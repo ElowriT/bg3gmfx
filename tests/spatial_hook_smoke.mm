@@ -60,9 +60,10 @@ int main(int argc, char **argv) {
             "kernel void FSR(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]], "
             "device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) "
             "{ if(all(p==uint2(0))) atomic_fetch_add_explicit(count,1,memory_order_relaxed); dst.write(src.read(p/2),p); }\n"
-            "kernel void FSR_RCAS(texture2d<float,access::write> dst [[texture(2)]], "
+            // Like BG3's: sharpening omitted, it undoes FSR_Tonemap. Counted apart from FSR.
+            "kernel void FSR_RCAS(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(2)]], "
             "device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) "
-            "{ if(all(p==uint2(0))) atomic_fetch_add_explicit(count,1,memory_order_relaxed); dst.write(float4(0.0),p); }\n"
+            "{ if(all(p==uint2(0))) atomic_fetch_add_explicit(count+1,1,memory_order_relaxed); float3 c=src.read(p).rgb; dst.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p); }\n"
             "kernel void Read(texture2d<float,access::read> src [[texture(0)]], device float4 *out [[buffer(0)]], "
             "uint2 p [[thread_position_in_grid]]) { out[p.y*src.get_width()+p.x]=src.read(p); }";
         NSError *error = nil;
@@ -84,11 +85,14 @@ int main(int argc, char **argv) {
         }
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLTexture> input = texture(device,256), taa = texture(device,256), bloom = texture(device,256);
-        id<MTLTexture> graded = texture(device,256), tonemapped = texture(device,256), scaled = texture(device,512);
+        id<MTLTexture> graded = texture(device,256), tonemapped = texture(device,256), scaled = texture(device,512,MTLPixelFormatRGBA16Float);
         id<MTLTexture> destination = texture(device,512,[mode isEqualToString:@"bad-format"] ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRG11B10Float);
         id<MTLBuffer> pixels = [device newBufferWithLength:512*512*4*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> nativeDispatches = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        *(uint32_t *)nativeDispatches.contents = 0;
+        // FSR and RCAS dispatches. With sharpening, BG3's RCAS runs once per frame on the MetalFX result.
+        id<MTLBuffer> nativeDispatches = [device newBufferWithLength:2*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        memset(nativeDispatches.contents,0,2*sizeof(uint32_t));
+        const char *sharpeningSetting = getenv("BG3MFX_METALFX_SHARPENING");
+        bool sharpening = !sharpeningSetting || strcmp(sharpeningSetting,"0");
         auto allocations = (NSUInteger(*)(void))dlsym(runtime,"BG3MFXTexturePoolAllocations");
         if (!allocations) return 13;
         NSUInteger warm = 0;
@@ -124,7 +128,9 @@ int main(int argc, char **argv) {
             // Steady-state frames must reuse pooled intermediates, not allocate.
             if (frame == 0) warm = allocations();
             else if (allocations() != warm) { fprintf(stderr,"Spatial allocated textures after warmup\n"); return 12; }
-            if (*(uint32_t *)nativeDispatches.contents != 0) { fprintf(stderr,"Native FSR work ran despite the MetalFX replacement\n"); return 8; }
+            const uint32_t *dispatched = (const uint32_t *)nativeDispatches.contents;
+            if (dispatched[0] != 0) { fprintf(stderr,"Native FSR work ran despite the MetalFX replacement\n"); return 8; }
+            if (dispatched[1] != (sharpening ? uint32_t(frame+1) : 0u)) { fprintf(stderr,"RCAS ran %u times after %d frames\n",dispatched[1],frame+1); return 14; }
             float *p = (float *)pixels.contents;
             for (NSUInteger y=32;y<480;y+=37) for (NSUInteger x=32;x<480;x+=41) for (int c=0;c<3;++c) {
                 float actual = p[(y*512+x)*4+c], expected = 3+2*c;
@@ -133,6 +139,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        puts("MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR/RCAS stayed suppressed, including a displaced creation hook.");
+        puts(sharpening ? "MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR stayed suppressed and BG3's RCAS sharpened the MetalFX result once per frame, including a displaced creation hook."
+                        : "MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR/RCAS stayed suppressed (sharpening off), including a displaced creation hook.");
     }
 }

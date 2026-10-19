@@ -14,6 +14,7 @@
 #import "SplitScreenFog.h"
 #import "LabInput.h"
 #import "NativeFixes.h"
+#import "Sharpening.h"
 #import "FrameInterpolation.h"
 #import "FrameLog.h"
 #import "GPUResources.h"
@@ -413,7 +414,7 @@ static void labPoll(void) {
     NSMutableArray *skips = [NSMutableArray array], *watches = [NSMutableArray array], *pokes = [NSMutableArray array];
     NSString *census = nil;
     bool serialize = false;
-    int scaling = -1, idleWait = -1;
+    int scaling = -1, idleWait = -1, sharpen = -1;
     for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
         NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if ([line hasPrefix:@"skip "] && line.length > 5) [skips addObject:[line substringFromIndex:5]];
@@ -457,9 +458,11 @@ static void labPoll(void) {
         else if ([line hasPrefix:@"census "] && line.length > 7) census = [line substringFromIndex:7];
         else if ([line hasPrefix:@"scaling "]) scaling = [[line substringFromIndex:8] intValue];
         else if ([line hasPrefix:@"idlewait "]) idleWait = [[line substringFromIndex:9] intValue];
+        else if ([line hasPrefix:@"sharpen "]) sharpen = [[line substringFromIndex:8] intValue];
     }
     labSkips = skips; labWatches = watches; labPokes = pokes; labSerialize = serialize; labScaling = scaling;
     if (idleWait >= 0) BG3MFXSetIdleWaitFix(idleWait != 0);
+    if (sharpen >= 0) BG3MFXSetSharpeningEnabled(sharpen != 0);
     unsigned generation = ++labGeneration;
     // A census already named in the file at launch is not repeated.
     if (census && !first && ![census isEqualToString:labCensusName]) labCensus = LabArmed;
@@ -1195,6 +1198,29 @@ static BOOL copyTemporalAAColor(id<MTLCommandBuffer> buffer, NSDictionary *input
     record(@{@"event":@"temporalTAACopy",@"source":texture(color),@"target":texture(target)});
     return YES;
 }
+// With sharpening, MetalFX writes an intermediate that BG3's own RCAS then
+// sharpens into the final target (see Sharpening.h); nil keeps the direct write.
+static id<MTLTexture> sharpeningIntermediate(id<MTLCommandBuffer> buffer, NSDictionary *inputs) {
+    if (!BG3MFXSharpeningEnabled() || !inputs[@"rcas"] || !inputs[@"scaled"] || !inputs[@"destination"]) return nil;
+    return [[BG3MFXNativeSharpening sharedForDevice:buffer.device] intermediateLike:inputs[@"destination"] commandBuffer:buffer];
+}
+static void sharpenInto(id<MTLCommandBuffer> buffer, NSDictionary *inputs, id<MTLTexture> linear) {
+    id<MTLTexture> destination = inputs[@"destination"];
+    BOOL encoded = [[BG3MFXNativeSharpening sharedForDevice:buffer.device] encodeFrom:linear fsrOutput:inputs[@"scaled"]
+        rcas:inputs[@"rcas"] destination:destination commandBuffer:buffer dispatch:^(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas) {
+            NSArray *g = rcas[@"grid"], *n = rcas[@"threads"];
+            MTLSize grid = MTLSizeMake([g[0] unsignedIntegerValue],[g[1] unsignedIntegerValue],[g[2] unsignedIntegerValue]);
+            MTLSize threads = MTLSizeMake([n[0] unsignedIntegerValue],[n[1] unsignedIntegerValue],[n[2] unsignedIntegerValue]);
+            SEL dispatch = [rcas[@"threadgroups"] boolValue] ? @selector(dispatchThreadgroups:threadsPerThreadgroup:) : @selector(dispatchThreads:threadsPerThreadgroup:);
+            // BG3's own pipeline: straight to Metal, not through the FSR replacement.
+            ((void(*)(id,SEL,MTLSize,MTLSize))original(encoder,dispatch))(encoder,dispatch,grid,threads);
+        }];
+    if (encoded) return;
+    record(@{@"event":@"sharpeningSkipped",@"destination":texture(destination)});
+    id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
+    [blit copyFromTexture:linear toTexture:destination];
+    [blit endEncoding];
+}
 static void endEncoder(id self, SEL cmd) {
     id<MTLCommandBuffer> commandBuffer = encoderBuffer(self);
     NSDictionary *probeInputs = objc_getAssociatedObject(self, &taaInputsKey);
@@ -1330,9 +1356,13 @@ static void endEncoder(id self, SEL cmd) {
     }
     int replacementMode = [fsrInputs[@"mode"] intValue];
     if (replacementMode == 2 && fsrInputs && commandBuffer && !spatialFailed) {
+        id<MTLTexture> intermediate = sharpeningIntermediate(commandBuffer,fsrInputs);
+        NSMutableDictionary *spatialInputs = [fsrInputs mutableCopy];
+        if (intermediate) spatialInputs[@"destination"] = intermediate;
         if (!fsrInputs[@"destination"])
             failSpatial(@"The FSR dispatch sequence ended before a MetalFX output was identified.");
-        else if (upscaleSpatial(commandBuffer,fsrInputs)) {
+        else if (upscaleSpatial(commandBuffer,spatialInputs)) {
+            if (intermediate) sharpenInto(commandBuffer,fsrInputs,intermediate);
             rememberUpscaledTAA(fsrInputs[@"nativeTAA"]);
             // As Temporal does, attach the frame's inputs to the upscaled output
             // so the tone-mapping chain carries them to BG3's composition.
@@ -1354,7 +1384,18 @@ static void endEncoder(id self, SEL cmd) {
             record(@{@"event":@"metalFXFrameSkipped",@"reason":@"The FSR stage ended before its final output texture was identified."}); }
         else if (!frame) { temporalResetPending=true;
             record(@{@"event":@"metalFXFrameSkipped",@"reason":@"The temporal scaler did not receive a matching scene color, depth, and motion frame."}); }
-        else upscaleTemporal(commandBuffer,frame,destination);
+        else {
+            id<MTLTexture> intermediate = sharpeningIntermediate(commandBuffer,fsrInputs);
+            if (upscaleTemporal(commandBuffer,frame,intermediate ?: destination) && intermediate) {
+                sharpenInto(commandBuffer,fsrInputs,intermediate);
+                // Frame Generation follows the frame from the texture MetalFX wrote.
+                NSValue *written = [NSValue valueWithPointer:(__bridge const void *)intermediate];
+                if (NSDictionary *generated = frames[written]) {
+                    frames[[NSValue valueWithPointer:(__bridge const void *)destination]] = generated;
+                    [frames removeObjectForKey:written];
+                }
+            }
+        }
     }
     if(composition && commandBuffer) encodeGeneratedPair(commandBuffer,composition);
     if (sceneProbe && probeInputs && commandBuffer) probeScene(commandBuffer,probeInputs);
@@ -2122,6 +2163,19 @@ static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
             if (!pending && objc_getAssociatedObject(self,&nativeFallbackKey)) goto native;
             if (pending && !pending[@"destination"] && pending[@"scaled"] == textures[@"0"] && textures[@"2"]) {
                 NSMutableDictionary *complete = [pending mutableCopy]; complete[@"destination"] = textures[@"2"];
+                // Everything needed to replay this sharpening on the MetalFX result.
+                __unsafe_unretained BG3MFXEncoderState *s = encoderState(self);
+                ConstantBinding *constants = constantSlot(self,StageCompute,0);
+                NSData *bytes = constants && constants->hasBytes ? s->bytes[@(StageCompute*EncoderSlots)] : nil;
+                if (s && s->pipeline && (bytes || (constants && constants->buffer))) {
+                    NSMutableDictionary *rcas = [@{@"pipeline":s->pipeline,@"grid":@[@(grid.width),@(grid.height),@(grid.depth)],
+                        @"threads":@[@(threads.width),@(threads.height),@(threads.depth)],
+                        @"threadgroups":@(cmd == @selector(dispatchThreadgroups:threadsPerThreadgroup:))} mutableCopy];
+                    if (textures[@"1"]) rcas[@"hairMask"] = textures[@"1"];
+                    if (bytes) rcas[@"constants"] = bytes;
+                    else { rcas[@"constantsBuffer"] = constants->buffer; rcas[@"constantsOffset"] = @(constants->offset); }
+                    complete[@"rcas"] = rcas;
+                }
                 objc_setAssociatedObject(self,&fsrInputsKey,complete,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 suppressNative = YES;
             } else {
@@ -2225,9 +2279,10 @@ static void instrumentEncoder(id encoder) {
         hook(encoder,"dispatchThreads:threadsPerThreadgroup:",(IMP)dispatch);
         hook(encoder,"dispatchThreadgroups:threadsPerThreadgroup:",(IMP)dispatch);
     }
-    if (labEnabled) {
-        hook(encoder,"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:",(IMP)dispatchIndirect);
-        // Compute constant buffers, for watch records and poke rules.
+    if (labEnabled) hook(encoder,"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:",(IMP)dispatchIndirect);
+    if (labEnabled || metalFXEnabled) {
+        // Compute constant buffers: lab watch records and poke rules, and BG3's
+        // RCAS constants, replayed to sharpen MetalFX output (Sharpening.h).
         hook(encoder,"setBuffer:offset:atIndex:",(IMP)bindBuffer);
         hook(encoder,"setBuffers:offsets:withRange:",(IMP)bindBuffers);
         hook(encoder,"setBufferOffset:atIndex:",(IMP)bufferOffset);

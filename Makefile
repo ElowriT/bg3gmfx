@@ -61,13 +61,13 @@ build/temporal-upscaler-smoke: tests/temporal_upscaler_smoke.mm src/TemporalUpsc
 build:
 	mkdir -p build
 
-build/libBG3MetalFXTrace.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h src/LabInput.mm src/LabInput.h src/NativeFixes.mm src/NativeFixes.h | build
-	$(CXX) $(CXXFLAGS) -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm src/LabInput.mm src/NativeFixes.mm $(FRAMEWORKS) -framework GameController -o $@
+build/libBG3MetalFXTrace.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h src/LabInput.mm src/LabInput.h src/NativeFixes.mm src/NativeFixes.h src/Sharpening.mm src/Sharpening.h | build
+	$(CXX) $(CXXFLAGS) -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm src/LabInput.mm src/NativeFixes.mm src/Sharpening.mm $(FRAMEWORKS) -framework GameController -o $@
 	codesign --force --sign - $@
 
 # Keep diagnostic and quiet runtimes as separate outputs for comparison.
-build/libBG3MetalFX.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h src/LabInput.mm src/LabInput.h src/NativeFixes.mm src/NativeFixes.h | build
-	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm src/LabInput.mm src/NativeFixes.mm $(FRAMEWORKS) -framework GameController -o $@
+build/libBG3MetalFX.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h src/LabInput.mm src/LabInput.h src/NativeFixes.mm src/NativeFixes.h src/Sharpening.mm src/Sharpening.h | build
+	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm src/LabInput.mm src/NativeFixes.mm src/Sharpening.mm $(FRAMEWORKS) -framework GameController -o $@
 	codesign --force --sign - $@
 
 build/metalfx-probe: tools/metalfx_probe.m | build
@@ -80,6 +80,7 @@ test: build/frame-generation-hook-smoke build/frame-interpolation-smoke build/me
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFXTrace.dylib hdr
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFX.dylib scaled
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFXTrace.dylib scaled
+	BG3MFX_METALFX_SHARPENING=0 ./build/frame-generation-hook-smoke ./build/libBG3MetalFX.dylib
 	./build/frame-interpolation-smoke
 	BG3MFX_TEST_DIRECT_INPUTS=1 ./build/frame-interpolation-smoke
 	./build/metal4-bridge-smoke
@@ -94,6 +95,8 @@ test: build/frame-generation-hook-smoke build/frame-interpolation-smoke build/me
 	./build/spatial-hook-smoke ./build/libBG3MetalFXTrace.dylib
 	./build/temporal-hook-smoke ./build/libBG3MetalFX.dylib
 	./build/temporal-hook-smoke ./build/libBG3MetalFXTrace.dylib
+	BG3MFX_METALFX_SHARPENING=0 ./build/spatial-hook-smoke ./build/libBG3MetalFX.dylib
+	BG3MFX_METALFX_SHARPENING=0 ./build/temporal-hook-smoke ./build/libBG3MetalFX.dylib
 	./build/lab-smoke ./build/libBG3MetalFX.dylib
 	./build/lab-smoke ./build/libBG3MetalFXTrace.dylib
 	./build/split-screen-fog-smoke ./build/libBG3MetalFX.dylib

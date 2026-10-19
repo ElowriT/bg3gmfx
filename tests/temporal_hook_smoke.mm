@@ -31,8 +31,9 @@ int main(int argc, char **argv) {
             "color.write(float4(0.5,0.75,1.0,1),p);motion.write(float4(0),p);}\n"
             "kernel void FSR(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]], device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {"
             "if(all(p==uint2(0))) atomic_fetch_add_explicit(count,1,memory_order_relaxed);dst.write(src.read(p/2),p);}\n"
-            "kernel void FSR_RCAS(texture2d<float,access::write> dst [[texture(2)]], device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {"
-            "if(all(p==uint2(0))) atomic_fetch_add_explicit(count,1,memory_order_relaxed);dst.write(float4(0),p);}\n"
+            // Like BG3's: sharpening omitted, it undoes FSR_Tonemap. Counted apart from FSR (count[0]).
+            "kernel void FSR_RCAS(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(2)]], device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {"
+            "if(all(p==uint2(0))) atomic_fetch_add_explicit(count+1,1,memory_order_relaxed);float3 c=src.read(p).rgb;dst.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p);}\n"
             "kernel void Read(texture2d<float,access::read> src [[texture(0)]], device float4 *out [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {out[p.y*src.get_width()+p.x]=src.read(p);}";
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) { fprintf(stderr,"%s\n",error.description.UTF8String); return 5; }
@@ -58,11 +59,11 @@ int main(int argc, char **argv) {
         id<MTLTexture> taa = texture(device,256,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
         id<MTLTexture> auxiliaryTAA = texture(device,256,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
         id<MTLTexture> postColor = texture(device,256,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
-        id<MTLTexture> scaled = texture(device,512,MTLPixelFormatRG11B10Float,rw);
+        id<MTLTexture> scaled = texture(device,512,MTLPixelFormatRGBA16Float,rw);
         id<MTLTexture> output = texture(device,512,MTLPixelFormatRG11B10Float,rw);
         id<MTLBuffer> pixels = [device newBufferWithLength:512*512*sizeof(float)*4 options:MTLResourceStorageModeShared];
         id<MTLBuffer> previewPixels = [device newBufferWithLength:256*256*sizeof(float)*4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> count = [device newBufferWithLength:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> count = [device newBufferWithLength:8 options:MTLResourceStorageModeShared];
         *(uint32_t *)count.contents=0;
         id<MTLCommandQueue> queue = [device newCommandQueue];
         float camera[56]={}, temporal[56]={}, viewport[42]={};
@@ -171,7 +172,7 @@ int main(int argc, char **argv) {
             id<MTLTexture> sLinear=texture(device,size,MTLPixelFormatR32Float,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
             id<MTLTexture> sTAA=texture(device,size,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
             id<MTLTexture> sTonemapped=texture(device,size,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
-            id<MTLTexture> sScaled=texture(device,size*2,MTLPixelFormatRG11B10Float,rw);
+            id<MTLTexture> sScaled=texture(device,size*2,MTLPixelFormatRGBA16Float,rw);
             id<MTLTexture> sOutput=texture(device,size*2,MTLPixelFormatRG11B10Float,rw);
             uint32_t sDimensions[2]={uint32_t(size),uint32_t(size)}; memcpy((char *)viewport+16,sDimensions,8);
             *(uint32_t *)count.contents=0;
