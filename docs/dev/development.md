@@ -41,6 +41,26 @@ python3 tools/launch/bg3mfx.py launch-trace
 # Or pass --output /absolute/path/to/new-trace.jsonl
 ```
 
+To start the development runtime with Steam's Play button instead, set
+Baldur's Gate 3's Launch Options (Properties > General) to:
+
+```text
+"/absolute/path/to/checkout/tools/launch/steam-launch.sh" #%command%
+```
+
+Steam needs `%command%` to run a wrapper and replaces it with the quoted app
+bundle; the `#` keeps that path, whose name has an apostrophe, out of the
+command, and the script finds the bundle in the Steam libraries. It starts the
+game through LaunchServices (`open -n -W`), so the game keeps its own access to
+`~/Documents` and Steam tracks it until it quits, with the quiet runtime from
+`build/bin/` injected after Steam's own libraries (the overlay), `-NoLauncher 1`,
+and the Metal HUD loadable as the `bg3mfx` launcher does. Optional
+`build/steam-launch.env` lines (`KEY=VALUE`) are added to the game's
+environment, for example `BG3MFX_LAB=/absolute/path` for lab mode;
+`BG3MFX_RUNTIME=` there selects another library. Clear the Launch Options to
+play unmodded. `tests/launcher/test_steam_launch.py` checks the arguments it
+passes to `open`.
+
 The unmodded Steam app bundle is at
 `/Users/acw/Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/Baldur's Gate 3.app`.
 The parent folder is spelled `Baldurs` (no apostrophe); the `.app` filename has
