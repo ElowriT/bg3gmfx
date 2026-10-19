@@ -25,7 +25,7 @@ $(BIN_DIR)/runtime-smoke: tests/integration/runtime_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
 
 $(BIN_DIR)/lab-smoke: tests/integration/lab_smoke.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -o $@
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -framework GameController -o $@
 
 $(BIN_DIR)/split-screen-fog-smoke: tests/features/split-screen-fog/split_screen_fog_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@

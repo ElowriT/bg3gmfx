@@ -10,7 +10,14 @@ control.txt are kept):
   lab.py --dir <dir> shot NAME              screenshot to shots/NAME.png (needs screen recording access)
   lab.py --dir <dir> probe NAME [TEXT ...]  apply exactly these skip rules, then take shot NAME
   lab.py --dir <dir> rules NAME [LINE ...]  apply exactly these control lines (skip/poke), then shots NAME-a/-b
+  lab.py --dir <dir> pad N connect|disconnect|release      virtual controller N (1-4)
+  lab.py --dir <dir> pad N press BUTTON... [--hold S]      press together, release after S seconds (0.15)
+  lab.py --dir <dir> pad N hold BUTTON...                   keep these held until release
+  lab.py --dir <dir> pad N stick left|right X Y [--hold S]  tilt a stick (-1..1), for S seconds if given
+  lab.py --dir <dir> pad status                             the pads as the game reports them
+Buttons: a b x y lb rb lt rt l3 r3 menu options home up down left right.
 Screenshots wait until BG3 is the frontmost app, so a player can switch back to it.
+Other commands keep watch and pad lines in control.txt.
 """
 
 import argparse
@@ -39,7 +46,7 @@ def read_control(directory):
 
 def write_control(directory, skips, census):
     path = directory / "control.txt"
-    kept = [line for line in path.read_text().splitlines() if line.startswith("watch ")] if path.exists() else []
+    kept = [line for line in path.read_text().splitlines() if line.startswith(("watch ", "pad "))] if path.exists() else []
     lines = kept + [f"skip {text}" for text in skips]
     if census:
         lines.append(f"census {census}")
@@ -58,6 +65,69 @@ def wait_applied(directory, timeout=5.0):
                 return current
         time.sleep(0.1)
     raise SystemExit("The game did not apply the change (is it running in lab mode and in focus?)")
+
+
+def pad_state(directory, number):
+    """Controller `number`'s lines in control.txt: (connected, held buttons, sticks)."""
+    path = directory / "control.txt"
+    lines = path.read_text().splitlines() if path.exists() else []
+    connected, held, sticks = False, [], {}
+    for line in lines:
+        words = line.split()
+        if words[:2] != ["pad", str(number)]:
+            continue
+        connected = True
+        if len(words) == 6 and words[2] == "stick":
+            sticks[words[3]] = (float(words[4]), float(words[5]))
+        else:
+            held += [word for word in words[2:] if word not in held]
+    return connected, held, sticks
+
+
+def write_pad(directory, number, connected, held, sticks):
+    path = directory / "control.txt"
+    lines = path.read_text().splitlines() if path.exists() else []
+    lines = [line for line in lines if line.split()[:2] != ["pad", str(number)]]
+    if connected:
+        lines.append(" ".join(["pad", str(number)] + held))
+        lines += [f"pad {number} stick {side} {x:g} {y:g}" for side, (x, y) in sorted(sticks.items()) if (x, y) != (0, 0)]
+    path.write_text("\n".join(lines) + "\n")
+    return wait_applied(directory)
+
+
+def pad(directory, args):
+    if args.number == "status":
+        status = directory / "status.json"
+        print(json.dumps(json.loads(status.read_text()).get("pads", []) if status.exists() else [], indent=1))
+        return
+    number = int(args.number)
+    if not 1 <= number <= 4:
+        raise SystemExit("Pads are numbered 1 to 4")
+    connected, held, sticks = pad_state(directory, number)
+    action, rest = args.action, args.rest
+    if action == "connect":
+        status = write_pad(directory, number, True, held, sticks)
+    elif action == "disconnect":
+        status = write_pad(directory, number, False, [], {})
+    elif action == "release":
+        status = write_pad(directory, number, True, [], {})
+    elif action == "hold":
+        status = write_pad(directory, number, True, held + [b for b in rest if b not in held], sticks)
+    elif action == "press":
+        write_pad(directory, number, True, held + [b for b in rest if b not in held], sticks)
+        time.sleep(0.15 if args.hold is None else args.hold)
+        status = write_pad(directory, number, True, held, sticks)
+    elif action == "stick":
+        if len(rest) != 3 or rest[0] not in ("left", "right"):
+            raise SystemExit("Usage: pad N stick left|right X Y [--hold S]")
+        moved = dict(sticks, **{rest[0]: (float(rest[1]), float(rest[2]))})
+        status = write_pad(directory, number, True, held, moved)
+        if args.hold is not None:
+            time.sleep(args.hold)
+            status = write_pad(directory, number, True, held, sticks)
+    else:
+        raise SystemExit(f"Unknown pad action {action}")
+    print(json.dumps(status.get("pads", [])))
 
 
 def front_app():
@@ -130,6 +200,11 @@ def main():
     rules = sub.add_parser("rules")
     rules.add_argument("name")
     rules.add_argument("line", nargs="*")
+    pads = sub.add_parser("pad")
+    pads.add_argument("number")
+    pads.add_argument("action", nargs="?", default="connect")
+    pads.add_argument("rest", nargs="*")
+    pads.add_argument("--hold", type=float)
     probe = sub.add_parser("probe")
     probe.add_argument("name")
     probe.add_argument("text", nargs="*")
@@ -138,7 +213,9 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     skips, census = read_control(directory)
 
-    if args.command == "skip":
+    if args.command == "pad":
+        pad(directory, args)
+    elif args.command == "skip":
         write_control(directory, args.text, census)
         print(json.dumps(wait_applied(directory)))
     elif args.command == "clear":
@@ -160,7 +237,7 @@ def main():
     elif args.command == "rules":
         wait_front()
         path = directory / "control.txt"
-        kept = [line for line in path.read_text().splitlines() if line.startswith(("watch ", "census "))] if path.exists() else []
+        kept = [line for line in path.read_text().splitlines() if line.startswith(("watch ", "census ", "pad "))] if path.exists() else []
         path.write_text("\n".join(kept + args.line) + "\n")
         print(json.dumps(wait_applied(directory)))
         shot(directory, f"{args.name}-a")

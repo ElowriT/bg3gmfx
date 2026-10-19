@@ -3,9 +3,14 @@
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
 #include <atomic>
+#include <cmath>
+#include <memory>
+#include <vector>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach-o/dyld.h>
+#include <mutex>
+#include <objc/runtime.h>
 #include <unistd.h>
 
 static std::atomic<bool> logging{false};
@@ -134,4 +139,138 @@ void BG3MFXLabInputStart(NSString *directory) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ logDisplay(@"startup"); });
     });
+}
+
+// Virtual controllers. BG3 reads controllers through GameController
+// ([GCController controllers], the connect notifications, extendedGamepad
+// elements and their change handlers), so a simulated controller made with
+// +controllerWithExtendedGamepad can join like a real one, for example as the
+// second split-screen player. Pads are created and changed on the main thread.
+static const int padLimit = 4;
+static GCController *pads[padLimit];
+static std::mutex padLock;
+static NSArray<NSDictionary *> *padState = @[];
+static IMP originalControllers;
+
+static NSArray *labControllers(id self, SEL cmd) {
+    NSArray *list = ((NSArray *(*)(id,SEL))originalControllers)(self, cmd);
+    std::lock_guard<std::mutex> lock(padLock);
+    NSMutableArray *all = nil;
+    for (GCController *pad : pads) if (pad) { if (!all) all = [list mutableCopy] ?: [NSMutableArray array]; [all addObject:pad]; }
+    return all ?: list;
+}
+
+// The first calls BG3 makes on a virtual pad, for the timeline.
+static void notePadQuery(NSString *selector) {
+    static std::atomic<unsigned> queries{0};
+    if (queries.fetch_add(1) < 40) BG3MFXLabInputNote(@{@"event": @"padQuery", @"selector": selector});
+}
+
+// Presented as an Xbox controller: BG3 picks button glyphs by product.
+static Class padClass(GCController *controller) {
+    static Class cls;
+    if (!cls) {
+        cls = objc_allocateClassPair(object_getClass(controller), "BG3MFXLabController", 0);
+        class_addMethod(cls, @selector(vendorName), imp_implementationWithBlock(^NSString *(id) {
+            notePadQuery(@"vendorName"); return @"Xbox Wireless Controller"; }), "@@:");
+        class_addMethod(cls, @selector(productCategory), imp_implementationWithBlock(^NSString *(id) {
+            notePadQuery(@"productCategory"); return @"Xbox One"; }), "@@:");
+        objc_registerClassPair(cls);
+    }
+    return cls;
+}
+
+static NSDictionary<NSString *, NSString *> *padButtons() {
+    static NSDictionary *names = @{@"a": @"buttonA", @"b": @"buttonB", @"x": @"buttonX", @"y": @"buttonY",
+        @"lb": @"leftShoulder", @"rb": @"rightShoulder", @"lt": @"leftTrigger", @"rt": @"rightTrigger",
+        @"l3": @"leftThumbstickButton", @"r3": @"rightThumbstickButton", @"menu": @"buttonMenu",
+        @"options": @"buttonOptions", @"home": @"buttonHome"};
+    return names;
+}
+
+// -setValue: on a simulated controller changes the element but calls no change
+// handler, so they are called here as a real controller's input would: the
+// element's handlers, then the profile's.
+static void changed(GCExtendedGamepad *gamepad, GCControllerElement *element) {
+    if (auto handler = gamepad.valueChangedHandler) handler(gamepad, element);
+}
+static void setButton(GCExtendedGamepad *gamepad, GCControllerButtonInput *button, float value) {
+    if (!button || button.value == value) return;
+    bool wasPressed = button.pressed;
+    [button setValue:value];
+    if (auto handler = button.pressedChangedHandler; handler && button.pressed != wasPressed) handler(button, button.value, button.pressed);
+    if (auto handler = button.valueChangedHandler) handler(button, button.value, button.pressed);
+    changed(gamepad, button);
+}
+static void setAxes(GCExtendedGamepad *gamepad, GCControllerDirectionPad *pad, float x, float y) {
+    if (!pad || (pad.xAxis.value == x && pad.yAxis.value == y)) return;
+    [pad setValueForXAxis:x yAxis:y];
+    if (auto handler = pad.valueChangedHandler) handler(pad, pad.xAxis.value, pad.yAxis.value);
+    changed(gamepad, pad);
+}
+
+NSArray<NSDictionary *> *BG3MFXLabPadsApply(NSArray<NSString *> *lines) {
+    struct Wanted { bool connected = false; NSMutableSet *held = [NSMutableSet set]; float left[2] = {0, 0}, right[2] = {0, 0}; };
+    auto wanted = std::make_shared<std::vector<Wanted>>(padLimit);
+    for (NSString *line in lines) {
+        NSMutableArray<NSString *> *words = [[line.lowercaseString componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet] mutableCopy];
+        [words removeObject:@""];
+        int index = words.count ? words[0].intValue - 1 : -1;
+        if (index < 0 || index >= padLimit) continue;
+        Wanted &pad = (*wanted)[index];
+        pad.connected = true;
+        if (words.count == 5 && [words[1] isEqualToString:@"stick"]) {
+            float *stick = [words[2] isEqualToString:@"right"] ? pad.right : pad.left;
+            stick[0] = fmaxf(-1, fminf(1, words[3].floatValue)); stick[1] = fmaxf(-1, fminf(1, words[4].floatValue));
+            continue;
+        }
+        for (NSUInteger i = 1; i < words.count; ++i) [pad.held addObject:words[i]];
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!originalControllers) {
+            Method method = class_getClassMethod(GCController.class, @selector(controllers));
+            originalControllers = method_setImplementation(method, (IMP)labControllers);
+        }
+        NSMutableArray *state = [NSMutableArray array];
+        for (int i = 0; i < padLimit; ++i) {
+            const Wanted &want = (*wanted)[i];
+            GCController *pad;
+            { std::lock_guard<std::mutex> lock(padLock); pad = pads[i]; }
+            if (!want.connected) {
+                if (!pad) continue;
+                { std::lock_guard<std::mutex> lock(padLock); pads[i] = nil; }
+                [NSNotificationCenter.defaultCenter postNotificationName:GCControllerDidDisconnectNotification object:pad];
+                BG3MFXLabInputNote(@{@"event": @"padDisconnected", @"pad": @(i + 1)});
+                continue;
+            }
+            if (!pad) {
+                pad = [GCController controllerWithExtendedGamepad];
+                if (!pad) continue;
+                object_setClass(pad, padClass(pad));
+                { std::lock_guard<std::mutex> lock(padLock); pads[i] = pad; }
+                [NSNotificationCenter.defaultCenter postNotificationName:GCControllerDidConnectNotification object:pad];
+                BG3MFXLabInputNote(@{@"event": @"padConnected", @"pad": @(i + 1)});
+            }
+            GCExtendedGamepad *gamepad = pad.extendedGamepad;
+            NSMutableArray *unknown = [NSMutableArray array];
+            for (NSString *name in want.held)
+                if (!padButtons()[name] && ![@[@"up", @"down", @"left", @"right"] containsObject:name]) [unknown addObject:name];
+            [padButtons() enumerateKeysAndObjectsUsingBlock:^(NSString *name, NSString *key, BOOL *) {
+                setButton(gamepad, [gamepad valueForKey:key], [want.held containsObject:name] ? 1 : 0);
+            }];
+            setAxes(gamepad, gamepad.dpad, ([want.held containsObject:@"right"] ? 1 : 0) - ([want.held containsObject:@"left"] ? 1 : 0),
+                    ([want.held containsObject:@"up"] ? 1 : 0) - ([want.held containsObject:@"down"] ? 1 : 0));
+            setAxes(gamepad, gamepad.leftThumbstick, want.left[0], want.left[1]);
+            setAxes(gamepad, gamepad.rightThumbstick, want.right[0], want.right[1]);
+            NSMutableDictionary *entry = [@{@"pad": @(i + 1), @"player": @(pad.playerIndex),
+                @"handler": @(gamepad.valueChangedHandler != nil), @"held": [want.held.allObjects sortedArrayUsingSelector:@selector(compare:)],
+                @"left": @[@(want.left[0]), @(want.left[1])], @"right": @[@(want.right[0]), @(want.right[1])]} mutableCopy];
+            if (unknown.count) entry[@"unknown"] = unknown;
+            [state addObject:entry];
+        }
+        std::lock_guard<std::mutex> lock(padLock);
+        padState = state;
+    });
+    std::lock_guard<std::mutex> lock(padLock);
+    return padState;
 }

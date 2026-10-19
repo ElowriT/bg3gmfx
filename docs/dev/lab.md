@@ -31,16 +31,30 @@ compute pipelines by their kernel; `<text>` matches any part of that name.
 | `dumpbuf <tag> <text> <slot> <length> [#N]` | The same for a buffer or `setBytes` binding; `<slot>` as for `poke`. |
 | `scaling <1/2/3>` | Renders new command buffers as FSR, MetalFX Spatial or Temporal regardless of the menu, for same-scene comparisons (FSR and Spatial share the render size; Temporal needs the menu's TAA setup). |
 | `sharpen <0/1>` | Turns BG3's RCAS sharpening of MetalFX output off or on. |
+| `pad <N> [buttons]`, `pad <N> stick <left/right> <x> <y>` | Virtual game controller `N` (1–4), connected while it has a line, holding the named buttons (`a b x y lb rb lt rt l3 r3 menu options home up down left right`) and stick positions (−1 to 1). See below. |
+
+## Virtual controllers
+
+`pad` lines let lab mode test controller paths, such as two-player split screen,
+without physical controllers. Each pad is a simulated GameController controller
+(`+[GCController controllerWithExtendedGamepad]`) presented as an Xbox
+controller: it is added to `+[GCController controllers]` and announced with
+`GCControllerDidConnectNotification`, and button and stick changes call the
+element and profile change handlers as real input does. Removing a pad's lines
+disconnects it. The timeline records connections and BG3's first queries.
+`tools/launch/lab.py pad` presses, holds and releases buttons and tilts sticks
+(see its help). Changes apply at the next control-file read, so a press lasts at
+least a quarter of a second.
 
 ## Output files
 
 | File | Contents |
 | --- | --- |
-| `status.json` | The rule generation, skip/watch/poke rules, census name and `scaling` the game applied. |
+| `status.json` | The rule generation, skip/watch/poke rules, census name and `scaling` the game applied, and the virtual controllers as of the previous change (the player index BG3 gave each, whether it installed a change handler, held buttons). |
 | `perf.json` | About once a second: presented frames per second, command buffers per second, `gpuMsPerFrame` and `gpuBusy` from BG3's command buffers, and `metal4MsPerFrame`, MetalFX Temporal's own GPU time on its Metal 4 queue. BG3's command buffers wait for that queue, so with Temporal their time includes the wait; use `metal4MsPerFrame` or a serialized profile for real costs. |
 | `census-*.json`, `profile-*.json` | As above. |
 | `dump-*.raw`, `dump-*.json` | Raw texels or bytes; the JSON gives size, pixel format, bytes per row, viewport and the capturing call. |
-| `input-log.jsonl` | A timeline of AppKit input events (with the posting process for synthetic events), game controller changes, window and display changes (window frame, screen backing scale, Metal layer drawable size), cursor warps, `CGEventPost` calls with their game call sites, bg3mfx menu events, and upscaling pipeline events: scene capture per view, the pass chain from TAA to FSR, blit copies, lookups at FSR and native fallbacks. |
+| `input-log.jsonl` | A timeline of AppKit input events (with the posting process for synthetic events), game controller changes, window and display changes (window frame, screen backing scale, Metal layer drawable size), cursor warps, `CGEventPost` calls with their game call sites, bg3mfx menu events, and upscaling pipeline events: scene capture per view, the pass chain from TAA to FSR, blit copies, lookups at FSR and native fallbacks (the first 300 of each kind per split-screen view, then every 300th with its count), and virtual controller events. |
 
 ## Tools
 
@@ -48,6 +62,8 @@ compute pipelines by their kernel; `<text>` matches any part of that name.
 confirmation, summarizes a census pass by pass, and takes screenshots once BG3
 is the frontmost app (`probe NAME TEXT...` applies a rule set and takes one
 shot; `rules NAME LINE...` applies exact control lines and takes two).
+`pad N press|hold|release|stick|connect|disconnect` drives the virtual
+controllers; other commands keep `watch` and `pad` lines.
 
 For comparing shaders offline, with extracted data kept in the ignored `build/`
 directory and never distributed:
@@ -67,5 +83,5 @@ directory and never distributed:
 Skipping or poking pipelines that the MetalFX integration recognizes (TAA, the
 color passes it follows, FSR, RCAS, CombineUI) changes what the upscalers
 receive. Lab mode never alters any game file. `make test` covers the control
-file, census, dumps, pokes, serialization and the profiler with `lab-smoke` on
-both runtimes (synthetic only).
+file, census, dumps, pokes, serialization, the profiler and two virtual
+controllers with `lab-smoke` on both runtimes (synthetic only).

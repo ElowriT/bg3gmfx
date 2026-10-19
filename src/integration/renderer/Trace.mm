@@ -606,7 +606,24 @@ static void labWriteProfile(NSArray<NSMutableDictionary *> *frame, NSUInteger co
     fprintf(stderr,"BG3 MetalFX lab: profile %s timed %lu passes, %.2f ms in total\n",name.UTF8String,(unsigned long)passes.count,total);
 }
 // Lab mode: the upscaling pipeline's diagnostic events, in input-log.jsonl.
-static void labRecordEvent(NSDictionary *event) { BG3MFXLabInputNote(event); }
+// Most of them come every frame: the first 300 of each kind (per split-screen
+// view) are kept, then every 300th, with its count.
+static void labRecordEvent(NSDictionary *event) {
+    static std::mutex lock;
+    static NSMutableDictionary<NSString *,NSNumber *> *counts = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%@ %@",event[@"event"],[event[@"view"] componentsJoinedByString:@","]];
+    NSUInteger count;
+    {
+        std::lock_guard<std::mutex> hold(lock);
+        count = counts[key].unsignedIntegerValue + 1;
+        counts[key] = @(count);
+    }
+    if (count > 300 && count % 300) return;
+    if (count <= 300) { BG3MFXLabInputNote(event); return; }
+    NSMutableDictionary *counted = [event mutableCopy];
+    counted[@"count"] = @(count);
+    BG3MFXLabInputNote(counted);
+}
 static NSMutableDictionary *labLayouts;  // render pipeline name -> vertex descriptor
 static void labTagPipeline(id state, NSString *name, MTLVertexDescriptor *vertex = nil) {
     if (!labEnabled || !state || !name.length) return;
@@ -657,6 +674,7 @@ static void labPoll(void) {
     lastModified = modified;
     NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
     NSMutableArray *skips = [NSMutableArray array], *watches = [NSMutableArray array], *pokes = [NSMutableArray array];
+    NSMutableArray *pads = [NSMutableArray array];
     NSString *census = nil;
     bool serialize = false;
     int scaling = -1, sharpen = -1;
@@ -705,7 +723,9 @@ static void labPoll(void) {
         else if ([line hasPrefix:@"profile "] && line.length > 8) { census = [line substringFromIndex:8]; profile = true; }
         else if ([line hasPrefix:@"scaling "]) scaling = [[line substringFromIndex:8] intValue];
         else if ([line hasPrefix:@"sharpen "]) sharpen = [[line substringFromIndex:8] intValue];
+        else if ([line hasPrefix:@"pad "]) [pads addObject:[line substringFromIndex:4]];
     }
+    NSArray *padState = BG3MFXLabPadsApply(pads);
     labSkips = skips; labWatches = watches; labPokes = pokes; labSerialize = serialize; labScaling = scaling;
     if (sharpen >= 0) BG3MFXSetSharpeningEnabled(sharpen != 0);
     unsigned generation = ++labGeneration;
@@ -717,7 +737,7 @@ static void labPoll(void) {
         labCensusName = [[census componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
     }
     first = false;
-    labWrite(@"status.json",@{@"generation":@(generation),@"skip":skips,@"watch":watches,@"poke":pokes,@"serialize":@(serialize),@"dumps":@(labDumps.count),@"census":labCensusName ?: @"",@"frame":@(frames),@"scaling":@(scaling)});
+    labWrite(@"status.json",@{@"generation":@(generation),@"skip":skips,@"watch":watches,@"poke":pokes,@"serialize":@(serialize),@"dumps":@(labDumps.count),@"census":labCensusName ?: @"",@"frame":@(frames),@"scaling":@(scaling),@"pads":padState});
     fprintf(stderr,"BG3 MetalFX lab: generation %u, %lu skip rule(s)%s\n",generation,(unsigned long)skips.count,
         labCensus == LabArmed ? ", census armed" : "");
 }

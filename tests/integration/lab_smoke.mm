@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <GameController/GameController.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -196,6 +197,44 @@ int main(int argc, const char **argv) {
             if ([pass[@"kind"] isEqualToString:@"compute"]) timedCompute = true;
         }
         if (!timedScene || !timedCompute) { fprintf(stderr,"The profile did not time the frame's passes: %s\n",profile.description.UTF8String); return 24; }
+        // Virtual controllers: "pad N" lines connect them and name held buttons
+        // and stick positions; a pad without a line disconnects.
+        __block NSUInteger connects = 0, disconnects = 0;
+        [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:nil
+            usingBlock:^(NSNotification *) { ++connects; }];
+        [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil
+            usingBlock:^(NSNotification *) { ++disconnects; }];
+        auto settle = ^{ frame(); [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]]; };
+        NSUInteger realControllers = GCController.controllers.count;
+        control(@"pad 1\npad 2 a lb up\npad 2 stick left 0.5 -1\n");
+        settle();
+        GCController *joined = nil;
+        for (GCController *controller in GCController.controllers) if (controller.extendedGamepad.buttonA.pressed) joined = controller;
+        GCExtendedGamepad *gamepad = joined.extendedGamepad;
+        if (connects != 2 || GCController.controllers.count != realControllers + 2 || !joined ||
+            ![joined.vendorName isEqualToString:@"Xbox Wireless Controller"]) {
+            fprintf(stderr,"Two virtual controllers did not connect (%lu notifications): %s\n",(unsigned long)connects,
+                [NSString stringWithContentsOfFile:[directory stringByAppendingPathComponent:@"status.json"] encoding:NSUTF8StringEncoding error:nil].UTF8String); return 25;
+        }
+        if (!gamepad.leftShoulder.pressed || gamepad.buttonB.pressed || gamepad.dpad.yAxis.value != 1 ||
+            gamepad.leftThumbstick.xAxis.value != 0.5f || gamepad.leftThumbstick.yAxis.value != -1) {
+            fprintf(stderr,"The virtual controller does not hold the named buttons and stick position\n"); return 26;
+        }
+        __block NSUInteger changes = 0;
+        gamepad.valueChangedHandler = ^(GCExtendedGamepad *, GCControllerElement *) { ++changes; };
+        control(@"pad 1\npad 2 b\n");
+        settle();
+        if (gamepad.buttonA.pressed || !gamepad.buttonB.pressed || gamepad.dpad.yAxis.value != 0 || gamepad.leftThumbstick.xAxis.value != 0 || !changes) {
+            fprintf(stderr,"Changing the pad lines did not update the controller (%lu change callbacks)\n",(unsigned long)changes); return 27;
+        }
+        control(@"pad 2 b\n");
+        settle(); settle();
+        NSData *padStatusData = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:@"status.json"]];
+        NSDictionary *padStatus = padStatusData ? [NSJSONSerialization JSONObjectWithData:padStatusData options:0 error:nil] : nil;
+        if (disconnects != 1 || GCController.controllers.count != realControllers + 1 || ![joined.vendorName length]) {
+            fprintf(stderr,"Removing a pad's lines did not disconnect it\n"); return 28;
+        }
+        if (![padStatus[@"pads"] isKindOfClass:NSArray.class]) { fprintf(stderr,"status.json does not report the pads\n"); return 29; }
         control(@"serialize\n");
         if (frame() != red || frame() != red) { fprintf(stderr,"Serialized encoders changed the frame\n"); return 18; }
         control(@"");
@@ -204,7 +243,7 @@ int main(int argc, const char **argv) {
         NSDictionary *status = statusData ? [NSJSONSerialization JSONObjectWithData:statusData options:0 error:nil] : nil;
         if ([status[@"skip"] count] != 0) { fprintf(stderr,"status.json does not report the cleared rules\n"); return 15; }
         [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
-        printf("Lab mode skipped a named draw and dispatch, recorded a one-frame census, poked and restored a compute constant, and restored them.\n");
+        printf("Lab mode skipped a named draw and dispatch, recorded a one-frame census, poked and restored a compute constant, drove two virtual controllers, and restored them.\n");
     }
     return 0;
 }
