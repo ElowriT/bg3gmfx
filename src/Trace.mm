@@ -11,6 +11,7 @@
 #import "SpatialUpscaler.h"
 #import "TemporalUpscaler.h"
 #import "NativeMenu.h"
+#import "SplitScreenFog.h"
 #import "FrameInterpolation.h"
 #import "FrameLog.h"
 #import "GPUResources.h"
@@ -1391,6 +1392,12 @@ static void recordReflection(MTLRenderPipelineDescriptor *desc, MTLRenderPipelin
     record(@{@"event": @"shaderReflection", @"fragment": desc.fragmentFunction.name ?: @"", @"buffers": buffers, @"textures": textures});
 }
 static id renderPipeline(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, NSError **error) {
+    // The fixed fog composite is created like any pipeline; the game's own pair is the fallback.
+    if (MTLRenderPipelineDescriptor *fog = BG3MFXSplitScreenFogDescriptor(self,desc))
+        if (id state = renderPipeline(self,cmd,fog,nullptr)) {
+            record(@{@"event": @"splitScreenFog", @"fragment": desc.fragmentFunction.name ?: @""});
+            return state;
+        }
     id state;
     if (cameraShader(desc)) {
         SEL optionsSelector = sel_registerName("newRenderPipelineStateWithDescriptor:options:reflection:error:");
@@ -1425,6 +1432,11 @@ static id renderPipeline(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, NS
     return state;
 }
 static id renderPipelineOptions(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, MTLPipelineOption options, MTLRenderPipelineReflection **reflection, NSError **error) {
+    if (MTLRenderPipelineDescriptor *fog = BG3MFXSplitScreenFogDescriptor(self,desc))
+        if (id state = renderPipelineOptions(self,cmd,fog,options,reflection,nullptr)) {
+            record(@{@"event": @"splitScreenFog", @"fragment": desc.fragmentFunction.name ?: @""});
+            return state;
+        }
     MTLRenderPipelineReflection *extraReflection = nil;
     id state;
     if (cameraShader(desc)) {

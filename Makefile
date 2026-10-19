@@ -24,6 +24,9 @@ build/runtime-smoke: tests/runtime_smoke.mm | build
 build/lab-smoke: tests/lab_smoke.mm | build
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -o $@
 
+build/split-screen-fog-smoke: tests/split_screen_fog_smoke.mm | build
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
+
 build/spatial-hook-smoke: tests/spatial_hook_smoke.mm | build
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework AppKit -o $@
 
@@ -58,19 +61,19 @@ build/temporal-upscaler-smoke: tests/temporal_upscaler_smoke.mm src/TemporalUpsc
 build:
 	mkdir -p build
 
-build/libBG3MetalFXTrace.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S | build
-	$(CXX) $(CXXFLAGS) -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S $(FRAMEWORKS) -o $@
+build/libBG3MetalFXTrace.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h | build
+	$(CXX) $(CXXFLAGS) -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm $(FRAMEWORKS) -o $@
 	codesign --force --sign - $@
 
 # Keep diagnostic and quiet runtimes as separate outputs for comparison.
-build/libBG3MetalFX.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S | build
-	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S $(FRAMEWORKS) -o $@
+build/libBG3MetalFX.dylib: src/Trace.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/MetalFXPipeline.mm src/GPUResources.mm src/MetalFXPipeline.h src/GPUResources.h src/SpatialUpscaler.mm src/SpatialUpscaler.h src/TemporalUpscaler.mm src/TemporalUpscaler.h src/NativeMenu.mm src/NativeMenu.h src/NativeJitter.mm src/NativeJitter.h src/NativeJitter.S src/SplitScreenFog.mm src/SplitScreenFog.h | build
+	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -dynamiclib src/Trace.mm src/FrameInterpolation.mm src/FrameLog.mm src/MetalFXPipeline.mm src/GPUResources.mm src/SpatialUpscaler.mm src/TemporalUpscaler.mm src/NativeMenu.mm src/NativeJitter.mm src/NativeJitter.S src/SplitScreenFog.mm $(FRAMEWORKS) -o $@
 	codesign --force --sign - $@
 
 build/metalfx-probe: tools/metalfx_probe.m | build
 	xcrun clang -fobjc-arc -mmacosx-version-min=26.0 $< $(FRAMEWORKS) -o $@
 
-test: build/frame-generation-hook-smoke build/frame-interpolation-smoke build/metal4-bridge-smoke build/runtime-smoke build/metalfx-smoke build/temporal-quality-smoke build/native-jitter-smoke build/spatial-upscaler-smoke build/temporal-upscaler-smoke build/spatial-hook-smoke build/temporal-hook-smoke build/lab-smoke build/libBG3MetalFX.dylib build/libBG3MetalFXTrace.dylib
+test: build/frame-generation-hook-smoke build/frame-interpolation-smoke build/metal4-bridge-smoke build/runtime-smoke build/metalfx-smoke build/temporal-quality-smoke build/native-jitter-smoke build/spatial-upscaler-smoke build/temporal-upscaler-smoke build/spatial-hook-smoke build/temporal-hook-smoke build/lab-smoke build/split-screen-fog-smoke build/libBG3MetalFX.dylib build/libBG3MetalFXTrace.dylib
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFX.dylib
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFXTrace.dylib
 	./build/frame-generation-hook-smoke ./build/libBG3MetalFX.dylib hdr
@@ -93,6 +96,9 @@ test: build/frame-generation-hook-smoke build/frame-interpolation-smoke build/me
 	./build/temporal-hook-smoke ./build/libBG3MetalFXTrace.dylib
 	./build/lab-smoke ./build/libBG3MetalFX.dylib
 	./build/lab-smoke ./build/libBG3MetalFXTrace.dylib
+	./build/split-screen-fog-smoke ./build/libBG3MetalFX.dylib
+	./build/split-screen-fog-smoke ./build/libBG3MetalFXTrace.dylib
+	BG3MFX_SPLIT_SCREEN_FOG=0 ./build/split-screen-fog-smoke ./build/libBG3MetalFX.dylib
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: build/bg3mfx
@@ -103,7 +109,7 @@ clean:
 		build/runtime-smoke build/metalfx-smoke build/spatial-upscaler-smoke \
 		build/temporal-upscaler-smoke build/spatial-hook-smoke \
 		build/temporal-hook-smoke build/temporal-replay-smoke build/temporal-quality-smoke build/native-jitter-smoke build/temporal-api-compare build/metal4-bridge-smoke \
-		build/frame-interpolation-smoke build/frame-generation-hook-smoke build/lab-smoke
+		build/frame-interpolation-smoke build/frame-generation-hook-smoke build/lab-smoke build/split-screen-fog-smoke
 
 build/frame-interpolation-smoke: tests/frame_interpolation_smoke.mm src/FrameInterpolation.mm src/FrameInterpolation.h src/FrameLog.mm src/FrameLog.h src/GPUResources.mm src/GPUResources.h | build
 	$(CXX) $(CXXFLAGS) $< src/FrameInterpolation.mm src/FrameLog.mm src/GPUResources.mm $(FRAMEWORKS) -Isrc -o $@
