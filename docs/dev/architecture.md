@@ -33,9 +33,20 @@ control is disabled while Temporal is selected.
 `Trace.mm` contains the Metal interception layer used by both runtime builds. It
 tracks each command buffer's selected mode and associates exact BG3 textures
 through TAA, post-processing, and the native FSR stage. Unknown or mismatched
-resources fail closed instead of guessing from dimensions. Native FSR and RCAS
-dispatches are skipped only for an active MetalFX mode. Off and FSR retain
-BG3's callbacks and native rendering.
+resources fail closed instead of guessing from dimensions. Native FSR dispatches
+are skipped only for an active MetalFX mode. Off and FSR retain BG3's callbacks
+and native rendering.
+
+`Sharpening.mm` keeps the player's Sharpness setting for MetalFX. BG3's chain
+is `FSR_Tonemap` (c / (1 + max c)), FSR and `FSR_RCAS`, which sharpens in that
+space, leaves hair (its hair mask) unsharpened and writes linear HDR
+(c / (1 − max c)). The MetalFX result is written to a pooled texture, mapped
+into FSR's space in a half-float texture (rounded up, since the undo magnifies
+rounding near white and BG3's RG11B10 targets round toward zero), and BG3's
+own `FSR_RCAS` dispatch is replayed with its pipeline, constants, hair mask
+and grid into the final target. Compute constant bindings are tracked in
+MetalFX mode for this. `BG3MFX_METALFX_SHARPENING=0` keeps the unsharpened
+output.
 
 `SpatialUpscaler.mm` copies BG3's linear HDR scene color from RG11B10Float into
 RGBA16Float, runs MetalFX Spatial in HDR mode, and copies the result into BG3's
@@ -78,6 +89,55 @@ validation limits.
 `MetalFXPipeline.mm` owns only the MetalFX Spatial/Temporal scaler objects,
 resource checks, output allocation, scaler encoding, and its cross-API GPU event bridge. It has no BG3 menu,
 frame presentation, patching, or distribution responsibilities.
+
+## Split screen
+
+BG3 renders each split-screen view into its own rectangle of shared full-size
+textures, with that view's viewport and Viewport constants (`g_ViewportScale`,
+`g_ViewportOffset`, size, minimum, index), then runs FSR and RCAS over the
+whole frame once per view.
+
+`SplitScreenFog.mm` fixes the volumetric fog composite. BG3 pairs
+`DeferredFog_*_PS` with `DefaultVS`, which passes the fullscreen triangle's
+view-relative texCoord through, while the fragment shader indexes the fog volume
+(all views side by side) with render-target UVs, as `PPDefaultVS` provides for
+every other full-screen pass. Each view therefore sampled fog belonging to
+another part of the screen. When BG3 creates that pipeline, bg3mfx substitutes
+its own vertex function applying the view's scale and offset (bound at vertex
+buffer 9 for every full-screen pass); in a single view it is an identity.
+`BG3MFX_SPLIT_SCREEN_FOG=0` restores BG3's pairing.
+
+MetalFX upscales each view on its own (`ViewRegions.mm`). The TAA capture
+records the view rectangle from the Viewport constants; at each view's FSR
+dispatch, color, depth and motion are cropped into view-sized pooled textures,
+upscaled by a Temporal scaler of that view's own (own history; Spatial shares
+one per size) and placed into the view's rectangle of the output, which keeps
+either view from sampling the other at the seam. With sharpening, both views
+share one intermediate per frame, so the last view's whole-frame RCAS replay
+sharpens both. Between bloom and colour grading BG3 copies scene color with
+blits in split screen (`copyFromTexture:sourceSlice:sourceLevel:toTexture:…`);
+the scene association follows such copies like the recognized color passes.
+Frame Generation pairs whole frames only and stays unpaired in split screen.
+
+## BG3 fixes outside rendering
+
+`NativeFixes.mm` intercepts two imported functions at verified call sites of
+the supported build only; every other caller gets the original function.
+
+- Idle waits: BG3's frame limiter (`ls::GameClock::CapFrame`, which also paces
+  the server thread) and its job scheduler's idle loop
+  (`ls::WorkerThreadScheduler::DoWork`) wait by calling `pthread_yield_np` in a
+  loop, keeping about three cores busy at a 30 FPS cap. There a short spin is
+  followed by short sleeps. `BG3MFX_IDLE_WAIT=0` restores the spinning.
+- Window rebind click: after `cocoa::CocoaWindow::BindSurface` swaps the
+  window's content view (as when the render resolution changes), BG3 posts a
+  left mouse click through the HID event tap to focus the new view. The click
+  switched BG3's UI from controller to mouse and keyboard and could press
+  whatever was under the hidden cursor. While BG3 is active, bg3mfx makes the
+  new view first responder instead. `BG3MFX_KEEP_REBIND_CLICK=1` keeps the click.
+
+Both install after the native menu's build guard and check that each call site
+still calls the expected import stub.
 
 ## Frame Generation
 
@@ -226,6 +286,11 @@ does not alter the app bundle.
 ## Code map
 
 - `src/NativeMenu.mm`: settings menu, custom mode persistence, HUD checkbox.
+- `src/NativeFixes.*`: idle-wait and window-rebind-click fixes at verified call sites.
+- `src/SplitScreenFog.*`: the split-screen volumetric fog vertex function.
+- `src/Sharpening.*`: BG3's RCAS replayed on MetalFX output.
+- `src/ViewRegions.*`: split-screen view crops and placement.
+- `src/LabInput.*`: lab mode's input and pipeline event timeline (see [lab mode](lab.md)).
 - `src/NativeJitter.*`: guarded Temporal sample selection and ARM64 preservation.
 - `src/Trace.mm`: Metal hooks, exact texture association, pass replacement,
   diagnostic instrumentation.
@@ -235,6 +300,8 @@ does not alter the app bundle.
 - `src/GPUResources.*`: texture pools and the reusable Metal 4 submission bridge.
 - `src/FrameInterpolation.*`: frame interpolation, stand-in drawables, and the
   presentation worker.
-- `tests/*_smoke.mm`: synthetic Metal pixel and hook regressions.
+- `tests/*_smoke.mm`: synthetic Metal pixel and hook regressions, including
+  split-screen fog and per-view upscaling (`split_screen_*_smoke.mm`) and lab
+  mode (`lab_smoke.mm`).
 - `tools/bg3mfx.py`: guarded, bundle-preserving development launch.
 - `docs/dev/validation/`: current status and dated evidence.

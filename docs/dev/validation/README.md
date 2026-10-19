@@ -1,7 +1,51 @@
 # Current validation status
 
-Updated October 12, 2026. This page is the active record. Detailed dated notes
+Updated October 19, 2026. This page is the active record. Detailed dated notes
 are archived under [`history/`](history/).
+
+## Split screen, CPU use, sharpening and controller input (October 19)
+
+Live on BG3 4.1.1.7631656, M5 Pro, a 2560×1440 display (HiDPI), quiet runtime
+in lab mode, with the user playing two-player split screen with controllers.
+
+- Split-screen fog: the user reported "unnatural smoke" in split screen only.
+  Lab dumps (copied right after each view's passes) and the fog shaders showed
+  that `DeferredFog_*_PS` received view-relative UVs. A live A/B at a fixed
+  camera, toggling only the vertex-stage viewport constants, removed the
+  hard-edged, misplaced light shafts; the user confirmed the fix in game and that
+  single view is unchanged.
+- Idle waits: `sample` showed `GameClock::CapFrame` (game and server threads)
+  and `WorkerThreadScheduler::DoWork` spinning on `pthread_yield_np`. Process CPU
+  at 30 FPS: 225% → 34–70% at the main menu, 333% → 66–72% in game. Package
+  power from `powermetrics` (2560×1440 split screen, MetalFX Temporal Quality,
+  30 FPS): with the fix CPU ≈7.9 W, GPU ≈9.3 W, total ≈17.7 W; turning it off
+  live gave CPU 18–20 W and a total of 26–28 W. The frame rate stayed at 30.
+- Controller input: the lab input log showed two synthetic left clicks posted
+  by `CocoaWindow::BindSurface` right after the Video options rebuilt with a
+  MetalFX mode saved, and after switching to Temporal. With the replacement the
+  user confirmed the controller keeps working in the menu.
+- Sharpening: matched frames of Temporal Ultra Quality at the default sharpness
+  (0.8) measured about 60% more edge detail with BG3's RCAS replayed; mean
+  brightness within 0.5%.
+- Per-view upscaling: before, split screen ran BG3's FSR every frame ("no
+  matching scene color"): the capture skipped split viewports, and BG3's blit
+  copies between bloom and colour grading broke the pass chain. With both fixed,
+  the lab log shows every view captured, chained and upscaled, with no native
+  fallback, and the user confirmed the seam artifacts on faces are gone.
+- Costs: MetalFX Temporal's own Metal 4 GPU time was about 2 ms per frame for
+  one 1706×960 → 2560×1440 view and about 3 ms for both split-screen views. A
+  serialized lab profile put BG3's own GPU work at about 12.8 ms per frame in
+  that split-screen scene, with no single dominant pass (geometry about 4 ms,
+  volumetric fog 1.6 ms, shadows 1.1 ms). Turning HiDPI off made no measurable
+  power difference.
+
+Synthetic: `split-screen-fog-smoke` (fog pass receives render-target UVs; fails
+without the runtime), `split-screen-upscale-smoke` (two views with BG3-style
+viewports, blit hop and per-view FSR/RCAS; one scaler per view, no blending at
+the seam; fails on the earlier runtime), RCAS replay counts and identity checks
+in the Spatial, Temporal and Frame Generation hook tests (with and without
+sharpening), and `lab-smoke` for lab mode including the profiler. `make test`
+passes on both runtimes at each commit.
 
 ## Frame Generation (initial integration)
 
@@ -132,6 +176,9 @@ changed.
 | Spatial | Linear HDR after bloom/color grading enters MetalFX before `FSR_Tonemap`; output continues through BG3 tone mapping and UI | Synthetic and main-menu checks passed; user confirms good colors, persistent settings, and improved performance versus Off. No further Spatial testing requested |
 | Temporal | Native jitter converted to MetalFX displacement, HDR color, depth, and motion feed MetalFX; TAA output is replaced and separate AA is disabled | Corrected jitter improves analytic reconstruction and captured-game replay; user confirms clearly better and stable in the quiet Temporal/Balanced saved-camera and slow-motion test. MetalFX shader-validation fault remains unresolved |
 | Native Off and FSR | Original settings callbacks and rendering paths remain in use | Off, TAA, native FSR callbacks/dispatches were observed in live menu tests |
+| Split screen | Fog composite uses view-relative UV mapping; each view is upscaled on its own | User-confirmed fog and seam fixes in two-player split screen; synthetic split-screen tests |
+| Sharpening | BG3's RCAS replayed on MetalFX output | Live matched-frame detail measurement; hook tests with and without sharpening |
+| CPU idle waits and controller input | Frame-limiter/scheduler spins sleep; window-rebind click replaced | Live CPU and package-power A/B; user-confirmed controller fix |
 | Metal HUD | Persistent menu checkbox controls the Metal layer overlay | Menu ordering and HUD on/off were visually verified |
 | Error path | Setup and resource failures display a clear error and exit 78. A frame whose FSR input matches no captured scene (transitions) runs BG3's native FSR + RCAS for that frame, logs `metalFXNativeFallback`, and restarts Temporal history | Synthetic invalid-resource regressions pass; the hook fixture checks the unmatched-frame fallback. User reported scene-match closures before this change; not yet retested live |
 
