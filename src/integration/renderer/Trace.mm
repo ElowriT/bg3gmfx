@@ -538,6 +538,73 @@ enum LabCensus : uint8_t { LabIdle, LabArmed, LabRecording };
 static LabCensus labCensus;
 static NSString *labCensusName;
 static NSMutableArray *labFrame;
+static void labWrite(NSString *file, id object);
+// "profile <name>": a census whose render and compute passes also carry GPU
+// timestamps at stage boundaries; once the GPU has finished that frame,
+// profile-<name>.json lists every pass with its GPU time.
+static bool labProfileRequested, labProfiling;
+static id<MTLCounterSampleBuffer> labCounters;
+static id<MTLDevice> labProfileDevice;
+static NSUInteger labSamples;
+static const NSUInteger labSampleLimit = 4096;
+static MTLTimestamp labProfileCPU, labProfileGPU;
+static thread_local bool labCreatingProfiledEncoder;
+// The first of two samples (start, end) for the next profiled pass, or NSNotFound.
+static NSUInteger labProfileSamples(id<MTLDevice> device) {
+    if (!labProfiling || !device) return NSNotFound;
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (!labCounters) {
+        id<MTLCounterSet> timestamps = nil;
+        for (id<MTLCounterSet> set in device.counterSets) if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) timestamps = set;
+        MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
+        desc.counterSet = timestamps; desc.storageMode = MTLStorageModeShared; desc.sampleCount = labSampleLimit;
+        if (timestamps && [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+            labCounters = [device newCounterSampleBufferWithDescriptor:desc error:nil];
+        labProfileDevice = device;
+        if (!labCounters) { labProfiling = false; fprintf(stderr,"BG3 MetalFX lab: GPU timestamps unavailable\n"); return NSNotFound; }
+    }
+    if (device != labProfileDevice || labSamples + 2 > labSampleLimit) return NSNotFound;
+    if (!labSamples) [device sampleTimestamps:&labProfileCPU gpuTimestamp:&labProfileGPU];
+    NSUInteger first = labSamples; labSamples += 2;
+    return first;
+}
+static id labProfiledComputeEncoder(id<MTLCommandBuffer> buffer, MTLDispatchType type, NSUInteger samples) {
+    MTLComputePassDescriptor *pass = [MTLComputePassDescriptor computePassDescriptor];
+    pass.dispatchType = type;
+    pass.sampleBufferAttachments[0].sampleBuffer = labCounters;
+    pass.sampleBufferAttachments[0].startOfEncoderSampleIndex = samples;
+    pass.sampleBufferAttachments[0].endOfEncoderSampleIndex = samples + 1;
+    labCreatingProfiledEncoder = true;
+    id encoder = [buffer computeCommandEncoderWithDescriptor:pass];
+    labCreatingProfiledEncoder = false;
+    return encoder;
+}
+static void labWriteProfile(NSArray<NSMutableDictionary *> *frame, NSUInteger count, NSString *name) {
+    NSData *data = count ? [labCounters resolveCounterRange:NSMakeRange(0,count)] : nil;
+    const MTLCounterResultTimestamp *samples = (const MTLCounterResultTimestamp *)data.bytes;
+    MTLTimestamp cpu = 0, gpu = 0;
+    [labProfileDevice sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    double nanosecondsPerTick = gpu > labProfileGPU ? (double)(cpu - labProfileCPU) / (double)(gpu - labProfileGPU) : 1;
+    NSMutableArray *passes = [NSMutableArray array];
+    double total = 0;
+    for (NSDictionary *entry in frame) {
+        NSNumber *first = entry[@"samples"];
+        if (!first || !samples || first.unsignedIntegerValue + 1 >= count + 1) continue;
+        uint64_t start = samples[first.unsignedIntegerValue].timestamp, end = samples[first.unsignedIntegerValue + 1].timestamp;
+        if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || !start || end < start) continue;
+        double ms = (end - start) * nanosecondsPerTick * 1e-6;
+        total += ms;
+        NSMutableDictionary *pass = [@{@"index":entry[@"index"],@"kind":entry[@"kind"],@"gpuMs":@(ms),
+            @"draws":entry[@"draws"] ?: @{},@"dispatches":entry[@"dispatches"] ?: @{}} mutableCopy];
+        if (entry[@"viewport"]) pass[@"viewport"] = entry[@"viewport"];
+        if (entry[@"label"]) pass[@"label"] = entry[@"label"];
+        if (entry[@"colors"]) pass[@"colors"] = entry[@"colors"];
+        [passes addObject:pass];
+    }
+    labWrite([NSString stringWithFormat:@"profile-%@.json",name],@{@"profile":name,@"passes":passes,@"sumMs":@(total),
+        @"metal4MsPerFrame":@(0)});
+    fprintf(stderr,"BG3 MetalFX lab: profile %s timed %lu passes, %.2f ms in total\n",name.UTF8String,(unsigned long)passes.count,total);
+}
 // Lab mode: the upscaling pipeline's diagnostic events, in input-log.jsonl.
 static void labRecordEvent(NSDictionary *event) { BG3MFXLabInputNote(event); }
 static NSMutableDictionary *labLayouts;  // render pipeline name -> vertex descriptor
@@ -593,6 +660,7 @@ static void labPoll(void) {
     NSString *census = nil;
     bool serialize = false;
     int scaling = -1, sharpen = -1;
+    bool profile = false;
     for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
         NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if ([line hasPrefix:@"skip "] && line.length > 5) [skips addObject:[line substringFromIndex:5]];
@@ -634,6 +702,7 @@ static void labPoll(void) {
             }
         }
         else if ([line hasPrefix:@"census "] && line.length > 7) census = [line substringFromIndex:7];
+        else if ([line hasPrefix:@"profile "] && line.length > 8) { census = [line substringFromIndex:8]; profile = true; }
         else if ([line hasPrefix:@"scaling "]) scaling = [[line substringFromIndex:8] intValue];
         else if ([line hasPrefix:@"sharpen "]) sharpen = [[line substringFromIndex:8] intValue];
     }
@@ -641,7 +710,7 @@ static void labPoll(void) {
     if (sharpen >= 0) BG3MFXSetSharpeningEnabled(sharpen != 0);
     unsigned generation = ++labGeneration;
     // A census already named in the file at launch is not repeated.
-    if (census && !first && ![census isEqualToString:labCensusName]) labCensus = LabArmed;
+    if (census && !first && ![census isEqualToString:labCensusName]) { labCensus = LabArmed; labProfileRequested = profile; }
     if (census) {
         NSCharacterSet *unsafe = [[NSCharacterSet characterSetWithCharactersInString:
             @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"] invertedSet];
@@ -921,8 +990,21 @@ static void labFrameBoundary(void) {
     labPerf();
     std::lock_guard<std::recursive_mutex> lock(guard());
     if (labDumpArmed) for (NSMutableDictionary *dump in labDumps) if ([dump[@"state"] isEqualToString:@"armed"]) dump[@"seen"] = @0;
-    if (labCensus == LabArmed) { labFrame = [NSMutableArray array]; labCensus = LabRecording; return; }
+    if (labCensus == LabArmed) {
+        labFrame = [NSMutableArray array]; labCensus = LabRecording;
+        if (labProfileRequested) { labProfiling = true; labSamples = 0; labProfileRequested = false; }
+        return;
+    }
     if (labCensus != LabRecording) return;
+    if (labProfiling) {
+        // Resolve once the GPU has certainly finished the frame.
+        labProfiling = false;
+        NSArray *frame = labFrame; NSUInteger count = labSamples; NSString *name = labCensusName;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+            std::lock_guard<std::recursive_mutex> hold(guard());
+            labWriteProfile(frame,count,name);
+        });
+    }
     NSMutableDictionary *layouts = [NSMutableDictionary dictionary];
     for (NSString *name in labLayouts) for (NSString *text in labWatches)
         if ([name rangeOfString:text].location != NSNotFound) layouts[name] = labLayouts[name];
@@ -2702,6 +2784,15 @@ static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
         @"computeHookRegistered": @(computeRegistered),
         @"computeHookActive": @(computeMethod && method_getImplementation(computeMethod) == (IMP)computeEncoderType)});
     }
+    NSUInteger samples = labEnabled ? labProfileSamples([(id<MTLCommandBuffer>)self device]) : NSNotFound;
+    if (samples != NSNotFound) {
+        MTLRenderPassDescriptor *profiled = [desc copy];
+        MTLRenderPassSampleBufferAttachmentDescriptor *attachment = profiled.sampleBufferAttachments[0];
+        attachment.sampleBuffer = labCounters;
+        attachment.startOfVertexSampleIndex = samples; attachment.endOfVertexSampleIndex = MTLCounterDontSample;
+        attachment.startOfFragmentSampleIndex = MTLCounterDontSample; attachment.endOfFragmentSampleIndex = samples + 1;
+        desc = profiled;
+    }
     id encoder = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,desc);
     instrumentEncoder(encoder);
     setEncoderMode(encoder, objc_getAssociatedObject(self, &bufferScalingModeKey));
@@ -2727,6 +2818,7 @@ static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
         if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) { state->buffer=self; state->colorTarget=desc.colorAttachments[0].texture; }
     }
     if (labEnabled && encoder) labBeginEncoder(encoder,@"render",desc,self);
+    if (samples != NSNotFound) if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder)) s->labRecord[@"samples"] = @(samples);
     return encoder;
 }
 // BG3 copies scene color between post-processing passes with blits in split
@@ -2787,12 +2879,15 @@ static id blitEncoderDescriptor(id self, SEL cmd, id descriptor) {
     return encoder;
 }
 static id computeEncoder(id self, SEL cmd) {
-    id encoder = ((id(*)(id,SEL))original(self,cmd))(self,cmd);
+    if (labCreatingProfiledEncoder) return ((id(*)(id,SEL))original(self,cmd))(self,cmd);
+    NSUInteger samples = labEnabled ? labProfileSamples([(id<MTLCommandBuffer>)self device]) : NSNotFound;
+    id encoder = samples != NSNotFound ? labProfiledComputeEncoder(self,MTLDispatchTypeSerial,samples) : ((id(*)(id,SEL))original(self,cmd))(self,cmd);
     record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     setEncoderMode(encoder, objc_getAssociatedObject(self, &bufferScalingModeKey));
     if (metalFXEnabled || labEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
     if (labEnabled && encoder) labBeginEncoder(encoder,@"compute",nil,self);
+    if (samples != NSNotFound) if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder)) s->labRecord[@"samples"] = @(samples);
     return encoder;
 }
 static id computeEncoderType(id self, SEL cmd, MTLDispatchType type) {
@@ -2806,14 +2901,17 @@ static id computeEncoderType(id self, SEL cmd, MTLDispatchType type) {
             if (found != priorComputeMethods().end()) { forward = found->second; break; }
         }
     }
+    if (labCreatingProfiledEncoder) return ((id(*)(id,SEL,MTLDispatchType))forward)(self,cmd,type);
+    NSUInteger samples = labEnabled ? labProfileSamples([(id<MTLCommandBuffer>)self device]) : NSNotFound;
     activeBuffer = (__bridge void *)self;
-    id encoder = ((id(*)(id,SEL,MTLDispatchType))forward)(self,cmd,type);
+    id encoder = samples != NSNotFound ? labProfiledComputeEncoder(self,type,samples) : ((id(*)(id,SEL,MTLDispatchType))forward)(self,cmd,type);
     activeBuffer = previous;
     record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"dispatchType": @(type), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     setEncoderMode(encoder, objc_getAssociatedObject(self, &bufferScalingModeKey));
     if (metalFXEnabled || labEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
     if (labEnabled && encoder) labBeginEncoder(encoder,@"compute",nil,self);
+    if (samples != NSNotFound) if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder)) s->labRecord[@"samples"] = @(samples);
     return encoder;
 }
 static void countPresent(id drawable, SEL cmd) {

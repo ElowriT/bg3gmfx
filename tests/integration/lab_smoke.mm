@@ -182,6 +182,20 @@ int main(int argc, const char **argv) {
                 stampData.length == 4 ? *(const uint32_t *)stampData.bytes : 0, secondStamp.length == 4 ? *(const uint32_t *)secondStamp.bytes : 0,
                 (unsigned long)quadData.length,(unsigned long)color.length); return 22;
         }
+        // A profile times every pass of one frame with GPU timestamps.
+        control(@"profile prof\n");
+        frame(); frame(); frame();
+        usleep(800000);
+        NSData *profileData = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:@"profile-prof.json"]];
+        NSDictionary *profile = profileData ? [NSJSONSerialization JSONObjectWithData:profileData options:0 error:nil] : nil;
+        bool timedScene = false, timedCompute = false;
+        for (NSDictionary *pass in profile[@"passes"]) {
+            double ms = [pass[@"gpuMs"] doubleValue];
+            if (ms < 0 || ms > 1000) { fprintf(stderr,"Implausible pass time %f\n",ms); return 23; }
+            if ([pass[@"label"] isEqualToString:@"LabScene"]) timedScene = true;
+            if ([pass[@"kind"] isEqualToString:@"compute"]) timedCompute = true;
+        }
+        if (!timedScene || !timedCompute) { fprintf(stderr,"The profile did not time the frame's passes: %s\n",profile.description.UTF8String); return 24; }
         control(@"serialize\n");
         if (frame() != red || frame() != red) { fprintf(stderr,"Serialized encoders changed the frame\n"); return 18; }
         control(@"");
