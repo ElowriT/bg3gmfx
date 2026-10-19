@@ -88,9 +88,12 @@ from 23.7 W to 7.4 W at the same 95–96 fps; server ticks stayed at 30.0/s
 
 Live on BG3 4.1.1.7631656, M5 Pro, a 2560×1440 display (HiDPI), quiet runtime
 in [lab mode](../lab.md), with the user playing two-player split screen with
-controllers. These sessions ran on the 0.2.2-based branch; the port onto the
-feature layout passes `make test` and has not been rechecked live in split
-screen or with a controller.
+controllers. These sessions ran on the 0.2.2-based branch. On the feature
+layout, a single view (Temporal, fog, sharpening on/off: about 30% more edge
+detail on matched screenshots) and two-player split screen were rechecked live
+the same day, the split screen with two lab virtual controllers: per-view
+upscaling without native fallbacks while both cameras turned, and no visible
+seam. The window rebind click fix has not been rechecked on this layout.
 
 - Split-screen fog: the user reported "unnatural smoke" in split screen only.
   Lab dumps (copied right after each view's passes) and the fog shaders showed
@@ -260,7 +263,7 @@ changed.
 | Metal HUD | Persistent menu checkbox controls the Metal layer overlay | Menu ordering and HUD on/off were visually verified |
 | Error path | Setup and resource failures display a clear error and exit 78. A frame whose FSR input matches no captured scene (transitions) runs BG3's native FSR + RCAS for that frame, logs `metalFXNativeFallback`, and restarts Temporal history | Synthetic invalid-resource regressions pass; the hook fixture checks the unmatched-frame fallback. User reported scene-match closures before this change; not yet retested live |
 | Video Options Menu Fix | Restores `LSMTLView` first responder after BG3 detaches and reattaches it during fullscreen graphics-setting changes | User confirmed the fullscreen Video menu remains responsive after changing settings; modal and windowed paths still need broader checks |
-| Split screen | Fog composite uses view-relative UV mapping; each view is upscaled on its own | User-confirmed fog and seam fixes in two-player split screen on the 0.2.2-based branch; synthetic split-screen tests |
+| Split screen | Fog composite uses view-relative UV mapping; each view is upscaled on its own | User-confirmed fog and seam fixes in two-player split screen on the 0.2.2-based branch, rechecked on the feature layout with lab virtual controllers; synthetic split-screen tests |
 | MetalFX Sharpening | BG3's RCAS replayed on MetalFX output | Live matched-frame detail measurement; hook tests with and without sharpening |
 | Window Rebind Click Fix | The synthetic click after a window rebind is replaced by focusing the new view | User confirmed the controller keeps working in Video options on the 0.2.2-based branch |
 
