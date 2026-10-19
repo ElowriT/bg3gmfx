@@ -1,4 +1,5 @@
 #import "NativeMenu.h"
+#import "NativeFixes.h"
 #import "NativeJitter.h"
 #import <MetalFX/MetalFX.h>
 #import <AppKit/AppKit.h>
@@ -436,6 +437,7 @@ BOOL BG3MFXInstallNativeMenu(void (*report)(NSDictionary *), NSError **error) {
     if (!supported) { errorOut(error,@"Unsupported BG3 build for native menu integration."); return NO; }
     slide = _dyld_get_image_vmaddr_slide(imageIndex);
     if (!BG3MFXInstallNativeJitter(slide,report,error)) return NO;
+    BG3MFXInstallNativeFixes(slide,report);  // optional: reports and stays off if the call sites differ
     void **table = at<void **>(0x1087ac1a0);
     if (table[4] != at<void *>(0x103288fb8) || table[7] != at<void *>(0x103290180)) { errorOut(error,@"The Video menu callback was already modified."); return NO; }
     originalInit = reinterpret_cast<void(*)(void *)>(table[4]);

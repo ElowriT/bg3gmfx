@@ -12,6 +12,8 @@
 #import "TemporalUpscaler.h"
 #import "NativeMenu.h"
 #import "SplitScreenFog.h"
+#import "LabInput.h"
+#import "NativeFixes.h"
 #import "FrameInterpolation.h"
 #import "FrameLog.h"
 #import "GPUResources.h"
@@ -351,6 +353,10 @@ static id<MTLFence> labFence(id<MTLDevice> device) {
     return fence;
 }
 static std::atomic<unsigned> labGeneration{1};
+// "scaling N" renders new command buffers as Upscaling Type N (1 FSR, 2 Spatial,
+// 3 Temporal) for same-scene comparisons; GPU time feeds perf.json.
+static std::atomic<int> labScaling{-1};
+static std::atomic<uint64_t> labGPUNanoseconds{0}, labCommits{0};
 enum LabCensus : uint8_t { LabIdle, LabArmed, LabRecording };
 static LabCensus labCensus;
 static NSString *labCensusName;
@@ -407,6 +413,7 @@ static void labPoll(void) {
     NSMutableArray *skips = [NSMutableArray array], *watches = [NSMutableArray array], *pokes = [NSMutableArray array];
     NSString *census = nil;
     bool serialize = false;
+    int scaling = -1, idleWait = -1;
     for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
         NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if ([line hasPrefix:@"skip "] && line.length > 5) [skips addObject:[line substringFromIndex:5]];
@@ -448,8 +455,11 @@ static void labPoll(void) {
             }
         }
         else if ([line hasPrefix:@"census "] && line.length > 7) census = [line substringFromIndex:7];
+        else if ([line hasPrefix:@"scaling "]) scaling = [[line substringFromIndex:8] intValue];
+        else if ([line hasPrefix:@"idlewait "]) idleWait = [[line substringFromIndex:9] intValue];
     }
-    labSkips = skips; labWatches = watches; labPokes = pokes; labSerialize = serialize;
+    labSkips = skips; labWatches = watches; labPokes = pokes; labSerialize = serialize; labScaling = scaling;
+    if (idleWait >= 0) BG3MFXSetIdleWaitFix(idleWait != 0);
     unsigned generation = ++labGeneration;
     // A census already named in the file at launch is not repeated.
     if (census && !first && ![census isEqualToString:labCensusName]) labCensus = LabArmed;
@@ -459,7 +469,7 @@ static void labPoll(void) {
         labCensusName = [[census componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
     }
     first = false;
-    labWrite(@"status.json",@{@"generation":@(generation),@"skip":skips,@"watch":watches,@"poke":pokes,@"serialize":@(serialize),@"dumps":@(labDumps.count),@"census":labCensusName ?: @"",@"frame":@(frames)});
+    labWrite(@"status.json",@{@"generation":@(generation),@"skip":skips,@"watch":watches,@"poke":pokes,@"serialize":@(serialize),@"dumps":@(labDumps.count),@"census":labCensusName ?: @"",@"frame":@(frames),@"scaling":@(scaling)});
     fprintf(stderr,"BG3 MetalFX lab: generation %u, %lu skip rule(s)%s\n",generation,(unsigned long)skips.count,
         labCensus == LabArmed ? ", census armed" : "");
 }
@@ -712,8 +722,22 @@ static void labWriteDumps(id<MTLCommandBuffer> buffer, __unsafe_unretained id en
         dump[@"state"] = @"written"; [dump removeObjectsForKeys:@[@"texture",@"buffer",@"encoder"]];
     }
 }
+// About once a second: presented frames, command buffers and GPU busy time.
+static void labPerf(void) {
+    static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU;
+    double now = CACurrentMediaTime();
+    if (now - last < 1.0) return;
+    uint64_t commits = labCommits.load(), gpu = labGPUNanoseconds.load();
+    if (last) {
+        double span = now - last, presented = (double)(frames - lastFrames);
+        labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
+            @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),@"frame":@(frames)});
+    }
+    last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu;
+}
 static void labFrameBoundary(void) {
     labPoll();
+    labPerf();
     std::lock_guard<std::recursive_mutex> lock(guard());
     if (labDumpArmed) for (NSMutableDictionary *dump in labDumps) if ([dump[@"state"] isEqualToString:@"armed"]) dump[@"seen"] = @0;
     if (labCensus == LabArmed) { labFrame = [NSMutableArray array]; labCensus = LabRecording; return; }
@@ -967,6 +991,7 @@ static void failSpatial(NSString *reason) { failFeature(NO,reason); }
 static void failTemporal(NSString *reason) { failFeature(YES,reason); }
 static void menuReport(NSDictionary *event) {
     record(event);
+    if (labEnabled) BG3MFXLabInputNote(event);
     if ([event[@"event"] isEqualToString:@"nativeMenuError"])
         failFeature(NO,event[@"error"]);
     if ([event[@"event"] isEqualToString:@"frameGenerationChanged"] || [event[@"event"] isEqualToString:@"upscalingModeChanged"]) {
@@ -2332,6 +2357,13 @@ static void presentTimed(id self, SEL cmd, id drawable, double time) {
 }
 static void commit(id self, SEL cmd) {
     if (labEnabled && labDumpCaptured) labWriteDumps(self);
+    if (labEnabled) {
+        labCommits.fetch_add(1,std::memory_order_relaxed);
+        [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            double span = done.GPUEndTime - done.GPUStartTime;
+            if (span > 0 && span < 1) labGPUNanoseconds.fetch_add((uint64_t)(span*1e9),std::memory_order_relaxed);
+        }];
+    }
     if (id<MTLDrawable> shown=objc_getAssociatedObject(self,&nativePresentKey)) {
         objc_setAssociatedObject(self,&nativePresentKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         CFTimeInterval committed=CACurrentMediaTime();
@@ -2440,6 +2472,7 @@ static id commandBuffer(id self, SEL cmd) {
     // Selection changes apply to the next command buffer. Sampling the live
     // menu independently at TAA and FSR could mix two render paths in one frame.
     int mode = BG3MFXSelectedScalingMode();
+    if (labEnabled) if (int forced = labScaling.load(std::memory_order_relaxed); forced >= 1 && forced <= 3) mode = forced;
     id buffer = ((id(*)(id,SEL))original(self,actual))(self,actual);
     objc_setAssociatedObject(buffer,&bufferScalingModeKey,@(mode),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // Frame Generation combines with every Upscaling Type: it uses the camera,
@@ -2494,6 +2527,7 @@ __attribute__((constructor)) static void start() {
             labSkips = @[]; labEnabled = true;
             traceConstants = YES;  // installs the draw and dispatch hooks
             fprintf(stderr,"BG3 MetalFX lab mode: %s\n",labDirectory.UTF8String);
+            BG3MFXLabInputStart(labDirectory);
         }
         if (diagnostics) {
             constantSamples = [NSMutableDictionary dictionary];
