@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
+#include <objc/runtime.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -199,19 +200,21 @@ int main(int argc, const char **argv) {
         if (!timedScene || !timedCompute) { fprintf(stderr,"The profile did not time the frame's passes: %s\n",profile.description.UTF8String); return 24; }
         // Virtual controllers: "pad N" lines connect them and name held buttons
         // and stick positions; a pad without a line disconnects.
+        // Physical controllers connected to the Mac are left out of the counts.
+        auto virtualPad = ^bool(id controller) { return !strcmp(object_getClassName(controller),"BG3MFXLabController"); };
+        auto virtualPads = ^NSUInteger { NSUInteger n = 0; for (GCController *c in GCController.controllers) n += virtualPad(c); return n; };
         __block NSUInteger connects = 0, disconnects = 0;
         [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:nil
-            usingBlock:^(NSNotification *) { ++connects; }];
+            usingBlock:^(NSNotification *note) { connects += virtualPad(note.object); }];
         [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil
-            usingBlock:^(NSNotification *) { ++disconnects; }];
+            usingBlock:^(NSNotification *note) { disconnects += virtualPad(note.object); }];
         auto settle = ^{ frame(); [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]]; };
-        NSUInteger realControllers = GCController.controllers.count;
         control(@"pad 1\npad 2 a lb up\npad 2 stick left 0.5 -1\n");
         settle();
         GCController *joined = nil;
-        for (GCController *controller in GCController.controllers) if (controller.extendedGamepad.buttonA.pressed) joined = controller;
+        for (GCController *controller in GCController.controllers) if (virtualPad(controller) && controller.extendedGamepad.buttonA.pressed) joined = controller;
         GCExtendedGamepad *gamepad = joined.extendedGamepad;
-        if (connects != 2 || GCController.controllers.count != realControllers + 2 || !joined ||
+        if (connects != 2 || virtualPads() != 2 || !joined ||
             ![joined.vendorName isEqualToString:@"Xbox Wireless Controller"]) {
             fprintf(stderr,"Two virtual controllers did not connect (%lu notifications): %s\n",(unsigned long)connects,
                 [NSString stringWithContentsOfFile:[directory stringByAppendingPathComponent:@"status.json"] encoding:NSUTF8StringEncoding error:nil].UTF8String); return 25;
@@ -236,7 +239,7 @@ int main(int argc, const char **argv) {
         settle(); settle();
         NSData *padStatusData = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:@"status.json"]];
         NSDictionary *padStatus = padStatusData ? [NSJSONSerialization JSONObjectWithData:padStatusData options:0 error:nil] : nil;
-        if (disconnects != 1 || GCController.controllers.count != realControllers + 1 || ![joined.vendorName length]) {
+        if (disconnects != 1 || virtualPads() != 1 || ![joined.vendorName length]) {
             fprintf(stderr,"Removing a pad's lines did not disconnect it\n"); return 28;
         }
         if (![padStatus[@"pads"] isKindOfClass:NSArray.class]) { fprintf(stderr,"status.json does not report the pads\n"); return 29; }
