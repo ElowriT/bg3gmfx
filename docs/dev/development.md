@@ -54,7 +54,9 @@ command, and the script finds the bundle in the Steam libraries. It starts the
 game through LaunchServices (`open -n -W`), so the game keeps its own access to
 `~/Documents` and Steam tracks it until it quits, with the quiet runtime from
 `build/bin/` injected after Steam's own libraries (the overlay), `-NoLauncher 1`,
-and the Metal HUD loadable as the `bg3mfx` launcher does. Optional
+and the Metal HUD loadable as the `bg3mfx` launcher does.
+`BG3MFX_STEAM_OVERLAY=0` in the file below leaves Steam's libraries out, as
+that launcher does. Optional
 `build/steam-launch.env` lines (`KEY=VALUE`) are added to the game's
 environment, for example `BG3MFX_LAB=/absolute/path` for lab mode;
 `BG3MFX_RUNTIME=` there selects another library. Clear the Launch Options to

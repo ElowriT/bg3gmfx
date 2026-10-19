@@ -8,13 +8,14 @@
 # bundle; the "#" keeps that path (whose name has an apostrophe) out of the
 # command, and the bundle is found here instead. The game is started through
 # LaunchServices like a normal Steam launch, so it keeps its own access to
-# ~/Documents, with the runtime injected next to Steam's own libraries (the
+# ~/Documents, with the runtime injected after Steam's own libraries (the
 # overlay), the Larian launcher skipped and the Metal HUD loadable. Steam
 # tracks the game until it quits.
 #
 # Optional build/steam-launch.env: KEY=VALUE lines added to the game's
 # environment (for example BG3MFX_LAB=/absolute/path); BG3MFX_RUNTIME there
-# selects another runtime library.
+# selects another runtime library, and BG3MFX_STEAM_OVERLAY=0 leaves out
+# Steam's libraries, as the bg3mfx launcher does.
 set -u
 checkout="$(cd "$(dirname "$0")/../.." && pwd)"
 runtime="$checkout/build/bin/libBG3MetalFX.dylib"
@@ -29,10 +30,15 @@ fail() {
 }
 
 extra=()
+overlay=1
 if [ -f "$checkout/build/steam-launch.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
-        if [ "${line%%=*}" = BG3MFX_RUNTIME ]; then runtime="${line#*=}"; else extra+=(--env "$line"); fi
+        case "${line%%=*}" in
+            BG3MFX_RUNTIME) runtime="${line#*=}" ;;
+            BG3MFX_STEAM_OVERLAY) overlay="${line#*=}" ;;
+            *) extra+=(--env "$line") ;;
+        esac
     done < "$checkout/build/steam-launch.env"
 fi
 [ -f "$runtime" ] || fail "The runtime $runtime is missing. Run make in $checkout."
@@ -55,7 +61,7 @@ fi
 [ -n "$app" ] || fail "Baldur's Gate 3 was not found in the Steam libraries."
 
 inserts="$runtime"
-[ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ] && inserts="$STEAM_DYLD_INSERT_LIBRARIES:$runtime"
+[ "$overlay" = 1 ] && [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ] && inserts="$STEAM_DYLD_INSERT_LIBRARIES:$runtime"
 # Metal loads its HUD only when MTL_HUD_ENABLED is set at launch; it starts
 # hidden unless BG3's Show Metal HUD checkbox was left on (as bg3mfx does).
 hud=(--env MTL_HUD_ENABLED=1)

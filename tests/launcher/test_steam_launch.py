@@ -49,6 +49,13 @@ class SteamLaunchTests(unittest.TestCase):
             self.assertIn(value, environment)
         self.assertEqual(arguments[-4:], [str(self.app), "--args", "-NoLauncher", "1"])
 
+    def test_leaves_out_steam_libraries_on_request(self):
+        self.env_file.write_text("BG3MFX_STEAM_OVERLAY=0\n")
+        result, arguments = self.launch(STEAM_DYLD_INSERT_LIBRARIES="/steam/overlay.dylib")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"DYLD_INSERT_LIBRARIES={self.runtime}", arguments)
+        self.assertNotIn("BG3MFX_STEAM_OVERLAY=0", arguments)
+
     def test_uses_an_intact_bundle_and_another_runtime(self):
         other = self.root / "Other Library/Baldur's Gate 3.app"
         other.mkdir(parents=True)
