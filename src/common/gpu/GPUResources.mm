@@ -1,7 +1,9 @@
 #import "common/gpu/GPUResources.h"
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <objc/runtime.h>
 
 #if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
 static std::atomic<NSUInteger> poolAllocations{0};
@@ -62,6 +64,60 @@ static NSError *resourceError(NSString *reason) {
 }
 @end
 
+// Submission order (see GPUResources.h). Per command queue, the tracked buffers
+// in GPU order; each buffer holds its pending submissions until it is committed.
+static std::atomic<uint64_t> reordered{0};
+uint64_t BG3MFXMetal4Reordered(void) { return reordered.load(std::memory_order_relaxed); }
+static std::recursive_mutex &orderLock() { static auto *lock=new std::recursive_mutex; return *lock; }
+static std::unordered_map<const void *, std::deque<id<MTLCommandBuffer>>> &orderQueues() {
+    static auto *queues=new std::unordered_map<const void *, std::deque<id<MTLCommandBuffer>>>; return *queues;
+}
+static char orderStateKey, orderPendingKey;
+enum : int { OrderUntracked=0, OrderTracked, OrderEnqueued, OrderCommitted };
+static int orderState(id buffer) { return [objc_getAssociatedObject(buffer,&orderStateKey) intValue]; }
+static void setOrderState(id buffer, int state) {
+    objc_setAssociatedObject(buffer,&orderStateKey,@(state),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+void BG3MFXMetal4TrackBuffer(id<MTLCommandBuffer> buffer) { setOrderState(buffer,OrderTracked); }
+// Gives `buffer` its place in its queue's GPU order (order lock held).
+static void placeInOrder(id<MTLCommandBuffer> buffer) {
+    if (orderState(buffer)!=OrderTracked) return;
+    setOrderState(buffer,OrderEnqueued);
+    orderQueues()[(__bridge const void *)buffer.commandQueue].push_back(buffer);
+}
+void BG3MFXMetal4Enqueue(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void)) {
+    if (orderState(buffer)==OrderUntracked) { call(); return; }
+    std::lock_guard<std::recursive_mutex> lock(orderLock());
+    call(); placeInOrder(buffer);
+}
+void BG3MFXMetal4Commit(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void)) {
+    if (orderState(buffer)==OrderUntracked) { call(); return; }
+    std::lock_guard<std::recursive_mutex> lock(orderLock());
+    placeInOrder(buffer);  // a buffer never enqueued takes its place at commit
+    setOrderState(buffer,OrderCommitted);
+    auto &buffers=orderQueues()[(__bridge const void *)buffer.commandQueue];
+    while (!buffers.empty() && orderState(buffers.front())==OrderCommitted) {
+        id<MTLCommandBuffer> next=buffers.front(); buffers.pop_front();
+        NSArray *pending=objc_getAssociatedObject(next,&orderPendingKey);
+        objc_setAssociatedObject(next,&orderPendingKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        for (void (^submit)(void) in pending) submit();
+    }
+    call();
+}
+// Holds `submit` until `buffer`'s turn; NO when it should run now.
+static BOOL deferSubmission(id<MTLCommandBuffer> buffer, void (^submit)(void)) {
+    if (orderState(buffer)==OrderUntracked) return NO;
+    std::lock_guard<std::recursive_mutex> lock(orderLock());
+    if (orderState(buffer)==OrderCommitted) return NO;
+    NSMutableArray *pending=objc_getAssociatedObject(buffer,&orderPendingKey);
+    if (!pending) {
+        pending=[NSMutableArray array];
+        objc_setAssociatedObject(buffer,&orderPendingKey,pending,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [pending addObject:[submit copy]];
+    return YES;
+}
+
 // One reusable Metal 4 submission. Its event values increase per reuse, so a
 // slot's signal never moves backwards even if BG3 commits buffers out of order.
 @interface BG3MFXMetal4Slot : NSObject
@@ -80,6 +136,7 @@ static NSError *resourceError(NSString *reason) {
     NSString *_label;
     std::mutex _mutex;
     NSMutableArray<BG3MFXMetal4Slot *> *_free;
+    uint64_t _encoded, _submitted;  // submission numbers in encoding order
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)device label:(NSString *)label error:(NSError **)error {
     if (!(self=[super init])) return nil;
@@ -118,10 +175,8 @@ static NSError *resourceError(NSString *reason) {
             if (error) *error=resourceError(@"Could not allocate a Metal 4 submission."); return NO;
         }
     }
-    [slot.commands beginCommandBufferWithAllocator:slot.allocator];
-    [slot.commands useResidencySet:residency];
-    encode(slot.commands);
-    [slot.commands endCommandBuffer];
+    uint64_t sequence;
+    { std::lock_guard<std::mutex> lock(_mutex); sequence=++_encoded; }
     uint64_t ready=++slot.value, done=++slot.value;
     // Metal 4 command buffers do not retain allocations; keep everything the
     // submission touches alive until GPU feedback, then recycle the slot.
@@ -137,12 +192,28 @@ static NSError *resourceError(NSString *reason) {
         [slot.allocator reset];
         std::lock_guard<std::mutex> lock(bridge->_mutex); [bridge->_free addObject:slot];
     }];
-    id<MTL4CommandBuffer> commands=slot.commands;
+    id<MTL4CommandQueue> queue=_queue; id<MTLEvent> event=slot.event; id<MTL4CommandBuffer> commands=slot.commands;
+    id<MTL4CommandAllocator> allocator=slot.allocator; void (^record)(id<MTL4CommandBuffer>)=[encode copy];
+    // Recorded at submission: a temporal effect links each frame to the one
+    // encoded before it, so it must see frames in the order the GPU runs them.
+    void (^submit)(void)=^{
+        [commands beginCommandBufferWithAllocator:allocator];
+        [commands useResidencySet:residency];
+        record(commands);
+        [commands endCommandBuffer];
+        {
+            std::lock_guard<std::mutex> lock(bridge->_mutex);
+            if (sequence<bridge->_submitted) reordered.fetch_add(1,std::memory_order_relaxed);
+            else bridge->_submitted=sequence;
+        }
+        id<MTL4CommandBuffer> list=commands;
+        [queue waitForEvent:event value:ready];
+        [queue commit:&list count:1 options:options];
+        [queue signalEvent:event value:done];
+    };
     [buffer encodeSignalEvent:slot.event value:ready];
-    [_queue waitForEvent:slot.event value:ready];
-    [_queue commit:&commands count:1 options:options];
-    [_queue signalEvent:slot.event value:done];
     [buffer encodeWaitForEvent:slot.event value:done];
+    if (!deferSubmission(buffer,submit)) submit();
     return YES;
 }
 @end

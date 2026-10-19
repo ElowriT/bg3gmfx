@@ -25,7 +25,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)init NS_UNAVAILABLE;
 - (nullable instancetype)initWithDevice:(id<MTLDevice>)device label:(NSString *)label error:(NSError **)error;
 // `allocations` are made resident for this submission. `retained` objects and
-// the allocations stay alive until the GPU reports completion.
+// the allocations stay alive until the GPU reports completion. `encode` may run
+// later (see submission order below), so it must capture every value it uses.
 - (BOOL)encodeIntoBuffer:(id<MTLCommandBuffer>)buffer
              allocations:(NSArray<id<MTLAllocation>> *)allocations
                 retained:(NSArray *)retained
@@ -33,6 +34,24 @@ NS_ASSUME_NONNULL_BEGIN
                  failure:(nullable void (^)(NSError *error))failure
                    error:(NSError **)error;
 @end
+
+// Submission order. A bridge submission waits on its Metal 4 queue for a signal
+// from the command buffer it is encoded into, so it must reach that queue in the
+// GPU order of those buffers. BG3 fixes that order with -enqueue and encodes the
+// buffers afterwards, on several threads; submitted in encoding order, a queue
+// could wait on a buffer that runs after one waiting on the queue (a GPU
+// timeout). Temporal effects also link each frame to the one encoded before it.
+// For tracked buffers, submissions are recorded and submitted once the buffer
+// and every buffer enqueued before it on its queue have been committed; a
+// buffer that is never committed never submits. Untracked buffers submit
+// immediately.
+void BG3MFXMetal4TrackBuffer(id<MTLCommandBuffer> buffer);
+// The runtime's -enqueue and -commit hooks: `call` is the original method.
+void BG3MFXMetal4Enqueue(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void));
+void BG3MFXMetal4Commit(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void));
+// Submissions that reached their queue in another order than they were encoded
+// in (each would have waited on the GPU without the ordering).
+uint64_t BG3MFXMetal4Reordered(void);
 
 // Diagnostics and lab mode (both runtimes): when set, receives each Metal 4
 // bridge submission's GPU time.

@@ -1001,7 +1001,8 @@ static void labPerf(void) {
         double span = now - last, presented = (double)(frames - lastFrames);
         labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
             @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),
-            @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames)});
+            @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames),
+            @"metal4Reordered":@(BG3MFXMetal4Reordered())});
     }
     last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu; lastMetal4 = metal4;
 }
@@ -3026,7 +3027,12 @@ static void commit(id self, SEL cmd) {
                 @"paired":@(pairedPresents.load()),@"unpaired":@(replayedPresents.load())});
 #endif
     }
-    ((void(*)(id,SEL))original(self,cmd))(self,cmd);
+    BG3MFXMetal4Commit(self,^{ ((void(*)(id,SEL))original(self,cmd))(self,cmd); });
+}
+// BG3 fixes its buffers' GPU order with -enqueue before encoding them; Metal 4
+// submissions follow that order (GPUResources.h).
+static void enqueueBuffer(id self, SEL cmd) {
+    BG3MFXMetal4Enqueue(self,^{ ((void(*)(id,SEL))original(self,cmd))(self,cmd); });
 }
 // Frame Generation hands BG3 a stand-in instead of a real drawable; the
 // presenter's own thread still receives real ones.
@@ -3130,6 +3136,8 @@ static id commandBuffer(id self, SEL cmd) {
     hook(buffer,"presentDrawable:afterMinimumDuration:",(IMP)presentTimed);
     hook(buffer,"presentDrawable:atTime:",(IMP)presentTimed);
     hook(buffer,"commit",(IMP)commit);
+    hook(buffer,"enqueue",(IMP)enqueueBuffer);
+    if (metalFXEnabled) BG3MFXMetal4TrackBuffer(buffer);
     if (diagnostics) hook(buffer,"pushDebugGroup:",(IMP)group);
     return buffer;
 }

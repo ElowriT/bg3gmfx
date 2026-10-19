@@ -130,6 +130,24 @@ the seam; fails on the earlier runtime), RCAS replay counts and identity checks
 in the Spatial, Temporal and Frame Generation hook tests (with and without
 sharpening), and `lab-smoke` for lab mode including the profiler.
 
+## Metal 4 submission order (October 19)
+
+Live on the feature layout (2560×1440, two-player split screen, MetalFX
+Temporal): right after the frame cap was turned off, the game ran at about one
+frame per second, the kernel logged `AGX: Channel error 2` and denied BG3
+further GPU submissions after two GPU restarts, BG3's command buffers failed
+with `kIOGPUCommandBufferCallbackErrorTimeout`, and bg3mfx reported
+"MetalFX Temporal could not continue" (`MTL4CommandQueueErrorDomain` error 1,
+a Metal 4 queue timeout). Bridge submissions reached their Metal 4 queue in
+encoding order, while BG3 fixes the GPU order of its buffers with `-enqueue`
+after encoding them. `metal4-bridge-smoke` now encodes upscaling into two
+buffers in one order and enqueues them in the other: submitted in encoding
+order it fails with the same GPU timeout after about 10 s; submitting in
+enqueue order alone still stalled about 4 s, because the temporal scaler links
+frames in encoding order. With the scaler work recorded at submission time it
+completes in milliseconds. Not yet rechecked live with the frame cap off;
+`perf.json` reports `metal4Reordered`, the submissions that this reordered.
+
 ## Frame Generation
 
 Frame Generation is the "MetalFX Frame Generation" checkbox and combines with

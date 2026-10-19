@@ -75,6 +75,16 @@ other devices retain `MTLFXTemporalScaler`. A dedicated Metal 4 queue waits on
 an event signaled after BG3 produces the scaler inputs, then signals another
 event that BG3's original Metal 3 buffer waits on before consuming the output.
 Per-submission residency and feedback-owned resources preserve GPU lifetimes.
+BG3 encodes its command buffers on several threads and fixes their GPU order
+with `-enqueue` afterwards, so encoding order and GPU order can differ (seen
+with the frame cap off). A Metal 4 submission is therefore recorded and
+submitted only when its BG3 buffer, and every buffer enqueued before it on its
+queue, has been committed: the queue never waits on a buffer that runs later,
+and the temporal scaler and the Frame Generation effect see frames in GPU
+order (they link each frame to the one encoded before). A buffer that is never
+committed never submits. Before this, such a frame left the Metal 4 queue and
+BG3 waiting on each other until the GPU timed out (`MTL4CommandQueueErrorDomain`
+error 1, then macOS refused the game further GPU submissions).
 This does not convert BG3's renderer or presentation to Metal 4. See the
 [Metal 4 audit](validation/metal4-temporal.md) for the API/model distinction and
 validation limits.

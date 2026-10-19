@@ -169,22 +169,27 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
         [encoder endEncoding];
     }
     id<MTLTexture> previous=_directColor ? nil : (_previous ?: color);
-    _effect.colorTexture=color; _effect.prevColorTexture=previous; _effect.outputTexture=out;
-    _effect.depthTexture=z; _effect.motionTexture=mv; _effect.depthReversed=p.depthReversed;
-    _effect.motionVectorScaleX=p.motionScaleX; _effect.motionVectorScaleY=p.motionScaleY;
-    _effect.jitterOffsetX=p.jitterX; _effect.jitterOffsetY=p.jitterY;
-    _effect.nearPlane=c[48]; _effect.farPlane=c[49]; _effect.fieldOfView=fov;
-    _effect.aspectRatio=(float)_outW/_outH; _effect.deltaTime=delta;
-    _effect.shouldResetHistory=_reset || p.reset; _effect.uiTexture=nil;
+    // Captured values: the Metal 4 bridge may encode this frame later.
+    float nearPlane=c[48], farPlane=c[49], aspect=(float)_outW/_outH; BOOL reset=_reset || p.reset;
+    void (^configure)(id<MTLFXFrameInterpolatorBase>)=^(id<MTLFXFrameInterpolatorBase> e) {
+        e.colorTexture=color; e.prevColorTexture=previous; e.outputTexture=out;
+        e.depthTexture=z; e.motionTexture=mv; e.depthReversed=p.depthReversed;
+        e.motionVectorScaleX=p.motionScaleX; e.motionVectorScaleY=p.motionScaleY;
+        e.jitterOffsetX=p.jitterX; e.jitterOffsetY=p.jitterY;
+        e.nearPlane=nearPlane; e.farPlane=farPlane; e.fieldOfView=fov;
+        e.aspectRatio=aspect; e.deltaTime=delta;
+        e.shouldResetHistory=reset; e.uiTexture=nil;
+    };
     if (_effect4) {
         id<MTL4FXFrameInterpolator> effect=_effect4;
         if (![_bridge encodeIntoBuffer:buffer allocations:previous ? @[color,z,mv,out,previous] : @[color,z,mv,out] retained:@[effect]
                 encode:^(id<MTL4CommandBuffer> commands) {
+                    configure(effect);
                     commands.label=@"BG3MFX generated scene"; [effect encodeToCommandBuffer:commands];
                 } failure:self.failureHandler error:error]) {
             [_lock unlock]; return nil;
         }
-    } else { [_effect3 encodeToCommandBuffer:buffer]; }
+    } else { configure(_effect3); [_effect3 encodeToCommandBuffer:buffer]; }
     if (!_directColor) {
         if (_previous) [_colors relinquish:_previous afterCommandBuffer:buffer];
         [_colors retainTexture:color]; _previous=color;
