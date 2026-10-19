@@ -42,6 +42,11 @@ static std::map<std::pair<Class, SEL>, IMP> &originals() {
     static auto *value = new std::map<std::pair<Class, SEL>, IMP>;
     return *value;
 }
+// The replacement each hooked method received, to recognize it under another name.
+static std::map<std::pair<Class, SEL>, IMP> &replacements() {
+    static auto *value = new std::map<std::pair<Class, SEL>, IMP>;
+    return *value;
+}
 static NSMutableSet<NSString *> *seen;
 static NSFileHandle *output;
 static unsigned long frames;
@@ -1130,6 +1135,21 @@ static IMP originalSlow(Class concrete, SEL selector, unsigned generation, Origi
         auto it = originals().find({cls, selector});
         if (it != originals().end()) { entry = {concrete, selector, it->second, generation}; return it->second; }
     }
+    // Another library exchanged a hooked method with one of its own (the Steam
+    // overlay does this for -commit), so a replacement runs under that
+    // library's selector. Find the hooked method by the replacement it carries.
+    if (Method method = class_getInstanceMethod(concrete, selector)) {
+        IMP running = method_getImplementation(method), found = nullptr;
+        bool ambiguous = false;
+        for (Class cls = concrete; cls; cls = class_getSuperclass(cls))
+            for (auto &[key, replacement] : replacements())
+                if (key.first == cls && replacement == running) {
+                    IMP imp = originals()[key];
+                    if (found && imp != found) ambiguous = true;
+                    found = imp;
+                }
+        if (found && !ambiguous) { entry = {concrete, selector, found, generation}; return found; }
+    }
     abort();
 }
 static void hook(id object, const char *name, IMP replacement) {
@@ -1145,6 +1165,7 @@ static void hook(id object, const char *name, IMP replacement) {
     Method method = class_getInstanceMethod(cls, selector);
     if (!method || method_getImplementation(method) == replacement) return;
     originals()[{cls, selector}] = method_getImplementation(method);
+    replacements()[{cls, selector}] = replacement;
     originalsGeneration.fetch_add(1, std::memory_order_release);
     class_replaceMethod(cls, selector, replacement, method_getTypeEncoding(method));
 }

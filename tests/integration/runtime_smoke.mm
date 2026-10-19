@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #include <dlfcn.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 static IMP earlierCompute;
 static id lateComputeWrapper(id self, SEL cmd, MTLDispatchType type) {
@@ -88,6 +89,15 @@ int main(int argc, const char **argv) {
         [encoder setComputePipelineState:compute]; [encoder setBuffer:computed offset:0 atIndex:0];
         [encoder dispatchThreads:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(4,1,1)];
         [encoder endEncoding];
+        // Another library exchanging -commit with a method of its own, as the
+        // Steam overlay does, leaves the runtime's hook under that selector.
+        Class committedClass = object_getClass(buffer);
+        SEL overlayCommit = sel_registerName("overlaySmoke_commit");
+        class_addMethod(committedClass, overlayCommit, imp_implementationWithBlock(^(id self) {
+            ((void(*)(id,SEL))objc_msgSend)(self, overlayCommit);
+        }), "v@:");
+        method_exchangeImplementations(class_getInstanceMethod(committedClass, @selector(commit)),
+                                       class_getInstanceMethod(committedClass, overlayCommit));
         [buffer commit];
         [buffer waitUntilCompleted];
         if (buffer.status != MTLCommandBufferStatusCompleted) return 4;
@@ -95,7 +105,7 @@ int main(int argc, const char **argv) {
         uint8_t pixel[4];
         [texture getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(32,32,1,1) mipmapLevel:0];
         if (pixel[0] < 62 || pixel[0] > 65 || pixel[1] < 126 || pixel[1] > 129 || pixel[2] < 190 || pixel[2] > 193) return 7;
-        puts("Runtime loaded; hooked Metal command buffer completed");
+        puts("Runtime loaded; hooked Metal command buffer completed, also with -commit exchanged by another library");
     }
     return 0;
 }
