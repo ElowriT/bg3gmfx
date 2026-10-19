@@ -170,6 +170,12 @@ and releasing. Bug reports and pull requests are welcome.
 
 ## License and credits
 
+BG3MFX was created by [AndrewTriesToCode](https://github.com/AndrewTriesToCode).
+The split-screen fixes, MetalFX sharpening, controller input fix and lab mode
+added by [ElowriT](https://github.com/ElowriT) build directly on that work: the
+runtime, the research behind it and the care in its documentation made them
+possible. Thank you, Andrew!
+
 BG3MFX is released under the [MIT License](LICENSE). It contains no game
 files or assets, and downloading it doesn't give you the game: you need your own
 copy of Baldur's Gate 3 from Steam.
