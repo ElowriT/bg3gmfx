@@ -42,7 +42,7 @@ int main(int argc,char **argv) { @autoreleasepool {
         "fragment float4 CombineUI_HDR(Q q [[stage_in]],texture2d<float> scene [[texture(0)]],texture2d<float> ui [[texture(1)]],constant C &c [[buffer(0)]],sampler s [[sampler(0)]]){return combine(q,scene,ui,c,s);}\n"
         "kernel void CAS(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],uint2 p [[thread_position_in_grid]]){d.write(s.read(p),p);}\n"
         "kernel void FSR(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],device atomic_uint *count [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p==uint2(0)))atomic_fetch_add_explicit(count,1,memory_order_relaxed);d.write(s.read(p/2),p);}\n"
-        "kernel void FSR_RCAS(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(2)]],device atomic_uint *count [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p==uint2(0)))atomic_fetch_add_explicit(count,1,memory_order_relaxed);float3 c=s.read(p).rgb;d.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p);}";
+        "kernel void FSR_RCAS(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(2)]],device atomic_uint *count [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p==uint2(0)))atomic_fetch_add_explicit(count+1,1,memory_order_relaxed);float3 c=s.read(p).rgb;d.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p);}";
     auto library=[device newLibraryWithSource:source options:nil error:&error];if(!library)return 4;
     NSMutableArray *render=[NSMutableArray array];
     NSArray *names=@[@"LinearizeDepth",@"VelocityBufferCamera_PS",@"PPTAA_PS",@"FSR_Tonemap",@"PPToneMap_LUT",hdrOutput ? @"CombineUI_HDR" : @"CombineUI"];
@@ -55,7 +55,12 @@ int main(int argc,char **argv) { @autoreleasepool {
     auto rcas=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"FSR_RCAS"] error:&error];
     auto cas=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"CAS"] error:&error];
     auto q=[device newCommandQueue];auto vertices=[device newBufferWithLength:80 options:MTLResourceStorageModeShared];
-    auto count=[device newBufferWithLength:4 options:MTLResourceStorageModeShared];auto sample=[device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+    // FSR dispatches in [0], RCAS in [1]: with sharpening, BG3's RCAS also runs once on a MetalFX result.
+    auto count=[device newBufferWithLength:8 options:MTLResourceStorageModeShared];
+    const char *sharpeningSetting=getenv("BG3MFX_METALFX_SHARPENING");bool sharpening=!sharpeningSetting || strcmp(sharpeningSetting,"0");
+    // Off has no FSR stage; FSR (and unsettled sizes) run it natively; MetalFX replaces FSR.
+    auto dispatchesMatch=[&](int mode,bool native){const uint32_t *n=(const uint32_t *)count.contents;
+        if(native)return n[0]==1 && n[1]==1;if(mode==0)return n[0]==0 && n[1]==0;return n[0]==0 && n[1]==(sharpening ? 1u : 0u);};auto sample=[device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
     float camera[56]={};camera[21]=1.7;camera[26]=-.001001;camera[30]=.1001001;camera[48]=.1;camera[49]=100;
     float temporal[56]={},viewport[42]={};viewport[0]=viewport[1]=1;((uint32_t *)viewport)[4]=((uint32_t *)viewport)[5]=128;
     // Unattached layer: nothing is shown. Without Frame Generation BG3 gets real
@@ -103,7 +108,7 @@ int main(int argc,char **argv) { @autoreleasepool {
             if(i==1)[e setFragmentBytes:camera length:sizeof(camera) atIndex:11];
             if(i==2){[e setFragmentTexture:motion atIndex:2];[e setFragmentBytes:temporal length:sizeof(temporal) atIndex:8];[e setFragmentBytes:viewport length:sizeof(viewport) atIndex:9];}
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e endEncoding];}
-        *(uint32_t *)count.contents=0;
+        memset(count.contents,0,8);
         if(mode){pass=[MTLRenderPassDescriptor new];pass.colorAttachments[0].texture=bounded;pass.colorAttachments[0].loadAction=MTLLoadActionDontCare;pass.colorAttachments[0].storeAction=MTLStoreActionStore;e=[b renderCommandEncoderWithDescriptor:pass];[e setRenderPipelineState:render[3]];[e setFragmentTexture:taa atIndex:0];[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e endEncoding];
             auto c=[b computeCommandEncoder];[c setComputePipelineState:fsr];[c setTexture:bounded atIndex:0];[c setTexture:scaled atIndex:1];[c setBuffer:count offset:0 atIndex:0];[c dispatchThreads:MTLSizeMake(out,out,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
             [c setComputePipelineState:rcas];[c setTexture:scaled atIndex:0];[c setTexture:hdr atIndex:2];[c dispatchThreads:MTLSizeMake(out,out,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[c endEncoding];}
@@ -120,7 +125,7 @@ int main(int argc,char **argv) { @autoreleasepool {
             // Frame Generation requires Temporal and the checkbox; otherwise native presentation.
             if(outputs){fprintf(stderr,"Frame generation ran for menu choice %d\n",choice);return 7;}
             [b commit];[b waitUntilCompleted];
-            if(b.error || *(uint32_t *)count.contents!=(mode==1 || unsettled ? 2u : 0u)){fprintf(stderr,"Native FSR dispatch/completion mismatch %d: %s\n",mode,b.error.description.UTF8String);return 8;}
+            if(b.error || !dispatchesMatch(mode,mode==1 || unsettled)){fprintf(stderr,"Native FSR dispatch/completion mismatch %d: %s\n",mode,b.error.description.UTF8String);return 8;}
             [NSThread sleepForTimeInterval:.1];
             if(size){printf("%s %lux%lu output used %s for menu choice %d.\n",unsettled ? "Unsettled" : "Settled",(unsigned long)out,(unsigned long)out,
                 unsettled ? "native FSR" : "MetalFX Temporal",choice);return 0;}
@@ -132,7 +137,7 @@ int main(int argc,char **argv) { @autoreleasepool {
         if(!outputs){fprintf(stderr,"No generated pair for mode %d\n",mode);return 7;}
         NSMutableArray *reads=[NSMutableArray array];auto blit=[b blitCommandEncoder];
         for(id<MTLTexture> t in @[final,outputs[@"generated"]]){auto r=[device newBufferWithLength:width*height*4 options:MTLResourceStorageModeShared];[reads addObject:r];[blit copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:r destinationOffset:0 destinationBytesPerRow:width*4 destinationBytesPerImage:width*height*4];}[blit endEncoding];[b commit];[b waitUntilCompleted];
-        if(b.error || *(uint32_t *)count.contents!=(mode==1 ? 2u : 0u)){fprintf(stderr,"Native FSR dispatch/completion mismatch %d: %s\n",mode,b.error.description.UTF8String);return 8;}
+        if(b.error || !dispatchesMatch(mode,mode==1)){fprintf(stderr,"Native FSR dispatch/completion mismatch %d: %s\n",mode,b.error.description.UTF8String);return 8;}
         // BG3's CombineUI composes the real frame into the stand-in itself. The
         // generated frame reuses its pipeline, constants and UI; for this static
         // scene it must match the real composite within interpolation rounding.
@@ -209,11 +214,11 @@ int main(int argc,char **argv) { @autoreleasepool {
     {   auto source=texture(device,128,MTLPixelFormatRG11B10Float,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
         auto scaled=texture(device,256,MTLPixelFormatRG11B10Float,MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
         auto sharpened=texture(device,256,MTLPixelFormatRG11B10Float,MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite);
-        *(uint32_t *)count.contents=0;auto b=[q commandBuffer];auto c=[b computeCommandEncoder];
+        memset(count.contents,0,8);auto b=[q commandBuffer];auto c=[b computeCommandEncoder];
         [c setComputePipelineState:fsr];[c setTexture:source atIndex:0];[c setTexture:scaled atIndex:1];[c setBuffer:count offset:0 atIndex:0];[c dispatchThreads:MTLSizeMake(256,256,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         [c setComputePipelineState:rcas];[c setTexture:scaled atIndex:0];[c setTexture:sharpened atIndex:2];[c dispatchThreads:MTLSizeMake(256,256,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[c endEncoding];
         [b commit];[b waitUntilCompleted];
-        if(b.error || *(uint32_t *)count.contents!=2u){fprintf(stderr,"Unmatched Temporal frame did not fall back to native FSR (%u dispatches)\n",*(uint32_t *)count.contents);return 19;}
+        if(b.error || !dispatchesMatch(3,true)){fprintf(stderr,"Unmatched Temporal frame did not fall back to native FSR (%u FSR, %u RCAS dispatches)\n",((uint32_t *)count.contents)[0],((uint32_t *)count.contents)[1]);return 19;}
         puts("Unmatched Temporal frame fell back to native FSR and RCAS.");
     }
     puts("Frame-generation hook checks passed: Frame Generation with Off, FSR, Spatial and Temporal renders into stand-in drawables, pairs and presents from an early-scheduled present, bounds BG3 to two or three stand-ins depending on pacing, reuses pooled resources, and releases on reselection; Off/FSR/Spatial/Temporal keep real drawables (unattached layer; no display or pacing acceptance).");return 0;

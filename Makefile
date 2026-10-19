@@ -81,6 +81,7 @@ RUNTIME_SOURCES = \
 	src/features/split-screen-fog/SplitScreenFog.mm \
 	src/features/window-rebind-click/RebindClick.mm \
 	src/integration/lab/LabInput.mm \
+	src/features/metalfx-sharpening/Sharpening.mm \
 	src/common/gpu/GPUResources.mm \
 	src/common/gpu/MetalFXPipeline.mm \
 	src/common/native/CodePatch.mm \
@@ -95,6 +96,7 @@ RUNTIME_HEADERS = \
 	src/features/split-screen-fog/SplitScreenFog.h \
 	src/features/window-rebind-click/RebindClick.h \
 	src/integration/lab/LabInput.h \
+	src/features/metalfx-sharpening/Sharpening.h \
 	src/common/native/SupportedBuild.h \
 	src/features/depth-prepass/DepthPrepass.h \
 	src/features/render-thread-optimizations/BindFilter.h \
@@ -162,6 +164,9 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	$(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFX.dylib
 	$(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	BG3MFX_SPLIT_SCREEN_FOG=0 $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFX.dylib
+	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: $(BIN_DIR)/bg3mfx
