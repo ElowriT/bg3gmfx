@@ -56,6 +56,11 @@ static constexpr bool diagnostics = false;
 #else
 static constexpr bool diagnostics = true;
 #endif
+// Lab mode's own upscaling events (input-log.jsonl), in both runtimes. Unlike
+// record(), its arguments are built only in lab mode, so they must never be nil.
+static bool labRecording;
+static void labRecordEvent(NSDictionary *event);
+#define labRecord(...) do { if (labRecording) labRecordEvent(__VA_ARGS__); } while (0)
 static NSMutableDictionary<NSString *, NSNumber *> *constantSamples;
 static NSMutableDictionary<NSString *, NSDictionary *> *shaderBufferSizes;
 #ifndef BG3MFX_NO_TRACE
@@ -292,6 +297,7 @@ static void fallBackToNative(id encoder, BOOL temporal, NSString *reason) {
         fflush(stderr);
     }
     record(@{@"event":@"metalFXNativeFallback",@"temporal":@(temporal),@"reason":reason ?: @"",@"count":@(count)});
+    if (count <= 20 || count%300 == 0) labRecord(@{@"event":@"metalFXNativeFallback",@"temporal":@(temporal),@"reason":reason ?: @"",@"count":@(count)});
 }
 static char temporalFrameKey, temporalSuppressedKey;
 // Only replace AA on exact targets already observed feeding native FSR.
@@ -532,6 +538,8 @@ enum LabCensus : uint8_t { LabIdle, LabArmed, LabRecording };
 static LabCensus labCensus;
 static NSString *labCensusName;
 static NSMutableArray *labFrame;
+// Lab mode: the upscaling pipeline's diagnostic events, in input-log.jsonl.
+static void labRecordEvent(NSDictionary *event) { BG3MFXLabInputNote(event); }
 static NSMutableDictionary *labLayouts;  // render pipeline name -> vertex descriptor
 static void labTagPipeline(id state, NSString *name, MTLVertexDescriptor *vertex = nil) {
     if (!labEnabled || !state || !name.length) return;
@@ -721,7 +729,8 @@ struct LabPokeScope {
 };
 static NSDictionary *labTexture(id<MTLTexture> t) {
     if (!t) return nil;
-    return @{@"label":t.label ?: @"",@"width":@(t.width),@"height":@(t.height),@"format":@(t.pixelFormat)};
+    return @{@"label":t.label ?: @"",@"width":@(t.width),@"height":@(t.height),@"format":@(t.pixelFormat),
+             @"id":[NSString stringWithFormat:@"%p",(__bridge void *)t]};
 }
 static void labBeginEncoder(id encoder, NSString *kind, MTLRenderPassDescriptor *desc, id<MTLCommandBuffer> buffer) {
     if (labSerialize) {
@@ -1605,6 +1614,7 @@ static void endEncoder(id self, SEL cmd) {
             frames[[NSValue valueWithPointer:(__bridge const void *)temporalInputs[@"taaColor"]]] = temporalInputs;
         }
         if (temporalMode && (!replaceTAA || copyTemporalAAColor(commandBuffer,temporalInputs))) {
+            labRecord(@{@"event":@"temporalFrameStored",@"taaColor":texture(temporalInputs[@"taaColor"]),@"view":temporalInputs[@"view"] ?: @[]});
             NSMutableDictionary *frames = objc_getAssociatedObject(commandBuffer,&temporalFrameKey);
             if (!frames) {
                 frames = [NSMutableDictionary dictionary];
@@ -2081,7 +2091,7 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
         objc_setAssociatedObject(buffer,&sceneCaptureFailureKey,[NSString stringWithFormat:@"constants: camera %@, jitter %@, viewport %@",camera ? @"available" : @"missing",temporal ? @"available" : @"missing",viewport ? @"available" : @"missing"],OBJC_ASSOCIATION_RETAIN_NONATOMIC); return;
     }
     NSArray *view = nil;
-    if (!sceneView(encoder,source,&view)) return;
+    if (!sceneView(encoder,source,&view)) { labRecord(@{@"event":@"sceneCaptureSkipped",@"reason":@"unsupported viewport"}); return; }
     // Frame Generation pairs whole frames only.
     if (spatialSeed && view) return;
     if (spatialSeed) {
@@ -2097,6 +2107,7 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
     if (view) inputs[@"view"] = view;
     objc_setAssociatedObject(encoder, &taaInputsKey, inputs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     noteAssociation(encoder,AssocTAAInputs);
+    labRecord(@{@"event":@"temporalSceneCaptured",@"view":view ?: @[],@"taaColor":texture(taaTarget),@"color":texture(source)});
 }
 static id<MTLBuffer> probeReadback(id<MTLCommandBuffer> buffer, id<MTLTexture> outputTexture) {
     NSUInteger row = outputTexture.width * 8; // RGBA16Float, aligned for these scene dimensions.
@@ -2315,6 +2326,9 @@ static void drawInputs(id encoder, const CompositionDraw &call) {
             id<MTLTexture> source = boundTextures(encoder)[@"0"];
             NSDictionary *inputFrame = source ? sceneFrames[[NSValue valueWithPointer:(__bridge const void *)source]] : nil;
             NSMutableDictionary *next = [@{@"target":target} mutableCopy];
+            if (temporalColorPass(fragment))
+                labRecord(@{@"event":inputFrame ? @"sceneChainPass" : @"sceneChainMissing",@"pipeline":fragment ?: @"",
+                    @"source":texture(source),@"target":texture(target),@"frames":@(sceneFrames.count)});
             if (inputFrame && source != target && source.width == target.width && source.height == target.height &&
                 ((temporalColorPass(fragment) && source.pixelFormat == MTLPixelFormatRG11B10Float && target.pixelFormat == MTLPixelFormatRG11B10Float) ||
                  (frameGeneration(buffer) && [fragment isEqualToString:@"PPToneMap_LUT"]))) {
@@ -2485,6 +2499,8 @@ static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
             NSUInteger viewWidth = view ? [view[2] unsignedIntegerValue] : spatialColor.width;
             NSUInteger viewHeight = view ? [view[3] unsignedIntegerValue] : spatialColor.height;
             if (temporal) {
+                if (!frame || source != frame[@"taaColor"]) labRecord(@{@"event":@"fsrSceneLookup",@"source":texture(source),
+                    @"frames":@(frames.count),@"found":@(frame != nil)});
                 if (!frame || source != frame[@"taaColor"] || scaled.width < source.width || scaled.height < source.height) {
 #ifndef BG3MFX_NO_TRACE
                     NSMutableArray *targets = [NSMutableArray array];
@@ -2713,6 +2729,63 @@ static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
     if (labEnabled && encoder) labBeginEncoder(encoder,@"render",desc,self);
     return encoder;
 }
+// BG3 copies scene color between post-processing passes with blits in split
+// screen (bloom's result into colour grading's input). Follow the scene through
+// such copies as through the recognized color passes.
+static char blitBufferKey;
+static void followSceneCopy(id encoder, id<MTLTexture> source, id<MTLTexture> destination) {
+    if (!metalFXEnabled || !source || !destination || source == destination) return;
+    if (labRecording && source.width >= 256 && source.height >= 256) {
+        static std::atomic<unsigned> copies{0};
+        if (copies.fetch_add(1) < 3000) labRecord(@{@"event":@"textureCopy",@"source":texture(source),@"destination":texture(destination)});
+    }
+    id<MTLCommandBuffer> buffer = objc_getAssociatedObject(encoder,&blitBufferKey);
+    NSMutableDictionary *frames = buffer ? objc_getAssociatedObject(buffer,&temporalFrameKey) : nil;
+    NSDictionary *frame = frames[[NSValue valueWithPointer:(__bridge const void *)source]];
+    if (!frame || destination.width != source.width || destination.height != source.height || destination.pixelFormat != source.pixelFormat) return;
+    NSMutableDictionary *next = [frame mutableCopy];
+    next[@"taaColor"] = destination; next[@"color"] = destination;
+    frames[[NSValue valueWithPointer:(__bridge const void *)destination]] = next;
+    labRecord(@{@"event":@"temporalColorCopied",@"source":texture(source),@"destination":texture(destination)});
+}
+static void blitRegion(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLTexture> source, NSUInteger sourceSlice, NSUInteger sourceLevel,
+                       MTLOrigin sourceOrigin, MTLSize sourceSize, __unsafe_unretained id<MTLTexture> destination, NSUInteger destinationSlice,
+                       NSUInteger destinationLevel, MTLOrigin destinationOrigin) {
+    ((void(*)(id,SEL,id,NSUInteger,NSUInteger,MTLOrigin,MTLSize,id,NSUInteger,NSUInteger,MTLOrigin))original(self,cmd))
+        (self,cmd,source,sourceSlice,sourceLevel,sourceOrigin,sourceSize,destination,destinationSlice,destinationLevel,destinationOrigin);
+    followSceneCopy(self,source,destination);
+}
+static void blitWhole(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLTexture> source, __unsafe_unretained id<MTLTexture> destination) {
+    ((void(*)(id,SEL,id,id))original(self,cmd))(self,cmd,source,destination);
+    followSceneCopy(self,source,destination);
+}
+static void blitSlices(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLTexture> source, NSUInteger sourceSlice, NSUInteger sourceLevel,
+                       __unsafe_unretained id<MTLTexture> destination, NSUInteger destinationSlice, NSUInteger destinationLevel,
+                       NSUInteger sliceCount, NSUInteger levelCount) {
+    ((void(*)(id,SEL,id,NSUInteger,NSUInteger,id,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))
+        (self,cmd,source,sourceSlice,sourceLevel,destination,destinationSlice,destinationLevel,sliceCount,levelCount);
+    followSceneCopy(self,source,destination);
+}
+static id blitEncoder(id self, SEL cmd) {
+    id encoder = ((id(*)(id,SEL))original(self,cmd))(self,cmd);
+    if (encoder && metalFXEnabled) {
+        objc_setAssociatedObject(encoder,&blitBufferKey,self,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        hook(encoder,"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",(IMP)blitRegion);
+        hook(encoder,"copyFromTexture:toTexture:",(IMP)blitWhole);
+        hook(encoder,"copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount:",(IMP)blitSlices);
+    }
+    return encoder;
+}
+static id blitEncoderDescriptor(id self, SEL cmd, id descriptor) {
+    id encoder = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,descriptor);
+    if (encoder && metalFXEnabled) {
+        objc_setAssociatedObject(encoder,&blitBufferKey,self,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        hook(encoder,"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",(IMP)blitRegion);
+        hook(encoder,"copyFromTexture:toTexture:",(IMP)blitWhole);
+        hook(encoder,"copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount:",(IMP)blitSlices);
+    }
+    return encoder;
+}
 static id computeEncoder(id self, SEL cmd) {
     id encoder = ((id(*)(id,SEL))original(self,cmd))(self,cmd);
     record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"class": NSStringFromClass([encoder class])});
@@ -2931,6 +3004,8 @@ static id commandBuffer(id self, SEL cmd) {
     record(@{@"event": @"commandBuffer", @"method": NSStringFromSelector(cmd), @"actualMethod": NSStringFromSelector(actual),
              @"retainedReferences": @([buffer retainedReferences])});
     hook(buffer,"renderCommandEncoderWithDescriptor:",(IMP)renderEncoder);
+    hook(buffer,"blitCommandEncoder",(IMP)blitEncoder);
+    hook(buffer,"blitCommandEncoderWithDescriptor:",(IMP)blitEncoderDescriptor);
     hook(buffer,"computeCommandEncoder",(IMP)computeEncoder);
     hook(buffer,"computeCommandEncoderWithDispatchType:",(IMP)computeEncoderType);
     hook(buffer,"presentDrawable:",(IMP)present);
@@ -2977,6 +3052,7 @@ __attribute__((constructor)) static void start() {
             traceConstants = YES;  // installs the draw and dispatch hooks
             fprintf(stderr,"BG3 MetalFX lab mode: %s\n",labDirectory.UTF8String);
             BG3MFXLabInputStart(labDirectory);
+            labRecording = true;
             if (!BG3MFXGPUTimingHook) BG3MFXGPUTimingHook = labMetal4Timing;
         }
         if (diagnostics) {

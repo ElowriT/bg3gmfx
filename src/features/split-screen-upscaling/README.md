@@ -21,6 +21,13 @@ rectangle of the output. Both edges of neighbouring rectangles round the same
 way, so the views meet exactly. BG3's RCAS replay runs once per view over the
 whole frame, as BG3 does, and reads a half-float copy.
 
+In split screen BG3 also blit-copies scene color between post-processing passes
+(bloom's result into colour grading's input), which used to break the pass chain
+from TAA to FSR. Blit copies of a tracked scene texture now carry its frame
+along, like the recognized color passes. With `BG3MFX_LAB` set, the capture per
+view, the pass chain, copies, FSR lookups and native fallbacks are logged to
+`input-log.jsonl`.
+
 Live on October 19, 2026 (BG3 4.1.1.7631656, M5 Pro, two-player split screen,
 1706×960 → 2560×1440, Temporal Quality): the seam artifact on faces was gone and
 Temporal no longer fell back to FSR; MetalFX Temporal cost about 2 ms per view

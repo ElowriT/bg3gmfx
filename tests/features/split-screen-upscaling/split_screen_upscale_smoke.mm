@@ -65,6 +65,7 @@ int main(int argc, char **argv) {
         id<MTLTexture> linearDepth = texture(device,W,H,MTLPixelFormatR32Float,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
         id<MTLTexture> taa = texture(device,W,H,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
         id<MTLTexture> tonemapped = texture(device,W,H,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
+        id<MTLTexture> graded = texture(device,W,H,MTLPixelFormatRG11B10Float,rw|MTLTextureUsageRenderTarget);
         id<MTLTexture> scaled = texture(device,OW,OH,MTLPixelFormatRGBA16Float,rw);
         id<MTLTexture> output = texture(device,OW,OH,MTLPixelFormatRG11B10Float,rw);
         id<MTLBuffer> pixels = [device newBufferWithLength:OW*OH*sizeof(float)*4 options:MTLResourceStorageModeShared];
@@ -111,7 +112,13 @@ int main(int argc, char **argv) {
                 pass(b,linearDepth,render[0],@[depth],view,NO);
                 pass(b,motion,render[2],@[],view,YES);
                 pass(b,taa,render[1],@[color,NSNull.null,motion],view,YES);
-                pass(b,tonemapped,render[3],@[taa],view,YES);
+                // In split screen BG3 copies each view's post-processed color into
+                // the next pass's input with a blit, as from bloom into colour grading.
+                id<MTLBlitCommandEncoder> copy=[b blitCommandEncoder];
+                [copy copyFromTexture:taa sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(view*W/2,0,0) sourceSize:MTLSizeMake(W/2,H,1)
+                            toTexture:graded destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(view*W/2,0,0)];
+                [copy endEncoding];
+                pass(b,tonemapped,render[3],@[graded],view,YES);
                 c=[b computeCommandEncoder];
                 [c setTexture:tonemapped atIndex:0]; [c setTexture:scaled atIndex:1]; [c setComputePipelineState:compute[1]];
                 [c setBuffer:count offset:0 atIndex:0];
