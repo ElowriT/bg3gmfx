@@ -104,6 +104,11 @@ struct CompositionDraw {
     bool hasViewport, hasScissor;
     MTLViewport viewport;
     MTLScissorRect scissor;
+    // Lab mode only (see labPoll): the bound pipeline's name, whether its draws
+    // are skipped, and this encoder's entry while a frame census is recorded.
+    bool labSkip, labWatch, labPoke;
+    __unsafe_unretained NSString *labPipeline;
+    __strong NSMutableDictionary *labRecord;
 }
 @end
 @implementation BG3MFXEncoderState
@@ -164,8 +169,9 @@ static bool temporalInputsNeeded(__unsafe_unretained id encoder) {
     (void)encoder;
     return diagnostics || metalFXEnabled;
 }
+static bool labEnabled;
 static bool constantInputNeeded(__unsafe_unretained id encoder, NSUInteger index) {
-    return index < 32 && (diagnostics || (temporalInputsNeeded(encoder) && (index == 0 || index == 8 || index == 9 || index == 11)));
+    return index < 32 && (diagnostics || labEnabled || (temporalInputsNeeded(encoder) && (index == 0 || index == 8 || index == 9 || index == 11)));
 }
 static NSUInteger sceneProbeAttempts;
 static char deviceDepthKey, sceneCaptureFailureKey, sceneCameraKey, taaInputsKey;
@@ -256,7 +262,7 @@ static void bindBuffer(__unsafe_unretained id self, SEL cmd, __unsafe_unretained
 }
 static void bindBuffers(__unsafe_unretained id self, SEL cmd, id<MTLBuffer> const *buffers, const NSUInteger *offsets, NSRange range) {
     ((void(*)(id,SEL,id<MTLBuffer> const *,const NSUInteger *,NSRange))original(self,cmd))(self,cmd,buffers,offsets,range);
-    if (!temporalInputsNeeded(self)) return;
+    if (!temporalInputsNeeded(self) && !labEnabled) return;
     EncoderStage stage=bindingStage(cmd);
     for (NSUInteger i=0; i<range.length; ++i) {
         if (!constantInputNeeded(self,range.location+i)) continue;
@@ -278,6 +284,16 @@ static void bindBytes(__unsafe_unretained id self, SEL cmd, const void *bytes, N
         if (b->hasBytes) {
             if (!s->bytes) s->bytes=[NSMutableDictionary dictionary];
             s->bytes[@(stage*EncoderSlots+index)]=[NSData dataWithBytes:bytes length:MIN(length,4096)];
+        }
+        // Lab census: keep every setBytes payload as bound, in binding order.
+        if (labEnabled && s && s->labRecord && b->hasBytes) {
+            static NSString *const names[]={@"vertex",@"fragment",@"compute"};
+            NSString *key=[NSString stringWithFormat:@"%@:%lu",names[stage],(unsigned long)index];
+            NSString *data=[[NSData dataWithBytes:bytes length:MIN(length,1024)] base64EncodedStringWithOptions:0];
+            std::lock_guard<std::recursive_mutex> lock(guard());
+            NSMutableArray *log=s->labRecord[@"setBytes"];
+            if (!log) s->labRecord[@"setBytes"]=log=[NSMutableArray array];
+            if (log.count<64) [log addObject:@{@"slot":key,@"length":@(length),@"base64":data ?: @""}];
         }
     }
 }
@@ -305,6 +321,410 @@ static void record(NSDictionary *event) {
     [output writeData:line];
 }
 #endif
+// Lab mode: a rendering investigation aid, off unless BG3MFX_LAB names a
+// directory. Its control.txt is reread a few times a second. Each "skip <text>"
+// line drops the draws and dispatches of every shader whose name contains
+// <text>; a changed "census <name>" line records the next frame's passes to
+// census-<name>.json, and "watch <text>" lines add the bound textures, constant
+// buffers, viewport and grid of matching calls to it. "poke <text> <index>
+// <offset> <float>" rebinds a matching dispatch's compute buffer <index> as a
+// copy with that float written at <offset>, then restores the original binding.
+// A "serialize" line chains every render and compute encoder with a fence, so
+// no pass can overlap the one before it (a test for missing synchronization).
+// "dump <tag> <text> <slot>" (a new tag each time) copies the texture bound at
+// <slot> of the next matching call, as it is when that command buffer ends, to
+// dump-<tag>.raw with a dump-<tag>.json description. "dumpbuf <tag> <text>
+// <index> <length>" does the same for the compute buffer bound at <index>. status.json reports what the game applied,
+// so a screenshot can be matched to the skips in effect.
+static NSString *labDirectory;
+static char labNameKey, labRulesKey;
+static NSArray<NSString *> *labSkips, *labWatches;
+static NSArray<NSDictionary *> *labPokes;
+static std::atomic<bool> labSerialize{false};
+static NSMutableArray<NSMutableDictionary *> *labDumps;  // armed, captured or written requests
+static std::atomic<bool> labDumpArmed{false}, labDumpCaptured{false};
+static id<MTLFence> labFence(id<MTLDevice> device) {
+    static id<MTLFence> fence;
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (!fence && device) fence = [device newFence];
+    return fence;
+}
+static std::atomic<unsigned> labGeneration{1};
+enum LabCensus : uint8_t { LabIdle, LabArmed, LabRecording };
+static LabCensus labCensus;
+static NSString *labCensusName;
+static NSMutableArray *labFrame;
+static NSMutableDictionary *labLayouts;  // render pipeline name -> vertex descriptor
+static void labTagPipeline(id state, NSString *name, MTLVertexDescriptor *vertex = nil) {
+    if (!labEnabled || !state || !name.length) return;
+    objc_setAssociatedObject(state,&labNameKey,name,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!vertex) return;
+    NSMutableArray *attributes = [NSMutableArray array], *layouts = [NSMutableArray array];
+    for (NSUInteger i = 0; i < 31; ++i) {
+        MTLVertexAttributeDescriptor *a = vertex.attributes[i];
+        if (a.format != MTLVertexFormatInvalid)
+            [attributes addObject:@{@"index":@(i),@"format":@(a.format),@"offset":@(a.offset),@"buffer":@(a.bufferIndex)}];
+        MTLVertexBufferLayoutDescriptor *l = vertex.layouts[i];
+        if (l.stride) [layouts addObject:@{@"buffer":@(i),@"stride":@(l.stride),@"step":@(l.stepFunction),@"rate":@(l.stepRate)}];
+    }
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (!labLayouts) labLayouts = [NSMutableDictionary dictionary];
+    labLayouts[name] = @{@"attributes":attributes,@"layouts":layouts};
+}
+static void labWrite(NSString *file, id object) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:nil];
+    [data writeToFile:[labDirectory stringByAppendingPathComponent:file] atomically:YES];
+}
+// "fragment:9", "vertex:0", "compute:3" or a bare compute index.
+static bool labStageSlot(NSString *text, EncoderStage *stage, NSUInteger *index) {
+    NSArray<NSString *> *parts = [text componentsSeparatedByString:@":"];
+    NSString *number = parts.lastObject;
+    if (parts.count > 2 || !number.length || [number rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location != NSNotFound) return false;
+    *stage = StageCompute;
+    if (parts.count == 2) {
+        if ([parts[0] isEqualToString:@"vertex"]) *stage = StageVertex;
+        else if ([parts[0] isEqualToString:@"fragment"]) *stage = StageFragment;
+        else if (![parts[0] isEqualToString:@"compute"]) return false;
+    }
+    *index = (NSUInteger)number.integerValue;
+    return *index < EncoderSlots;
+}
+static void labPoll(void) {
+    static double lastCheck;
+    static NSDate *lastModified;
+    static bool first = true;
+    double now = NSProcessInfo.processInfo.systemUptime;
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (now - lastCheck < 0.25) return;
+    lastCheck = now;
+    NSString *path = [labDirectory stringByAppendingPathComponent:@"control.txt"];
+    NSDate *modified = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil].fileModificationDate;
+    if (!modified) first = false;  // a control file created later is not a launch-time one
+    if (!modified || [modified isEqualToDate:lastModified]) return;
+    lastModified = modified;
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSMutableArray *skips = [NSMutableArray array], *watches = [NSMutableArray array], *pokes = [NSMutableArray array];
+    NSString *census = nil;
+    bool serialize = false;
+    for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSString *line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([line hasPrefix:@"skip "] && line.length > 5) [skips addObject:[line substringFromIndex:5]];
+        else if ([line hasPrefix:@"watch "] && line.length > 6) [watches addObject:[line substringFromIndex:6]];
+        else if ([line isEqualToString:@"serialize"]) serialize = true;
+        else if ([line hasPrefix:@"dump "] || [line hasPrefix:@"dumpbuf "]) {
+            static NSMutableSet *seenTags = [NSMutableSet set];
+            bool buffer = [line hasPrefix:@"dumpbuf "];
+            NSMutableArray *words = [[[line substringFromIndex:buffer ? 8 : 5] componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet] mutableCopy];
+            [words removeObject:@""];
+            // An optional last word "#N" picks the Nth matching call of a frame.
+            NSUInteger occurrence = 1;
+            if (words.count && [words.lastObject hasPrefix:@"#"]) { occurrence = MAX(1,[[words.lastObject substringFromIndex:1] integerValue]); [words removeLastObject]; }
+            EncoderStage stage = StageCompute; NSUInteger slot = 0;
+            bool color = !buffer && words.count == 3 && [words[2] isEqualToString:@"color0"];
+            bool valid = words.count == (buffer ? 4u : 3u) && (color || labStageSlot(words[2],&stage,&slot)) && (buffer || stage == StageCompute);
+            if (valid && ![seenTags containsObject:words[0]]) {
+                [seenTags addObject:words[0]];
+                if (!first) {
+                    if (!labDumps) labDumps = [NSMutableArray array];
+                    NSMutableDictionary *dump = [@{@"tag":words[0],@"text":words[1],@"slot":@(slot),@"stage":@(stage),@"state":@"armed",
+                        @"occurrence":@(occurrence),@"seen":@0} mutableCopy];
+                    if (color) dump[@"color"] = @YES;
+                    if (buffer) dump[@"length"] = @([words[3] integerValue]);
+                    [labDumps addObject:dump];
+                    labDumpArmed = true;
+                }
+            }
+        }
+        else if ([line hasPrefix:@"poke "]) {
+            NSArray *words = [[line substringFromIndex:5] componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            // poke <text> <[stage:]index> <offset> <value>; a value "i<N>" writes an integer.
+            EncoderStage stage; NSUInteger index;
+            if (words.count == 4 && labStageSlot(words[1],&stage,&index)) {
+                NSString *value = words[3];
+                bool integer = [value hasPrefix:@"i"];
+                [pokes addObject:@{@"text":words[0],@"stage":@(stage),@"index":@(index),@"offset":@([words[2] integerValue]),
+                    @"integer":@(integer),@"value":integer ? @([[value substringFromIndex:1] intValue]) : @([value floatValue])}];
+            }
+        }
+        else if ([line hasPrefix:@"census "] && line.length > 7) census = [line substringFromIndex:7];
+    }
+    labSkips = skips; labWatches = watches; labPokes = pokes; labSerialize = serialize;
+    unsigned generation = ++labGeneration;
+    // A census already named in the file at launch is not repeated.
+    if (census && !first && ![census isEqualToString:labCensusName]) labCensus = LabArmed;
+    if (census) {
+        NSCharacterSet *unsafe = [[NSCharacterSet characterSetWithCharactersInString:
+            @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"] invertedSet];
+        labCensusName = [[census componentsSeparatedByCharactersInSet:unsafe] componentsJoinedByString:@"_"];
+    }
+    first = false;
+    labWrite(@"status.json",@{@"generation":@(generation),@"skip":skips,@"watch":watches,@"poke":pokes,@"serialize":@(serialize),@"dumps":@(labDumps.count),@"census":labCensusName ?: @"",@"frame":@(frames)});
+    fprintf(stderr,"BG3 MetalFX lab: generation %u, %lu skip rule(s)%s\n",generation,(unsigned long)skips.count,
+        labCensus == LabArmed ? ", census armed" : "");
+}
+// Skip (bit 0), watch (bit 1) and poke (bit 2) rules for a pipeline, cached
+// per control generation.
+static unsigned labRules(__unsafe_unretained id state) {
+    unsigned generation = labGeneration.load(std::memory_order_acquire);
+    NSNumber *cached = objc_getAssociatedObject(state,&labRulesKey);
+    if (cached && (cached.unsignedIntValue >> 3) == generation) return cached.unsignedIntValue & 7;
+    NSString *name = objc_getAssociatedObject(state,&labNameKey);
+    NSArray<NSString *> *skips, *watches;
+    NSArray<NSDictionary *> *pokes;
+    { std::lock_guard<std::recursive_mutex> lock(guard()); skips = labSkips; watches = labWatches; pokes = labPokes; }
+    unsigned rules = 0;
+    for (NSString *text in skips) if (name && [name rangeOfString:text].location != NSNotFound) { rules |= 1; break; }
+    for (NSString *text in watches) if (name && [name rangeOfString:text].location != NSNotFound) { rules |= 2; break; }
+    for (NSDictionary *rule in pokes) if (name && [name rangeOfString:rule[@"text"]].location != NSNotFound) { rules |= 4; break; }
+    objc_setAssociatedObject(state,&labRulesKey,@(generation << 3 | rules),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return rules;
+}
+// The bytes a constant binding currently supplies, when the CPU can read them.
+static NSData *labBindingBytes(__unsafe_unretained BG3MFXEncoderState *s, EncoderStage stage, NSUInteger index, NSUInteger limit) {
+    ConstantBinding &b = s->constants[stage][index];
+    if (b.hasBytes) return s->bytes[@(stage*EncoderSlots+index)];
+    if (!b.buffer || b.buffer.storageMode == MTLStorageModePrivate || b.offset >= b.buffer.length || !b.buffer.contents) return nil;
+    return [NSData dataWithBytes:(const uint8_t *)b.buffer.contents+b.offset length:MIN(limit,b.buffer.length-b.offset)];
+}
+struct LabPoke { EncoderStage stage; NSUInteger index; ConstantBinding original; __strong NSData *originalBytes; };
+static void labBindBytes(id encoder, EncoderStage stage, NSData *data, NSUInteger index) {
+    if (stage == StageVertex) [(id<MTLRenderCommandEncoder>)encoder setVertexBytes:data.bytes length:data.length atIndex:index];
+    else if (stage == StageFragment) [(id<MTLRenderCommandEncoder>)encoder setFragmentBytes:data.bytes length:data.length atIndex:index];
+    else [(id<MTLComputeCommandEncoder>)encoder setBytes:data.bytes length:data.length atIndex:index];
+}
+// Applies matching poke rules to a draw or dispatch; labUnpoke restores the bindings.
+static std::vector<LabPoke> labPoke(__unsafe_unretained id encoder) {
+    std::vector<LabPoke> applied;
+    __unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder);
+    if (!s || !s->labPoke || !s->labPipeline) return applied;
+    NSArray<NSDictionary *> *pokes;
+    { std::lock_guard<std::recursive_mutex> lock(guard()); pokes = labPokes; }
+    bool render = [encoder respondsToSelector:@selector(setFragmentBytes:length:atIndex:)];
+    NSMutableDictionary<NSNumber *, NSMutableData *> *patched = [NSMutableDictionary dictionary];
+    for (NSDictionary *rule in pokes) {
+        if ([s->labPipeline rangeOfString:rule[@"text"]].location == NSNotFound) continue;
+        EncoderStage stage = (EncoderStage)[rule[@"stage"] intValue];
+        if (render == (stage == StageCompute)) continue;
+        NSUInteger index = [rule[@"index"] unsignedIntegerValue], offset = [rule[@"offset"] unsignedIntegerValue];
+        NSNumber *key = @(stage*EncoderSlots+index);
+        NSMutableData *data = patched[key];
+        if (!data) {
+            NSData *source = labBindingBytes(s,stage,index,4096);
+            if (!source) continue;
+            data = [source mutableCopy]; patched[key] = data;
+            ConstantBinding original = s->constants[stage][index];
+            applied.push_back({stage,index,original,original.hasBytes ? source : nil});
+        }
+        if (offset + 4 > data.length) continue;
+        if ([rule[@"integer"] boolValue]) { int value = [rule[@"value"] intValue]; memcpy((uint8_t *)data.mutableBytes+offset,&value,4); }
+        else { float value = [rule[@"value"] floatValue]; memcpy((uint8_t *)data.mutableBytes+offset,&value,4); }
+    }
+    for (NSNumber *key in patched)
+        labBindBytes(encoder,(EncoderStage)(key.unsignedIntegerValue/EncoderSlots),patched[key],key.unsignedIntegerValue%EncoderSlots);
+    return applied;
+}
+static void labUnpoke(id encoder, const std::vector<LabPoke> &applied) {
+    for (const LabPoke &p : applied) {
+        if (p.originalBytes) labBindBytes(encoder,p.stage,p.originalBytes,p.index);
+        else if (p.stage == StageVertex) [(id<MTLRenderCommandEncoder>)encoder setVertexBuffer:p.original.buffer offset:p.original.offset atIndex:p.index];
+        else if (p.stage == StageFragment) [(id<MTLRenderCommandEncoder>)encoder setFragmentBuffer:p.original.buffer offset:p.original.offset atIndex:p.index];
+        else [(id<MTLComputeCommandEncoder>)encoder setBuffer:p.original.buffer offset:p.original.offset atIndex:p.index];
+    }
+}
+// Pokes one draw for the lifetime of the scope.
+struct LabPokeScope {
+    __unsafe_unretained id encoder; std::vector<LabPoke> applied;
+    explicit LabPokeScope(__unsafe_unretained id e) : encoder(e) { if (labEnabled) applied = labPoke(e); }
+    ~LabPokeScope() { if (!applied.empty()) labUnpoke(encoder,applied); }
+};
+static NSDictionary *labTexture(id<MTLTexture> t) {
+    if (!t) return nil;
+    return @{@"label":t.label ?: @"",@"width":@(t.width),@"height":@(t.height),@"format":@(t.pixelFormat)};
+}
+static void labBeginEncoder(id encoder, NSString *kind, MTLRenderPassDescriptor *desc, id<MTLCommandBuffer> buffer) {
+    if (labSerialize) {
+        id<MTLFence> fence = labFence(buffer.device);
+        if ([kind isEqualToString:@"render"]) [(id<MTLRenderCommandEncoder>)encoder waitForFence:fence beforeStages:MTLRenderStageVertex];
+        else [(id<MTLComputeCommandEncoder>)encoder waitForFence:fence];
+    }
+    __unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder);
+    if (!s) return;
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (labCensus != LabRecording) { s->labRecord = nil; return; }
+    NSMutableDictionary *entry = [@{@"kind":kind,@"index":@(labFrame.count),
+        @"commandBuffer":[NSString stringWithFormat:@"%p",(__bridge void *)buffer],
+        @"draws":[NSMutableDictionary dictionary],@"dispatches":[NSMutableDictionary dictionary]} mutableCopy];
+    if (desc) {
+        NSMutableArray *colors = [NSMutableArray array];
+        for (NSUInteger i = 0; i < 8; ++i) if (NSDictionary *t = labTexture(desc.colorAttachments[i].texture)) [colors addObject:t];
+        entry[@"colors"] = colors;
+        if (NSDictionary *depth = labTexture(desc.depthAttachment.texture)) entry[@"depth"] = depth;
+    }
+    [labFrame addObject:entry];
+    s->labRecord = entry;
+}
+static NSArray *labRect(double x, double y, double width, double height) { return @[@(x),@(y),@(width),@(height)]; }
+// One watched call: everything bound to it that describes where and what it renders.
+static NSDictionary *labWatched(__unsafe_unretained BG3MFXEncoderState *s, NSString *name, NSString *grid) {
+    NSMutableDictionary *textures = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 0; i < EncoderSlots; ++i) if (id<MTLTexture> t = s->textures[i])
+        textures[@(i).stringValue] = @{@"id":[NSString stringWithFormat:@"%p",(__bridge void *)t],@"label":t.label ?: @"",
+            @"width":@(t.width),@"height":@(t.height),@"depth":@(t.depth),@"type":@(t.textureType),@"format":@(t.pixelFormat),
+            @"hazard":@(t.hazardTrackingMode),@"heap":@(t.heap != nil)};
+    NSMutableDictionary *buffers = [NSMutableDictionary dictionary];
+    static NSString *const stageNames[] = {@"vertex",@"fragment",@"compute"};
+    for (int stage = 0; stage < 3; ++stage) for (NSUInteger i = 0; i < EncoderSlots; ++i) {
+        ConstantBinding &b = s->constants[stage][i];
+        if (!b.buffer && !b.hasBytes) continue;
+        NSData *data = labBindingBytes(s,(EncoderStage)stage,i,1024);
+        NSMutableDictionary *info = [@{@"offset":@(b.offset),@"base64":[data base64EncodedStringWithOptions:0] ?: @""} mutableCopy];
+        if (b.buffer) [info addEntriesFromDictionary:@{@"id":[NSString stringWithFormat:@"%p",(__bridge void *)b.buffer],
+            @"length":@(b.buffer.length),@"storage":@(b.buffer.storageMode),@"hazard":@(b.buffer.hazardTrackingMode),@"heap":@(b.buffer.heap != nil)}];
+        buffers[[NSString stringWithFormat:@"%@:%lu",stageNames[stage],(unsigned long)i]] = info;
+    }
+    NSMutableDictionary *call = [@{@"shader":name,@"textures":textures,@"buffers":buffers} mutableCopy];
+    if (grid) call[@"grid"] = grid;
+    if (s->hasViewport) call[@"viewport"] = labRect(s->viewport.originX,s->viewport.originY,s->viewport.width,s->viewport.height);
+    if (s->hasScissor) call[@"scissor"] = labRect(s->scissor.x,s->scissor.y,s->scissor.width,s->scissor.height);
+    return call;
+}
+static void labCount(__unsafe_unretained BG3MFXEncoderState *s, NSString *table, NSString *grid) {
+    NSString *name = s->labPipeline ?: @"(unnamed)";
+    NSDictionary *watched = s->labWatch ? labWatched(s,name,grid) : nil;
+    if (s->labSkip) name = [name stringByAppendingString:@" [skipped]"];
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    NSMutableDictionary *entry = s->labRecord, *counts = entry[table];
+    counts[name] = @([counts[name] unsignedIntegerValue] + 1);
+    if (grid && !entry[@"grids"]) entry[@"grids"] = [NSMutableDictionary dictionary];
+    if (grid && !entry[@"grids"][name]) entry[@"grids"][name] = grid;
+    if (watched) {
+        if (!entry[@"watched"]) entry[@"watched"] = [NSMutableArray array];
+        if ([entry[@"watched"] count] < 16) [entry[@"watched"] addObject:watched];
+    }
+}
+// True when the draw or dispatch must be dropped. grid describes a dispatch.
+static inline bool labWork(__unsafe_unretained id encoder, NSString *table, NSString *grid = nil) {
+    if (!labEnabled) return false;
+    __unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder);
+    if (!s) return false;
+    if (s->labRecord) labCount(s,table,grid);
+    if (labDumpArmed && s->labPipeline) {
+        std::lock_guard<std::recursive_mutex> lock(guard());
+        bool armed = false;
+        for (NSMutableDictionary *dump in labDumps) {
+            if (![dump[@"state"] isEqualToString:@"armed"]) continue;
+            armed = true;
+            NSUInteger slot = [dump[@"slot"] unsignedIntegerValue];
+            EncoderStage stage = (EncoderStage)[dump[@"stage"] intValue];
+            if ([s->labPipeline rangeOfString:dump[@"text"]].location == NSNotFound || !s->buffer) continue;
+            NSUInteger seen = [dump[@"seen"] unsignedIntegerValue] + 1;
+            dump[@"seen"] = @(seen);
+            if (seen != [dump[@"occurrence"] unsignedIntegerValue]) continue;
+            // Copied when this encoder ends, so later passes cannot change it first.
+            dump[@"encoder"] = [NSValue valueWithPointer:(__bridge const void *)encoder];
+            dump[@"buffer"] = s->buffer; dump[@"shader"] = s->labPipeline; dump[@"viewport"] = s->hasViewport ?
+                labRect(s->viewport.originX,s->viewport.originY,s->viewport.width,s->viewport.height) : @[];
+            if (dump[@"length"]) {
+                ConstantBinding &b = s->constants[stage][slot];
+                NSData *bytes = b.hasBytes ? s->bytes[@(stage*EncoderSlots+slot)] : nil;
+                if (b.buffer) { dump[@"source"] = b.buffer; dump[@"offset"] = @(b.offset); } else if (bytes) dump[@"bytes"] = bytes;
+            } else if (id<MTLTexture> texture = [dump[@"color"] boolValue] ? s->colorTarget : s->textures[slot]) dump[@"texture"] = texture;
+            if (dump[@"source"] || dump[@"bytes"] || dump[@"texture"]) { dump[@"state"] = @"captured"; labDumpCaptured = true; }
+            else { dump[@"state"] = @"missing"; labWrite([NSString stringWithFormat:@"dump-%@.json",dump[@"tag"]],@{@"tag":dump[@"tag"],@"missing":@YES}); }
+        }
+        labDumpArmed = armed;
+    }
+    return s->labSkip;
+}
+static NSUInteger labBytesPerPixel(MTLPixelFormat format) {
+    switch (format) {
+        case MTLPixelFormatR8Unorm: return 1;
+        case MTLPixelFormatR16Float: case MTLPixelFormatRG8Unorm: return 2;
+        case MTLPixelFormatR32Float: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB10A2Unorm: return 4;
+        case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG32Float: return 8;
+        case MTLPixelFormatRGBA32Float: return 16;
+        default: return 0;
+    }
+}
+// After the encoder that matched a dump ends (or, as a fallback, at commit):
+// copy the resource out in the same command buffer.
+static void labWriteDumps(id<MTLCommandBuffer> buffer, __unsafe_unretained id encoder = nil) {
+    NSMutableArray<NSMutableDictionary *> *mine = [NSMutableArray array];
+    { std::lock_guard<std::recursive_mutex> lock(guard());
+      for (NSMutableDictionary *dump in labDumps)
+          if ([dump[@"state"] isEqualToString:@"captured"] && dump[@"buffer"] == buffer &&
+              (!encoder || [dump[@"encoder"] pointerValue] == (__bridge const void *)encoder)) { dump[@"state"] = @"copying"; [mine addObject:dump]; } }
+    for (NSMutableDictionary *dump in mine) {
+        NSString *bufferTag = dump[@"tag"];
+        if (dump[@"length"]) {
+            NSUInteger length = [dump[@"length"] unsignedIntegerValue];
+            NSDictionary *meta = @{@"tag":bufferTag,@"shader":dump[@"shader"] ?: @"",@"index":dump[@"slot"],@"stage":dump[@"stage"],
+                @"occurrence":dump[@"occurrence"],@"viewport":dump[@"viewport"] ?: @[],@"frame":@(frames)};
+            if (NSData *bytes = dump[@"bytes"]) {
+                [bytes writeToFile:[labDirectory stringByAppendingPathComponent:[NSString stringWithFormat:@"dump-%@.raw",bufferTag]] atomically:YES];
+                labWrite([NSString stringWithFormat:@"dump-%@.json",bufferTag],meta);
+            } else {
+                id<MTLBuffer> source = dump[@"source"];
+                NSUInteger offset = [dump[@"offset"] unsignedIntegerValue];
+                length = MIN(length, source.length > offset ? source.length - offset : 0);
+                id<MTLBuffer> copy = length ? [buffer.device newBufferWithLength:length options:MTLResourceStorageModeShared] : nil;
+                if (copy) {
+                    id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
+                    [blit copyFromBuffer:source sourceOffset:offset toBuffer:copy destinationOffset:0 size:length];
+                    [blit endEncoding];
+                    NSMutableDictionary *full = [meta mutableCopy]; full[@"length"] = @(length); full[@"storage"] = @(source.storageMode);
+                    [buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+                        [[NSData dataWithBytes:copy.contents length:copy.length] writeToFile:[labDirectory stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"dump-%@.raw",bufferTag]] atomically:YES];
+                        labWrite([NSString stringWithFormat:@"dump-%@.json",bufferTag],full);
+                        fprintf(stderr,"BG3 MetalFX lab: dump %s written\n",bufferTag.UTF8String);
+                    }];
+                }
+            }
+            std::lock_guard<std::recursive_mutex> lock(guard());
+            dump[@"state"] = @"written"; [dump removeObjectsForKeys:@[@"source",@"bytes",@"buffer",@"encoder"]];
+            continue;
+        }
+        id<MTLTexture> texture = dump[@"texture"];
+        NSUInteger bpp = labBytesPerPixel(texture.pixelFormat);
+        NSUInteger row = texture.width*bpp, image = row*texture.height;
+        id<MTLBuffer> copy = bpp ? [buffer.device newBufferWithLength:image*texture.depth options:MTLResourceStorageModeShared] : nil;
+        NSString *tag = dump[@"tag"];
+        NSDictionary *meta = @{@"tag":tag,@"shader":dump[@"shader"] ?: @"",@"slot":dump[@"slot"],@"label":texture.label ?: @"",
+            @"width":@(texture.width),@"height":@(texture.height),@"depth":@(texture.depth),@"format":@(texture.pixelFormat),
+            @"bytesPerPixel":@(bpp),@"bytesPerRow":@(row),@"frame":@(frames),@"mipmaps":@(texture.mipmapLevelCount),
+            @"type":@(texture.textureType),@"occurrence":dump[@"occurrence"],@"viewport":dump[@"viewport"] ?: @[],@"color":dump[@"color"] ?: @NO};
+        if (!copy) { labWrite([NSString stringWithFormat:@"dump-%@.json",tag],meta); continue; }
+        id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
+        [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(texture.width,texture.height,texture.depth) toBuffer:copy destinationOffset:0
+            destinationBytesPerRow:row destinationBytesPerImage:image];
+        [blit endEncoding];
+        [buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            [[NSData dataWithBytes:copy.contents length:copy.length] writeToFile:[labDirectory stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"dump-%@.raw",tag]] atomically:YES];
+            labWrite([NSString stringWithFormat:@"dump-%@.json",tag],meta);
+            fprintf(stderr,"BG3 MetalFX lab: dump %s written\n",tag.UTF8String);
+        }];
+        std::lock_guard<std::recursive_mutex> lock(guard());
+        dump[@"state"] = @"written"; [dump removeObjectsForKeys:@[@"texture",@"buffer",@"encoder"]];
+    }
+}
+static void labFrameBoundary(void) {
+    labPoll();
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (labDumpArmed) for (NSMutableDictionary *dump in labDumps) if ([dump[@"state"] isEqualToString:@"armed"]) dump[@"seen"] = @0;
+    if (labCensus == LabArmed) { labFrame = [NSMutableArray array]; labCensus = LabRecording; return; }
+    if (labCensus != LabRecording) return;
+    NSMutableDictionary *layouts = [NSMutableDictionary dictionary];
+    for (NSString *name in labLayouts) for (NSString *text in labWatches)
+        if ([name rangeOfString:text].location != NSNotFound) layouts[name] = labLayouts[name];
+    labWrite([NSString stringWithFormat:@"census-%@.json",labCensusName],
+        @{@"census":labCensusName,@"frame":@(frames),@"skip":labSkips ?: @[],@"encoders":labFrame,@"vertexLayouts":layouts});
+    fprintf(stderr,"BG3 MetalFX lab: census %s recorded %lu encoders\n",labCensusName.UTF8String,(unsigned long)labFrame.count);
+    labFrame = nil; labCensus = LabIdle;
+}
 #ifndef BG3MFX_NO_TRACE
 static char waterfallCopiesKey;
 static NSDictionary *waterfallLayout(MTLRenderPipelineDescriptor *desc) {
@@ -452,9 +872,9 @@ static void rememberTexture(__unsafe_unretained id self, SEL cmd, __unsafe_unret
         int mode = encoderScalingMode(self);
         // Metal permits textures to be bound before pipeline state. Retain the
         // three required slots independently of shader identification.
-        if ((!metalFXEnabled && mode != 2) || index > 2) return;
+        if (!labEnabled && ((!metalFXEnabled && mode != 2) || index > 2)) return;
     }
-    if ((sceneProbe || metalFXEnabled) && index < EncoderSlots)
+    if ((sceneProbe || metalFXEnabled || labEnabled) && index < EncoderSlots)
         if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(self)) s->textures[index]=t;
     if (diagnostics) {
         std::lock_guard<std::recursive_mutex> lock(guard());
@@ -756,6 +1176,13 @@ static void endEncoder(id self, SEL cmd) {
     NSDictionary *temporalInputs = objc_getAssociatedObject(self, &taaInputsKey);
     NSDictionary *postprocess = objc_getAssociatedObject(self,&temporalPostprocessKey);
     __unsafe_unretained BG3MFXEncoderState *encoderRecord = encoderState(self);
+    if (labEnabled && encoderRecord && encoderRecord->labRecord) {
+        NSString *encoderLabel = [self label];
+        std::lock_guard<std::recursive_mutex> lock(guard());
+        if (encoderLabel.length) encoderRecord->labRecord[@"label"] = encoderLabel;
+        if (encoderRecord->hasViewport) { MTLViewport v = encoderRecord->viewport;
+            encoderRecord->labRecord[@"viewport"] = labRect(v.originX,v.originY,v.width,v.height); }
+    }
     // A recognized pass followed by an unrecognized draw in the same encoder, or
     // an encoder of only unrecognized draws, overwrites its target: drop any
     // scene association for it (the per-draw logic this replaces did the same).
@@ -825,7 +1252,14 @@ static void endEncoder(id self, SEL cmd) {
         // Release buffer references as soon as this encoder ends.
         if (encoderRecord) { for (auto &stage:encoderRecord->constants) for (auto &binding:stage) binding={}; encoderRecord->bytes=nil; }
     }
+    if (labEnabled && labSerialize && commandBuffer) {
+        id<MTLFence> fence = labFence(commandBuffer.device);
+        if ([self respondsToSelector:@selector(updateFence:afterStages:)])
+            [(id<MTLRenderCommandEncoder>)self updateFence:fence afterStages:MTLRenderStageFragment];
+        else if ([self respondsToSelector:@selector(updateFence:)]) [(id<MTLComputeCommandEncoder>)self updateFence:fence];
+    }
     ((void(*)(id,SEL))original(self,cmd))(self,cmd);
+    if (labEnabled && labDumpCaptured && commandBuffer) labWriteDumps(commandBuffer,self);
 #ifndef BG3MFX_NO_TRACE
     finishWaterfallCopies(commandBuffer,waterfallCopies);
 #endif
@@ -912,6 +1346,10 @@ static void pipeline(__unsafe_unretained id self, SEL cmd, __unsafe_unretained i
     if (s) {
         s->pipeline=state; s->description=description;
         s->kind=(PipelineKind)[objc_getAssociatedObject(state,&pipelineKindKey) unsignedCharValue];
+        if (labEnabled) {
+            unsigned rules = state ? labRules(state) : 0;
+            s->labPipeline=objc_getAssociatedObject(state,&labNameKey); s->labSkip=rules & 1; s->labWatch=rules & 2; s->labPoke=rules & 4;
+        }
     }
     record(@{@"event": NSStringFromSelector(cmd), @"encoder": [self label] ?: @"", @"pipeline": description});
 }
@@ -972,6 +1410,7 @@ static id renderPipeline(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, NS
         if (!state) state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,desc,error);
     } else state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,desc,error);
     NSString *fragment = desc.fragmentFunction.name;
+    if (labEnabled) labTagPipeline(state,[NSString stringWithFormat:@"%@|%@",desc.vertexFunction.name ?: @"",fragment ?: @""],desc.vertexDescriptor);
     NSDictionary *description = diagnostics ? @{@"vertex": desc.vertexFunction.name ?: @"", @"fragment": fragment ?: @"", @"label": desc.label ?: @""} :
         (([fragment isEqualToString:@"PPTAA_PS"] || [fragment isEqualToString:@"LinearizeDepth"] || [fragment isEqualToString:@"VelocityBufferCamera_PS"] || temporalColorPass(fragment) || compositionShader(fragment) || [fragment isEqualToString:@"PPToneMap_LUT"]) ? @{@"fragment":fragment} : nil);
 #ifndef BG3MFX_NO_TRACE
@@ -1003,6 +1442,7 @@ static id renderPipelineOptions(id self, SEL cmd, MTLRenderPipelineDescriptor *d
         } else state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,cmd))(self,cmd,desc,options,reflection,error);
     } else state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,cmd))(self,cmd,desc,options,reflection,error);
     NSString *fragment = desc.fragmentFunction.name;
+    if (labEnabled) labTagPipeline(state,[NSString stringWithFormat:@"%@|%@",desc.vertexFunction.name ?: @"",fragment ?: @""],desc.vertexDescriptor);
     NSDictionary *description = diagnostics ? @{@"vertex": desc.vertexFunction.name ?: @"", @"fragment": fragment ?: @"", @"label": desc.label ?: @""} :
         (([fragment isEqualToString:@"PPTAA_PS"] || [fragment isEqualToString:@"LinearizeDepth"] || [fragment isEqualToString:@"VelocityBufferCamera_PS"] || temporalColorPass(fragment) || compositionShader(fragment) || [fragment isEqualToString:@"PPToneMap_LUT"]) ? @{@"fragment":fragment} : nil);
 #ifndef BG3MFX_NO_TRACE
@@ -1019,6 +1459,7 @@ static id renderPipelineOptions(id self, SEL cmd, MTLRenderPipelineDescriptor *d
 static id computePipeline(id self, SEL cmd, id<MTLFunction> function, NSError **error) {
     id state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,function,error);
     NSString *name = function.name;
+    labTagPipeline(state,name);
     NSDictionary *description = (diagnostics || [name isEqualToString:@"FSR"] || [name isEqualToString:@"FSR_RCAS"] ||
         [name isEqualToString:@"CAS"]) ? @{@"compute": name ?: @""} : nil;
     if (state) objc_setAssociatedObject(state, &pipelineKey, description, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1494,24 +1935,32 @@ static BOOL suppressTemporalTAA(id encoder) {
     return YES;
 }
 static void draw(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); return; }
     drawInputs(self,CompositionDraw{type,start,count,1,0,0,nil,0,MTLIndexTypeUInt16});
     if (suppressTemporalTAA(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count);
 }
 static void drawInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); return; }
     drawInputs(self,CompositionDraw{type,start,count,instances,0,0,nil,0,MTLIndexTypeUInt16});
     if (suppressTemporalTAA(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances);
 }
 static void drawBaseInstance(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances, NSUInteger base) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); return; }
     drawInputs(self,CompositionDraw{type,start,count,instances,base,0,nil,0,MTLIndexTypeUInt16});
     if (suppressTemporalTAA(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base);
 }
 static void drawIndexed(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset); return; }
     drawInputs(self,CompositionDraw{type,0,count,1,0,0,buffer,offset,indexType});
 #ifndef BG3MFX_NO_TRACE
@@ -1521,6 +1970,8 @@ static void drawIndexed(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType t
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset);
 }
 static void drawIndexedInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances); return; }
     drawInputs(self,CompositionDraw{type,0,count,instances,0,0,buffer,offset,indexType});
 #ifndef BG3MFX_NO_TRACE
@@ -1530,6 +1981,8 @@ static void drawIndexedInstances(__unsafe_unretained id self, SEL cmd, MTLPrimit
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances);
 }
 static void drawIndexedBase(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances, NSInteger baseVertex, NSUInteger baseInstance) {
+    if (labWork(self,@"draws")) return;
+    LabPokeScope poke(self);
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger,NSInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances,baseVertex,baseInstance); return; }
     drawInputs(self,CompositionDraw{type,0,count,instances,baseInstance,baseVertex,buffer,offset,indexType});
 #ifndef BG3MFX_NO_TRACE
@@ -1564,7 +2017,24 @@ static void forwardNativeCompute(id encoder, NSString *name, NSDictionary *textu
             frames[[NSValue valueWithPointer:(__bridge const void *)destination]] = pending[@"frame"];
     }
 }
+static void dispatchIndirect(id self, SEL cmd, id<MTLBuffer> buffer, NSUInteger offset, MTLSize threads) {
+    if (labWork(self,@"dispatches")) return;
+    std::vector<LabPoke> poked = labPoke(self);
+    ((void(*)(id,SEL,id,NSUInteger,MTLSize))original(self,cmd))(self,cmd,buffer,offset,threads);
+    labUnpoke(self,poked);
+}
+static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads);
 static void dispatch(id self, SEL cmd, MTLSize grid, MTLSize threads) {
+    if (!labEnabled) { dispatchNative(self,cmd,grid,threads); return; }
+    if (labWork(self,@"dispatches",[NSString stringWithFormat:@"%@ %lux%lux%lu / %lux%lux%lu",
+            cmd == @selector(dispatchThreads:threadsPerThreadgroup:) ? @"threads" : @"groups",
+            (unsigned long)grid.width,(unsigned long)grid.height,(unsigned long)grid.depth,
+            (unsigned long)threads.width,(unsigned long)threads.height,(unsigned long)threads.depth])) return;
+    std::vector<LabPoke> poked = labPoke(self);
+    dispatchNative(self,cmd,grid,threads);
+    labUnpoke(self,poked);
+}
+static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
     BOOL suppressNative = NO;
     NSDictionary *state = pipelineDescription(self);
     NSString *pipelineName = state[@"compute"];
@@ -1718,6 +2188,14 @@ static void instrumentEncoder(id encoder) {
         hook(encoder,"dispatchThreads:threadsPerThreadgroup:",(IMP)dispatch);
         hook(encoder,"dispatchThreadgroups:threadsPerThreadgroup:",(IMP)dispatch);
     }
+    if (labEnabled) {
+        hook(encoder,"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:",(IMP)dispatchIndirect);
+        // Compute constant buffers, for watch records and poke rules.
+        hook(encoder,"setBuffer:offset:atIndex:",(IMP)bindBuffer);
+        hook(encoder,"setBuffers:offsets:withRange:",(IMP)bindBuffers);
+        hook(encoder,"setBufferOffset:atIndex:",(IMP)bufferOffset);
+        hook(encoder,"setBytes:length:atIndex:",(IMP)bindBytes);
+    }
     markEncoderClassInstrumented(object_getClass(encoder));
 }
 static id computeEncoderType(id self, SEL cmd, MTLDispatchType type);
@@ -1763,9 +2241,10 @@ static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
     if (encoder) objc_setAssociatedObject(encoder, &attachmentsKey, attachments, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         record(@{@"event": @"renderPass", @"color": colors, @"depth": attachments[@"depth"]});
     }
-    if ((sceneProbe || metalFXEnabled) && encoder) {
+    if ((sceneProbe || metalFXEnabled || labEnabled) && encoder) {
         if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) { state->buffer=self; state->colorTarget=desc.colorAttachments[0].texture; }
     }
+    if (labEnabled && encoder) labBeginEncoder(encoder,@"render",desc,self);
     return encoder;
 }
 static id computeEncoder(id self, SEL cmd) {
@@ -1773,7 +2252,8 @@ static id computeEncoder(id self, SEL cmd) {
     record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     setEncoderMode(encoder, objc_getAssociatedObject(self, &bufferScalingModeKey));
-    if (metalFXEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
+    if (metalFXEnabled || labEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
+    if (labEnabled && encoder) labBeginEncoder(encoder,@"compute",nil,self);
     return encoder;
 }
 static id computeEncoderType(id self, SEL cmd, MTLDispatchType type) {
@@ -1793,11 +2273,13 @@ static id computeEncoderType(id self, SEL cmd, MTLDispatchType type) {
     record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"dispatchType": @(type), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     setEncoderMode(encoder, objc_getAssociatedObject(self, &bufferScalingModeKey));
-    if (metalFXEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
+    if (metalFXEnabled || labEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
+    if (labEnabled && encoder) labBeginEncoder(encoder,@"compute",nil,self);
     return encoder;
 }
 static void countPresent(id drawable, SEL cmd) {
     (void)drawable; (void)cmd;
+    if (labEnabled) labFrameBoundary();
     BG3MFXFrameLogRendered();
     std::lock_guard<std::recursive_mutex> lock(guard()); ++frames;
     if (frames == 1 || frames == 120 || frames % 3600 == 0)
@@ -1837,6 +2319,7 @@ static void presentTimed(id self, SEL cmd, id drawable, double time) {
     ((void(*)(id,SEL,id,double))original(self,cmd))(self,cmd,drawable,time);
 }
 static void commit(id self, SEL cmd) {
+    if (labEnabled && labDumpCaptured) labWriteDumps(self);
     if (id<MTLDrawable> shown=objc_getAssociatedObject(self,&nativePresentKey)) {
         objc_setAssociatedObject(self,&nativePresentKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         CFTimeInterval committed=CACurrentMediaTime();
@@ -1993,6 +2476,13 @@ __attribute__((constructor)) static void start() {
         sceneProbe = diagnostics && getenv("BG3MFX_SCENE_PROBE") && strcmp(getenv("BG3MFX_SCENE_PROBE"),"1") == 0;
         metalFXEnabled = getenv("BG3MFX_ENABLE_METALFX") && strcmp(getenv("BG3MFX_ENABLE_METALFX"),"1") == 0;
         if (metalFXEnabled) traceConstants = YES;
+        if (const char *lab = getenv("BG3MFX_LAB"); lab && *lab) {
+            labDirectory = [NSString stringWithUTF8String:lab].stringByExpandingTildeInPath;
+            [NSFileManager.defaultManager createDirectoryAtPath:labDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+            labSkips = @[]; labEnabled = true;
+            traceConstants = YES;  // installs the draw and dispatch hooks
+            fprintf(stderr,"BG3 MetalFX lab mode: %s\n",labDirectory.UTF8String);
+        }
         if (diagnostics) {
             constantSamples = [NSMutableDictionary dictionary];
             shaderBufferSizes = [NSMutableDictionary dictionary];
