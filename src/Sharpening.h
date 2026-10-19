@@ -8,8 +8,8 @@ NS_ASSUME_NONNULL_BEGIN
 // skips hair, and writes linear HDR (c / (1 - max(c))). MetalFX replaces FSR and
 // RCAS and writes linear HDR, which dropped the player's Sharpness setting. With
 // sharpening, MetalFX writes a pooled texture instead; it is mapped into FSR's
-// space in FSR's own output texture, and BG3's FSR_RCAS dispatch is replayed
-// with its own pipeline, constants, hair mask and grid into the final target.
+// space in a half-float texture, and BG3's FSR_RCAS dispatch is replayed with
+// its own pipeline, constants, hair mask and grid into the final target.
 // BG3MFX_METALFX_SHARPENING=0 keeps the unsharpened MetalFX output.
 @interface BG3MFXNativeSharpening : NSObject
 + (nullable instancetype)sharedForDevice:(id<MTLDevice>)device;
@@ -18,7 +18,6 @@ NS_ASSUME_NONNULL_BEGIN
 // rcas: the replayed dispatch (see Trace.mm, FSR_RCAS). dispatch issues the
 // dispatch on the encoder without bg3mfx's own dispatch hook.
 - (BOOL)encodeFrom:(id<MTLTexture>)linear
-         fsrOutput:(id<MTLTexture>)fsrOutput
               rcas:(NSDictionary *)rcas
        destination:(id<MTLTexture>)destination
      commandBuffer:(id<MTLCommandBuffer>)buffer

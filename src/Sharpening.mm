@@ -12,7 +12,7 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
 @implementation BG3MFXNativeSharpening {
     id<MTLDevice> _device;
     id<MTLComputePipelineState> _toFSRSpace;
-    NSMutableDictionary<NSString *, BG3MFXTexturePool *> *_pools;
+    NSMutableDictionary<NSString *, BG3MFXTexturePool *> *_pools, *_fsrSpacePools;
     std::mutex _lock;
 }
 
@@ -33,6 +33,7 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
     if (!(self = [super init])) return nil;
     _device = device;
     _pools = [NSMutableDictionary dictionary];
+    _fsrSpacePools = [NSMutableDictionary dictionary];
     // FSR_Tonemap's mapping, which FSR_RCAS undoes (c / (1 - max(c))) when it
     // writes BG3's RG11B10 target, which Metal fills rounding toward zero. The
     // MetalFX result is already on that grid, and the undo magnifies rounding by
@@ -77,22 +78,44 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
     return texture;
 }
 
-- (BOOL)encodeFrom:(id<MTLTexture>)linear fsrOutput:(id<MTLTexture>)fsrOutput rcas:(NSDictionary *)rcas
+// RCAS's input in FSR's space. BG3's own FSR output is RG11B10, whose rounding
+// RCAS's undo magnifies near white; half float keeps highlights intact.
+- (id<MTLTexture>)fsrSpaceLike:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer {
+    NSString *key = [NSString stringWithFormat:@"%lu:%lu", (unsigned long)destination.width, (unsigned long)destination.height];
+    BG3MFXTexturePool *pool;
+    {
+        std::lock_guard<std::mutex> hold(_lock);
+        pool = _fsrSpacePools[key];
+        if (!pool) {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                width:destination.width height:destination.height mipmapped:NO];
+            desc.storageMode = MTLStorageModePrivate;
+            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            pool = _fsrSpacePools[key] = [[BG3MFXTexturePool alloc] initWithDevice:_device descriptor:desc];
+        }
+    }
+    id<MTLTexture> texture = [pool acquire];
+    if (texture) [pool relinquish:texture afterCommandBuffer:buffer];
+    return texture;
+}
+
+- (BOOL)encodeFrom:(id<MTLTexture>)linear rcas:(NSDictionary *)rcas
        destination:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer
           dispatch:(void (^)(id<MTLComputeCommandEncoder>, NSDictionary *))dispatch {
     id<MTLComputePipelineState> pipeline = rcas[@"pipeline"];
-    if (!pipeline || !fsrOutput || fsrOutput.width != destination.width || fsrOutput.height != destination.height) return NO;
+    id<MTLTexture> fsrSpace = pipeline ? [self fsrSpaceLike:destination commandBuffer:buffer] : nil;
+    if (!fsrSpace) return NO;
     id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
     if (!encoder) return NO;
     encoder.label = @"BG3MFX native sharpening";
     [encoder setComputePipelineState:_toFSRSpace];
     [encoder setTexture:linear atIndex:0];
-    [encoder setTexture:fsrOutput atIndex:1];
+    [encoder setTexture:fsrSpace atIndex:1];
     MTLSize threads = MTLSizeMake(16, 16, 1);
     [encoder dispatchThreadgroups:MTLSizeMake((destination.width + 15) / 16, (destination.height + 15) / 16, 1) threadsPerThreadgroup:threads];
     [encoder memoryBarrierWithScope:MTLBarrierScopeTextures];
     [encoder setComputePipelineState:pipeline];
-    [encoder setTexture:fsrOutput atIndex:0];
+    [encoder setTexture:fsrSpace atIndex:0];
     [encoder setTexture:rcas[@"hairMask"] atIndex:1];
     [encoder setTexture:destination atIndex:2];
     if (NSData *bytes = rcas[@"constants"]) [encoder setBytes:bytes.bytes length:bytes.length atIndex:0];
