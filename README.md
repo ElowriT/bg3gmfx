@@ -6,8 +6,50 @@ BG3MFX mods Baldur's Gate 3 on Mac to improve performance and reduce power usage
 
 - CPU consumption up t0 **~75% lower**, meaning less heat and fan noise.
 
+## About this fork
+
+This is [ElowriT](https://github.com/ElowriT)'s fork of
+[BG3MFX](https://github.com/AndrewTriesToCode/bg3mfx) by AndrewTriesToCode,
+based on its 0.3.0 release. It keeps every BG3MFX feature below and adds:
+
+| Change | What you get |
+| --- | --- |
+| **Split-screen fog fix** | Volumetric fog and light shafts sit where they belong in two-player split screen, instead of hard-edged, misplaced smoke. |
+| **MetalFX in split screen** | Each player's half is upscaled on its own: MetalFX Temporal now works in split screen (it used to fall back to FSR 1.0), and the halves no longer blend into each other at the seam. |
+| **MetalFX sharpening** | The game's Sharpness slider works with MetalFX Spatial and Temporal, using BG3's own sharpening as with FSR. |
+| **Controller stays active** | Opening Video options or changing the upscaler no longer switches the game from your controller to mouse and keyboard. |
+| **Uncapped frame rate fix** | With the frame cap off, MetalFX no longer freezes the game and closes it with "MetalFX Temporal could not continue". |
+| **Steam overlay compatibility** | The game no longer crashes at launch when it starts with the Steam overlay. |
+| **Play from Steam** | Start the game with BG3MFX from Steam's Play button. |
+
+This fork is not in Homebrew: the [Install](#install) commands below install the
+original BG3MFX. To use the fork, build it (this needs Xcode or its Command Line
+Tools):
+
+```sh
+git clone -b bg3-grand-mac-fix-030 https://github.com/ElowriT/bg3mfx.git
+cd bg3mfx
+make
+```
+
+Then, in Steam, open Baldur's Gate 3's **Properties > General** and set
+**Launch Options** to the line below, with the folder you cloned into:
+
+```text
+"/path/to/bg3mfx/tools/launch/steam-launch.sh" #%command%
+```
+
+Press Play as usual; clear the field to play without BG3MFX. To turn one of
+the changes off, add its line to `build/steam-launch.env` in that folder:
+`BG3MFX_SPLIT_SCREEN_FOG=0`, `BG3MFX_METALFX_SHARPENING=0`,
+`BG3MFX_KEEP_REBIND_CLICK=1` (keeps the game's click), or
+`BG3MFX_STEAM_OVERLAY=0` (starts without the Steam overlay). Developers also
+get a lab mode for live renderer investigation, with virtual controllers and a
+GPU profiler: see [lab mode](docs/dev/lab.md).
+
 ## Table of Contents
 
+- [About this fork](#about-this-fork)
 - [Features](#features)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
