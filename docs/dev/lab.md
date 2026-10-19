@@ -1,34 +1,71 @@
 # Lab mode
 
-Lab mode is an investigation aid for finding which BG3 shader draws a visible
-effect. It is off unless `BG3MFX_LAB` names a directory, and it works in both the
-quiet and the diagnostic runtime.
+Lab mode is an investigation aid for live BG3 rendering work: finding which
+shader draws a visible effect, what it reads, what each pass costs, and why a
+renderer integration does or does not engage. It is off unless `BG3MFX_LAB`
+names a directory, and it works in both the quiet and the diagnostic runtime.
 
 ```sh
 BG3MFX_LAB="$PWD/build/evidence/lab" python3 tools/launch/bg3mfx.py launch
 ```
 
+Do not rebuild `build/bin/libBG3MetalFX.dylib` while a game started from it runs;
+check `pgrep -f "MacOS/Baldur"` first.
+
+## Control file
+
 While the game runs, the runtime rereads `<dir>/control.txt` at most four times
-a second, at frame presentation:
+a second, at frame presentation. Each line is one rule; rules not present in the
+file are cleared. Render pipelines are named `vertexFunction|fragmentFunction`,
+compute pipelines by their kernel; `<text>` matches any part of that name.
 
-- `skip <text>`: every draw or compute dispatch whose pipeline name contains
-  `<text>` is dropped. Render pipelines are named `vertexFunction|fragmentFunction`,
-  compute pipelines by their kernel. Rules apply from the next pipeline bind.
-- `watch <text>`: calls of matching pipelines also record, in the census, every
-  bound texture (identity, size, format, label), the viewport and scissor, and for
-  dispatches the grid. Identities tell whether two views share a texture.
-- `census <name>`: when the name changes, the next frame's render and compute
-  encoders are written to `<dir>/census-<name>.json`, in encoding order, with
-  their labels, color and depth targets, and per-shader call counts (skipped
-  calls are marked `[skipped]`). A census already named when the game starts is
-  not recorded.
+| Line | Effect |
+| --- | --- |
+| `skip <text>` | Drops every draw or dispatch of matching pipelines, from the next pipeline bind. |
+| `watch <text>` | Calls of matching pipelines also record, in the census, every bound texture (identity, size, format, label), constant buffer and `setBytes` payload, viewport, scissor and, for dispatches, the grid. |
+| `census <name>` | When the name changes, the next frame's render and compute encoders go to `census-<name>.json` in encoding order: labels, color/depth targets with identities, per-shader call counts (`[skipped]` marked), `setBytes` payloads, and vertex layouts of watched render pipelines. A census already named at launch is not recorded. |
+| `profile <name>` | A census whose render and compute passes also carry GPU timestamps at stage boundaries. Once the GPU has finished the frame, `profile-<name>.json` lists each pass with its `gpuMs`. Passes overlap on the GPU, so add `serialize` for exclusive per-pass times. |
+| `serialize` | Chains every render and compute encoder with a fence, so each starts after the previous one finished. It changes performance; use it for measurement and race checks only. |
+| `poke <text> <slot> <offset> <value>` | Rebinds a copy of the constants at `<slot>` with a 4-byte value at `<offset>` for matching calls only, then restores the original binding. `<slot>` is a compute index or `vertex:N`/`fragment:N`; a value `iN` writes an integer, otherwise a float. |
+| `dump <tag> <text> <slot> [#N]` | Copies the texture bound at `<slot>` (or `color0`, the render target) of the Nth matching call of a frame (default the first) right after its encoder ends, to `dump-<tag>.raw` with a JSON description. Each tag is captured once. |
+| `dumpbuf <tag> <text> <slot> <length> [#N]` | The same for a buffer or `setBytes` binding; `<slot>` as for `poke`. |
+| `scaling <1/2/3>` | Renders new command buffers as FSR, MetalFX Spatial or Temporal regardless of the menu, for same-scene comparisons (FSR and Spatial share the render size; Temporal needs the menu's TAA setup). |
+| `sharpen <0/1>` | Turns BG3's RCAS sharpening of MetalFX output off or on. |
 
-`<dir>/status.json` reports the generation, skip rules and census name the game
-applied. `tools/launch/lab.py` writes the control file, waits for that confirmation,
-summarizes a census, and takes screenshots once BG3 is the frontmost app
-(`probe NAME TEXT...` applies a rule set and takes one shot).
+## Output files
 
-Skipping pipelines that the MetalFX integration recognizes (TAA, the color
-passes it follows, FSR, CombineUI) changes what the upscalers receive; skip them
-only with Upscaling Type Off or FSR. Lab mode does not alter any game file.
-`make test` covers it with `lab-smoke` on both runtimes (synthetic only).
+| File | Contents |
+| --- | --- |
+| `status.json` | The rule generation, skip/watch/poke rules, census name and `scaling` the game applied. |
+| `perf.json` | About once a second: presented frames per second, command buffers per second, `gpuMsPerFrame` and `gpuBusy` from BG3's command buffers, and `metal4MsPerFrame`, MetalFX Temporal's own GPU time on its Metal 4 queue. BG3's command buffers wait for that queue, so with Temporal their time includes the wait; use `metal4MsPerFrame` or a serialized profile for real costs. |
+| `census-*.json`, `profile-*.json` | As above. |
+| `dump-*.raw`, `dump-*.json` | Raw texels or bytes; the JSON gives size, pixel format, bytes per row, viewport and the capturing call. |
+| `input-log.jsonl` | A timeline of AppKit input events (with the posting process for synthetic events), game controller changes, window and display changes (window frame, screen backing scale, Metal layer drawable size), cursor warps, `CGEventPost` calls with their game call sites, bg3mfx menu events, and upscaling pipeline events: scene capture per view, the pass chain from TAA to FSR, blit copies, lookups at FSR and native fallbacks. |
+
+## Tools
+
+`tools/launch/lab.py` writes the control file, waits for the `status.json`
+confirmation, summarizes a census pass by pass, and takes screenshots once BG3
+is the frontmost app (`probe NAME TEXT...` applies a rule set and takes one
+shot; `rules NAME LINE...` applies exact control lines and takes two).
+
+For comparing shaders offline, with extracted data kept in the ignored `build/`
+directory and never distributed:
+
+- `tools/reference/metallib_extract.py LIB list|extract`: functions of a `.metallib` as
+  AIR bitcode; disassemble with `xcrun clang -S -emit-llvm -x ir NAME.air`.
+- `tools/reference/metallib_reflect.m` (build with `xcrun clang -fobjc-arc -framework
+  Foundation -framework Metal`): bindings and constant-buffer members of
+  kernels, or of a render pair with `--render VERTEX FRAGMENT PIXELFORMAT`.
+- `tools/reference/lspk.py PAK list|extract`: Larian LSPK v18 archives, such as the
+  Windows `EngineShaders.pak` (downloaded by the license holder).
+- `tools/reference/bshd_spirv.py FILE.bshd OUTDIR`: SPIR-V modules from Vulkan `.bshd`
+  shader files, for `spirv-cross`.
+
+## Cautions
+
+Skipping or poking pipelines that the MetalFX integration recognizes (TAA, the
+color passes it follows, FSR, RCAS, CombineUI) changes what the upscalers
+receive. Lab mode never alters any game file. `make test` covers the control
+file, census, dumps, pokes, serialization and the profiler with `lab-smoke` on
+both runtimes (synthetic only).

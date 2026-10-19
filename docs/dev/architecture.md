@@ -36,8 +36,10 @@ control is disabled while Temporal is selected.
 tracks each command buffer's selected mode and associates exact BG3 textures
 through TAA, post-processing, and the native FSR stage. Unknown or mismatched
 resources fail closed instead of guessing from dimensions. Native FSR and RCAS
-dispatches are skipped only for an active MetalFX mode. Off and FSR retain
-BG3's callbacks and native rendering.
+dispatches are skipped only for an active MetalFX mode, and BG3's own RCAS
+dispatch is then replayed on the MetalFX result
+([MetalFX Sharpening](../../src/features/metalfx-sharpening/README.md)). Off and
+FSR retain BG3's callbacks and native rendering.
 
 `SpatialUpscaler.mm` copies BG3's linear HDR scene color from RG11B10Float into
 RGBA16Float, runs MetalFX Spatial in HDR mode, and copies the result into BG3's
@@ -80,6 +82,23 @@ validation limits.
 `MetalFXPipeline.mm` owns only the MetalFX Spatial/Temporal scaler objects,
 resource checks, output allocation, scaler encoding, and its cross-API GPU event bridge. It has no BG3 menu,
 frame presentation, patching, or distribution responsibilities.
+
+## Split screen
+
+BG3 renders each split-screen view into its own rectangle of shared full-size
+textures, with that view's viewport and Viewport constants (`g_ViewportScale`,
+`g_ViewportOffset`, size, minimum, index), then runs FSR and RCAS over the
+whole frame once per view.
+
+- [Split-Screen Fog Fix](../../src/features/split-screen-fog/README.md): the
+  volumetric fog composite gets a vertex function applying the view's scale and
+  offset, so each view samples its own part of the fog volume.
+- [Split-Screen Upscaling](../../src/features/split-screen-upscaling/README.md):
+  the TAA capture records each view's rectangle; at that view's FSR dispatch,
+  color, depth and motion are cropped, upscaled by the view's own scaler (own
+  Temporal history) and placed into its rectangle of the output. Scene
+  associations follow BG3's blit copies between bloom and colour grading.
+  Frame Generation pairs whole frames only and stays unpaired in split screen.
 
 ## Frame Generation
 
@@ -306,6 +325,22 @@ fixtures keep independent layouts/expected instructions to catch drift.
 - `src/features/lua-jump-fix/LuaJumpFix.*`: BG3's Lua error handling uses `_setjmp`/`_longjmp`,
   avoiding two system calls per protected call (on by default;
   `BG3MFX_LUA_SYSTEM_CALL_ELIMINATION=0` disables it).
+- `src/features/window-rebind-click/RebindClick.*`: Window Rebind Click Fix (on by
+  default; `BG3MFX_KEEP_REBIND_CLICK=1` keeps the click). After
+  `cocoa::CocoaWindow::BindSurface` swaps the content view, BG3 posts a synthetic
+  left click, which switched its UI from controller to mouse and keyboard. At the
+  two verified `CGEventPost` call sites (manifest `RebindClick`) the click is
+  replaced, while BG3 is active, by focusing the new view; installed with the
+  Video Options focus repair in `NativeMenu.mm`.
+- `src/features/split-screen-fog/SplitScreenFog.*`: the split-screen fog vertex
+  function (`BG3MFX_SPLIT_SCREEN_FOG=0` disables it).
+- `src/features/split-screen-upscaling/ViewRegions.*`: split-screen view crops and
+  placement for MetalFX.
+- `src/features/metalfx-sharpening/Sharpening.*`: BG3's RCAS replayed on MetalFX
+  output (`BG3MFX_METALFX_SHARPENING=0` disables it).
+- `src/integration/lab/LabInput.*`: [lab mode](lab.md)'s input, window and
+  upscaling-pipeline event timeline; the control file, census, dumps and GPU
+  profiler are in `Trace.mm`.
 - `src/integration/diagnostics/ServerPacingProbe.*`: opt-in measurement
   (`BG3MFX_TRACE_SERVER_PACING=1`, diagnostic runtime) of the server tick's work,
   CPU time and limiter, logged to category `pacing`.
@@ -321,5 +356,6 @@ fixtures keep independent layouts/expected instructions to catch drift.
 - `src/features/metalfx-frame-generation/FrameInterpolation.*`: frame interpolation, stand-in drawables, and the
   presentation worker.
 - `tests/features/`, `tests/common/`, and `tests/integration/`: synthetic Metal pixel and hook regressions.
-- `tools/launch/bg3mfx.py`: guarded, bundle-preserving development launch.
+- `tools/launch/bg3mfx.py`: guarded, bundle-preserving development launch;
+  `tools/launch/lab.py` drives lab mode.
 - `docs/dev/validation/`: current status and dated evidence.
