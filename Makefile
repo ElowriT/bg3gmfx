@@ -24,6 +24,9 @@ install: $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/bg3mfx
 $(BIN_DIR)/runtime-smoke: tests/integration/runtime_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
 
+$(BIN_DIR)/lab-smoke: tests/integration/lab_smoke.mm | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -o $@
+
 $(BIN_DIR)/spatial-hook-smoke: tests/features/metalfx-spatial-upscaling/spatial_hook_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework AppKit -o $@
 
@@ -117,7 +120,7 @@ $(BIN_DIR)/libBG3MetalFXTest.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BI
 $(BIN_DIR)/metalfx-probe: tools/probes/metalfx_probe.m | $(BIN_DIR)
 	xcrun clang -fobjc-arc -mmacosx-version-min=26.0 $< $(FRAMEWORKS) -o $@
 
-test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTrace.dylib
+test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/supported-build-smoke
 	$(BIN_DIR)/bind-filter-smoke
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
@@ -145,6 +148,8 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	BG3MFX_DEPTH_PREPASS_OPTIMIZATION=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-trim
 	BG3MFX_DEPTH_PREPASS_OPTIMIZATION=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib expect-trim
 	BG3MFX_DEPTH_PREPASS_OPTIMIZATION=0 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-full
+	$(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFX.dylib
+	$(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: $(BIN_DIR)/bg3mfx
