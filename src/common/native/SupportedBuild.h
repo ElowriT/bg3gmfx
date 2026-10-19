@@ -62,6 +62,13 @@ inline constexpr uintptr_t WorldTarget = 0x10638ec08;
 inline constexpr uintptr_t GettimeofdayTarget = 0x1077cce0c;
 inline constexpr uintptr_t CapTarget = 0x1064d1b8c;
 }
+namespace RebindClick {
+// Return addresses of cocoa::CocoaWindow::BindSurface's CGEventPost calls
+// (mouse down, up) and the import stub they call.
+inline constexpr uintptr_t MouseDownReturn = 0x100bb4218;
+inline constexpr uintptr_t MouseUpReturn = 0x100bb4248;
+inline constexpr uintptr_t EventPostStub = 0x1077caee0;
+}
 namespace Shadows {
 inline constexpr uintptr_t FirstStageAdd = 0x105d1a7c8;
 inline constexpr uintptr_t SecondStageAdd = 0x105d1a818;

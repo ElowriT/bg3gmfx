@@ -5,7 +5,7 @@ EVIDENCE_DIR ?= build/evidence
 CXX = xcrun clang++
 CPPFLAGS = -Isrc
 CXXFLAGS = $(CPPFLAGS) -std=c++17 -fobjc-arc -O2 -Wall -Wextra -mmacosx-version-min=26.0
-FRAMEWORKS = -framework Foundation -framework Metal -framework MetalFX -framework AppKit -framework QuartzCore
+FRAMEWORKS = -framework Foundation -framework Metal -framework MetalFX -framework AppKit -framework QuartzCore -framework GameController
 
 .PHONY: all install test test-python clean clean-evidence
 # The quiet runtime is the build players use; bg3mfx is its launcher.
@@ -79,6 +79,8 @@ RUNTIME_SOURCES = \
 	src/features/dynamic-worker-prioritization/DynamicWorkers.mm \
 	src/features/lua-jump-fix/LuaJumpFix.mm \
 	src/features/split-screen-fog/SplitScreenFog.mm \
+	src/features/window-rebind-click/RebindClick.mm \
+	src/integration/lab/LabInput.mm \
 	src/common/gpu/GPUResources.mm \
 	src/common/gpu/MetalFXPipeline.mm \
 	src/common/native/CodePatch.mm \
@@ -91,6 +93,8 @@ DIAGNOSTIC_SOURCES = \
 
 RUNTIME_HEADERS = \
 	src/features/split-screen-fog/SplitScreenFog.h \
+	src/features/window-rebind-click/RebindClick.h \
+	src/integration/lab/LabInput.h \
 	src/common/native/SupportedBuild.h \
 	src/features/depth-prepass/DepthPrepass.h \
 	src/features/render-thread-optimizations/BindFilter.h \

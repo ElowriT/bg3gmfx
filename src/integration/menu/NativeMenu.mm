@@ -7,6 +7,7 @@
 #import "integration/diagnostics/ServerPacingProbe.h"
 #endif
 #import "features/thread-idling/ThreadIdling.h"
+#import "features/window-rebind-click/RebindClick.h"
 #import "features/dynamic-worker-prioritization/DynamicWorkers.h"
 #import <MetalFX/MetalFX.h>
 #import <AppKit/AppKit.h>
@@ -515,6 +516,10 @@ BOOL BG3MFXInstallNativeMenu(void (*report)(NSDictionary *), NSError **error) {
     slide = _dyld_get_image_vmaddr_slide(imageIndex);
     bool focusRepairInstalled = installRenderViewFocusRepair();
     event(@{@"event":@"nativeMenuFocusRepairHook", @"installed":@(focusRepairInstalled)});
+    // BG3's synthetic click after a window rebind switched the UI from controller
+    // to mouse and keyboard (src/features/window-rebind-click/RebindClick.mm).
+    // A mismatch leaves BG3 unchanged. BG3MFX_KEEP_REBIND_CLICK=1 keeps the click.
+    BG3MFXInstallRebindClickFix(slide,report);
     if (!BG3MFXInstallTemporalJitter(slide,report,error)) return NO;
     // Remove BG3's duplicate cascaded-shadow stage (docs/dev/performance.md). A mismatch
     // leaves BG3 unchanged. BG3MFX_SHADOW_RENDERING_OPTIMIZATIONS=0 keeps both stages for
