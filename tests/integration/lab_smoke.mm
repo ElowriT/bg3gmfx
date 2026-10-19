@@ -220,13 +220,18 @@ int main(int argc, const char **argv) {
             gamepad.leftThumbstick.xAxis.value != 0.5f || gamepad.leftThumbstick.yAxis.value != -1) {
             fprintf(stderr,"The virtual controller does not hold the named buttons and stick position\n"); return 26;
         }
-        __block NSUInteger changes = 0;
+        __block NSUInteger changes = 0, pauses = 0;
         gamepad.valueChangedHandler = ^(GCExtendedGamepad *, GCControllerElement *) { ++changes; };
-        control(@"pad 1\npad 2 b\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        joined.controllerPausedHandler = ^(GCController *) { ++pauses; };
+#pragma clang diagnostic pop
+        control(@"pad 1\npad 2 b menu\n");
         settle();
         if (gamepad.buttonA.pressed || !gamepad.buttonB.pressed || gamepad.dpad.yAxis.value != 0 || gamepad.leftThumbstick.xAxis.value != 0 || !changes) {
             fprintf(stderr,"Changing the pad lines did not update the controller (%lu change callbacks)\n",(unsigned long)changes); return 27;
         }
+        if (pauses != 1) { fprintf(stderr,"Pressing Menu called the pause handler %lu times\n",(unsigned long)pauses); return 30; }
         control(@"pad 2 b\n");
         settle(); settle();
         NSData *padStatusData = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:@"status.json"]];

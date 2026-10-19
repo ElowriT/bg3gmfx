@@ -255,9 +255,17 @@ NSArray<NSDictionary *> *BG3MFXLabPadsApply(NSArray<NSString *> *lines) {
             NSMutableArray *unknown = [NSMutableArray array];
             for (NSString *name in want.held)
                 if (!padButtons()[name] && ![@[@"up", @"down", @"left", @"right"] containsObject:name]) [unknown addObject:name];
+            bool menuWasPressed = gamepad.buttonMenu.pressed;
             [padButtons() enumerateKeysAndObjectsUsingBlock:^(NSString *name, NSString *key, BOOL *) {
                 setButton(gamepad, [gamepad valueForKey:key], [want.held containsObject:name] ? 1 : 0);
             }];
+            // BG3 takes the Menu button from the controller's pause handler.
+            if (!menuWasPressed && gamepad.buttonMenu.pressed) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                if (auto paused = pad.controllerPausedHandler) paused(pad);
+#pragma clang diagnostic pop
+            }
             setAxes(gamepad, gamepad.dpad, ([want.held containsObject:@"right"] ? 1 : 0) - ([want.held containsObject:@"left"] ? 1 : 0),
                     ([want.held containsObject:@"up"] ? 1 : 0) - ([want.held containsObject:@"down"] ? 1 : 0));
             setAxes(gamepad, gamepad.leftThumbstick, want.left[0], want.left[1]);

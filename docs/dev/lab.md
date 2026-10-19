@@ -40,7 +40,9 @@ without physical controllers. Each pad is a simulated GameController controller
 (`+[GCController controllerWithExtendedGamepad]`) presented as an Xbox
 controller: it is added to `+[GCController controllers]` and announced with
 `GCControllerDidConnectNotification`, and button and stick changes call the
-element and profile change handlers as real input does. Removing a pad's lines
+element and profile change handlers as real input does; pressing `menu` also
+calls the controller's pause handler, where BG3 takes its Menu button
+(`options` is the View button). Removing a pad's lines
 disconnects it. The timeline records connections and BG3's first queries.
 `tools/launch/lab.py pad` presses, holds and releases buttons and tilts sticks
 (see its help). Changes apply at the next control-file read, so a press lasts at
