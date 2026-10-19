@@ -7,6 +7,7 @@ control.txt are kept):
   lab.py --dir <dir> clear                  remove every skip rule
   lab.py --dir <dir> census NAME            record the next frame to census-NAME.json
   lab.py --dir <dir> summary NAME           print that census pass by pass
+  lab.py --dir <dir> profile-summary NAME   GPU time of profile-NAME.json by category, top passes, repeats
   lab.py --dir <dir> shot NAME              screenshot to shots/NAME.png (needs screen recording access)
   lab.py --dir <dir> probe NAME [TEXT ...]  apply exactly these skip rules, then take shot NAME
   lab.py --dir <dir> rules NAME [LINE ...]  apply exactly these control lines (skip/poke), then shots NAME-a/-b
@@ -188,6 +189,86 @@ def summary(directory, name):
                 print(f"        t{slot} {bound['id']} {size} {FORMATS.get(bound['format'], bound['format'])} {bound['label']}")
 
 
+# Pass categories for profile summaries; a shader takes the first that matches.
+# BG3 names material variants by pass: _DEPS_ shadow depth, _DEP_ depth
+# prepass, _DEF_ G-buffer, _VEL_ velocity, _FOR_ forward. Approximate: a pass is
+# counted whole under the category of most of its calls.
+CATEGORIES = [
+    ("shadows", r"_DEPS_|Shadow|Cascade"),
+    ("depth prepass", r"_DEP_|FadePattern"),
+    ("velocity", r"_VEL_|Velocity"),
+    ("G-buffer", r"_DEF_"),
+    ("fog and clouds", r"Fog|Volumetric|Clouds"),
+    ("lighting and decals", r"ClusteredLighting|Cluster|Decal|DirLight|Light"),
+    ("ambient occlusion", r"SSAO|GTAO|HBAO"),
+    ("TAA and upscaling", r"PPTAA|FSR|BG3MFX|MetalFX"),
+    ("post-processing", r"\|PP|^PP|Bloom|ToneMap|ColorGrading|SSSS|Outline|Exposure|RoomTrigger"),
+    ("UI and HUD", r"31_|CombineUI|libMTLHud"),
+    ("skinning", r"Skinning|BlendShape"),
+    ("forward", r"_FOR_"),
+]
+
+
+def shader_category(name):
+    for category, pattern in CATEGORIES:
+        if re.search(pattern, name):
+            return category
+    return "other"
+
+
+def pass_category(entry):
+    calls = {}
+    for name, count in {**entry.get("draws", {}), **entry.get("dispatches", {})}.items():
+        category = shader_category(name)
+        calls[category] = calls.get(category, 0) + count
+    return max(calls, key=calls.get) if calls else "other"
+
+
+def short_shader(name):
+    """The vertex half of a render pair (they share the material name), without prefixes."""
+    first = name.split("|")[0] if "|" in name and not name.startswith(("PPDefaultVS", "PassPosVS", "DefaultVS")) else name
+    return re.sub(r"^(Shared_|Engine_Materials_)", "", first).replace("_vertexMain", "")[:56]
+
+
+def profile_summary(directory, name, top=12):
+    profile = json.loads((directory / f"profile-{name}.json").read_text())
+    passes = profile["passes"]
+    total = profile.get("sumMs") or sum(p["gpuMs"] for p in passes)
+    metal4 = profile.get("metal4MsPerFrame") or 0
+    print(f"profile {name}: {len(passes)} passes, {total:.2f} ms of BG3 passes"
+          + (f"; MetalFX's own queue {metal4:.2f} ms per frame" if metal4 else ""))
+    print("(passes overlap on the GPU unless the profile was taken with `serialize`)")
+    by_category = {}
+    for entry in passes:
+        time, count = by_category.get(pass_category(entry), (0.0, 0))
+        by_category[pass_category(entry)] = (time + entry["gpuMs"], count + 1)
+    for category, (time, count) in sorted(by_category.items(), key=lambda item: -item[1][0]):
+        print(f"  {category:22} {time:6.2f} ms {100 * time / total if total else 0:5.1f}%  ({count} passes)")
+    print("top passes:")
+    for entry in sorted(passes, key=lambda p: -p["gpuMs"])[:top]:
+        work = entry.get("draws") or entry.get("dispatches") or {}
+        shaders = ", ".join(short_shader(key) for key in sorted(work, key=lambda key: -work[key])[:2])
+        where = f" viewport {entry['viewport']}" if entry.get("viewport") else ""
+        print(f"  #{entry['index']:<4} {entry['gpuMs']:6.3f} ms {entry['kind']:7} {sum(work.values()):4} call(s) "
+              f"{pass_category(entry)}: {shaders}{where}")
+    # The same shaders over the whole target more than once per frame: in split
+    # screen, work a view repeats for the whole frame instead of its half.
+    repeats = {}
+    for entry in passes:
+        target = (entry.get("colors") or [{}])[0]
+        viewport = entry.get("viewport")
+        if not viewport or not target or viewport[2:] != [target.get("width"), target.get("height")] or viewport[:2] != [0, 0]:
+            continue
+        key = tuple(sorted(entry.get("draws", {})))
+        repeats.setdefault(key, []).append(entry)
+    repeated = [(sum(e["gpuMs"] for e in group), key, group) for key, group in repeats.items() if len(group) > 1]
+    if repeated:
+        print("full-target passes repeated in the frame:")
+        for time, key, group in sorted(repeated, key=lambda item: -item[0])[:top]:
+            print(f"  {time:6.3f} ms x{len(group)} {', '.join(short_shader(k) for k in key[:2]) or '(no draws)'} "
+                  f"viewport {group[0]['viewport']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", type=Path, required=True)
@@ -196,6 +277,7 @@ def main():
     sub.add_parser("clear")
     sub.add_parser("census").add_argument("name")
     sub.add_parser("summary").add_argument("name")
+    sub.add_parser("profile-summary").add_argument("name")
     sub.add_parser("shot").add_argument("name")
     rules = sub.add_parser("rules")
     rules.add_argument("name")
@@ -234,6 +316,8 @@ def main():
         summary(directory, args.name)
     elif args.command == "summary":
         summary(directory, args.name)
+    elif args.command == "profile-summary":
+        profile_summary(directory, args.name)
     elif args.command == "rules":
         wait_front()
         path = directory / "control.txt"

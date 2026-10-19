@@ -584,6 +584,8 @@ static id labProfiledComputeEncoder(id<MTLCommandBuffer> buffer, MTLDispatchType
     labCreatingProfiledEncoder = false;
     return encoder;
 }
+// MetalFX's own Metal 4 GPU time per frame from the latest perf.json, for profiles.
+static std::atomic<double> labMetal4MsPerFrame{0};
 static void labWriteProfile(NSArray<NSMutableDictionary *> *frame, NSUInteger count, NSString *name) {
     NSData *data = count ? [labCounters resolveCounterRange:NSMakeRange(0,count)] : nil;
     const MTLCounterResultTimestamp *samples = (const MTLCounterResultTimestamp *)data.bytes;
@@ -607,7 +609,7 @@ static void labWriteProfile(NSArray<NSMutableDictionary *> *frame, NSUInteger co
         [passes addObject:pass];
     }
     labWrite([NSString stringWithFormat:@"profile-%@.json",name],@{@"profile":name,@"passes":passes,@"sumMs":@(total),
-        @"metal4MsPerFrame":@(0)});
+        @"metal4MsPerFrame":@(labMetal4MsPerFrame.load())});
     fprintf(stderr,"BG3 MetalFX lab: profile %s timed %lu passes, %.2f ms in total\n",name.UTF8String,(unsigned long)passes.count,total);
 }
 // Lab mode: the upscaling pipeline's diagnostic events, in input-log.jsonl.
@@ -1004,6 +1006,7 @@ static void labPerf(void) {
     uint64_t commits = labCommits.load(), gpu = labGPUNanoseconds.load(), metal4 = labMetal4Nanoseconds.load();
     if (last) {
         double span = now - last, presented = (double)(frames - lastFrames);
+        labMetal4MsPerFrame = presented ? (metal4-lastMetal4)*1e-6/presented : 0;
         labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
             @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),
             @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames),

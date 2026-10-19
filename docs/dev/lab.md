@@ -54,7 +54,7 @@ least a quarter of a second.
 | --- | --- |
 | `status.json` | The rule generation, skip/watch/poke rules, census name and `scaling` the game applied, and the virtual controllers as of the previous change (the player index BG3 gave each, whether it installed a change handler, held buttons). |
 | `perf.json` | About once a second: presented frames per second, command buffers per second, `gpuMsPerFrame` and `gpuBusy` from BG3's command buffers, and `metal4MsPerFrame`, MetalFX Temporal's own GPU time on its Metal 4 queue. BG3's command buffers wait for that queue, so with Temporal their time includes the wait; use `metal4MsPerFrame` or a serialized profile for real costs. `metal4Reordered` counts Metal 4 submissions that reached their queue in another order than they were encoded in (see [architecture](architecture.md)). |
-| `census-*.json`, `profile-*.json` | As above. |
+| `census-*.json`, `profile-*.json` | As above; a profile also records MetalFX's own GPU time per frame from the latest `perf.json`. |
 | `dump-*.raw`, `dump-*.json` | Raw texels or bytes; the JSON gives size, pixel format, bytes per row, viewport and the capturing call. |
 | `input-log.jsonl` | A timeline of AppKit input events (with the posting process for synthetic events), game controller changes, window and display changes (window frame, screen backing scale, Metal layer drawable size), cursor warps, `CGEventPost` calls with their game call sites, bg3mfx menu events, and upscaling pipeline events: scene capture per view, the pass chain from TAA to FSR, blit copies, lookups at FSR and native fallbacks (the first 300 of each kind per split-screen view, then every 300th with its count), and virtual controller events. |
 
@@ -65,7 +65,12 @@ confirmation, summarizes a census pass by pass, and takes screenshots once BG3
 is the frontmost app (`probe NAME TEXT...` applies a rule set and takes one
 shot; `rules NAME LINE...` applies exact control lines and takes two).
 `pad N press|hold|release|stick|connect|disconnect` drives the virtual
-controllers; other commands keep `watch` and `pad` lines.
+controllers; other commands keep `watch` and `pad` lines. `profile-summary NAME`
+adds up a profile by category (shadows, depth prepass, G-buffer, velocity,
+lighting, fog, post-processing, TAA and upscaling, UI, from BG3's material and
+shader names; approximate), lists the most expensive passes, and the passes
+that cover the whole target more than once a frame (in split screen, work that
+should cover one view).
 
 For comparing shaders offline, with extracted data kept in the ignored `build/`
 directory and never distributed:
