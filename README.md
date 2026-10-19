@@ -1,6 +1,10 @@
-# BG3MFX
+# BG3GMFX
 
-BG3MFX mods Baldur's Gate 3 on Mac to improve performance and reduce power usage. It does not alter any actual game files on disk.
+BG3GMFX is a fork of [BG3MFX](https://github.com/AndrewTriesToCode/bg3mfx) with
+split-screen, sharpening, controller and stability fixes (see
+[About this fork](#about-this-fork)). Like BG3MFX, it mods Baldur's Gate 3 on Mac
+to improve performance and reduce power usage, and it does not alter any actual
+game files on disk.
 
 - Framerate improvements anywhere from **50% to 100%** at no visual loss.
 
@@ -8,7 +12,7 @@ BG3MFX mods Baldur's Gate 3 on Mac to improve performance and reduce power usage
 
 ## About this fork
 
-This is [ElowriT](https://github.com/ElowriT)'s fork of
+BG3GMFX is [ElowriT](https://github.com/ElowriT)'s fork of
 [BG3MFX](https://github.com/AndrewTriesToCode/bg3mfx) by AndrewTriesToCode,
 based on its 0.3.0 release. It keeps every BG3MFX feature below and adds:
 
@@ -22,13 +26,13 @@ based on its 0.3.0 release. It keeps every BG3MFX feature below and adds:
 | **Steam overlay compatibility** | The game no longer crashes at launch when it starts with the Steam overlay. |
 | **Play from Steam** | Start the game with BG3MFX from Steam's Play button. |
 
-This fork is not in Homebrew: the [Install](#install) commands below install the
-original BG3MFX. To use the fork, build it (this needs Xcode or its Command Line
+BG3GMFX is not in Homebrew: the [Install](#install) commands below install the
+original BG3MFX. To use BG3GMFX, build it (this needs Xcode or its Command Line
 Tools):
 
 ```sh
-git clone -b bg3-grand-mac-fix-030 https://github.com/ElowriT/bg3mfx.git
-cd bg3mfx
+git clone https://github.com/ElowriT/bg3gmfx.git
+cd bg3gmfx
 make
 ```
 
@@ -36,10 +40,11 @@ Then, in Steam, open Baldur's Gate 3's **Properties > General** and set
 **Launch Options** to the line below, with the folder you cloned into:
 
 ```text
-"/path/to/bg3mfx/tools/launch/steam-launch.sh" #%command%
+"/path/to/bg3gmfx/tools/launch/steam-launch.sh" #%command%
 ```
 
-Press Play as usual; clear the field to play without BG3MFX. To turn one of
+Press Play as usual; clear the field to play without BG3GMFX. Its runtime,
+launcher and settings keep BG3MFX's names (`bg3mfx`, `BG3MFX_…`). To turn one of
 the changes off, add its line to `build/steam-launch.env` in that folder:
 `BG3MFX_SPLIT_SCREEN_FOG=0`, `BG3MFX_METALFX_SHARPENING=0`,
 `BG3MFX_KEEP_REBIND_CLICK=1` (keeps the game's click), or
