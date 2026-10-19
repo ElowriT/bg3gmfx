@@ -30,6 +30,9 @@ $(BIN_DIR)/lab-smoke: tests/integration/lab_smoke.mm | $(BIN_DIR)
 $(BIN_DIR)/split-screen-fog-smoke: tests/features/split-screen-fog/split_screen_fog_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
 
+$(BIN_DIR)/split-screen-upscale-smoke: tests/features/split-screen-upscaling/split_screen_upscale_smoke.mm | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
+
 $(BIN_DIR)/spatial-hook-smoke: tests/features/metalfx-spatial-upscaling/spatial_hook_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework AppKit -o $@
 
@@ -82,6 +85,7 @@ RUNTIME_SOURCES = \
 	src/features/window-rebind-click/RebindClick.mm \
 	src/integration/lab/LabInput.mm \
 	src/features/metalfx-sharpening/Sharpening.mm \
+	src/features/split-screen-upscaling/ViewRegions.mm \
 	src/common/gpu/GPUResources.mm \
 	src/common/gpu/MetalFXPipeline.mm \
 	src/common/native/CodePatch.mm \
@@ -97,6 +101,7 @@ RUNTIME_HEADERS = \
 	src/features/window-rebind-click/RebindClick.h \
 	src/integration/lab/LabInput.h \
 	src/features/metalfx-sharpening/Sharpening.h \
+	src/features/split-screen-upscaling/ViewRegions.h \
 	src/common/native/SupportedBuild.h \
 	src/features/depth-prepass/DepthPrepass.h \
 	src/features/render-thread-optimizations/BindFilter.h \
@@ -131,7 +136,7 @@ $(BIN_DIR)/libBG3MetalFXTest.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BI
 $(BIN_DIR)/metalfx-probe: tools/probes/metalfx_probe.m | $(BIN_DIR)
 	xcrun clang -fobjc-arc -mmacosx-version-min=26.0 $< $(FRAMEWORKS) -o $@
 
-test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/lab-smoke $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTrace.dylib
+test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/lab-smoke $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/supported-build-smoke
 	$(BIN_DIR)/bind-filter-smoke
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
@@ -167,6 +172,9 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
+	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: $(BIN_DIR)/bg3mfx

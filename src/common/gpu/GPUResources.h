@@ -34,10 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
                    error:(NSError **)error;
 @end
 
-// Diagnostics: when set, receives each Metal 4 bridge submission's GPU time.
-#ifndef BG3MFX_NO_TRACE
+// Diagnostics and lab mode (both runtimes): when set, receives each Metal 4
+// bridge submission's GPU time.
 extern "C" void (*_Nullable BG3MFXGPUTimingHook)(NSString *label, double gpuSeconds);
-#endif
 
 NS_ASSUME_NONNULL_END
 

@@ -17,6 +17,7 @@
 #import "features/split-screen-fog/SplitScreenFog.h"
 #import "integration/lab/LabInput.h"
 #import "features/metalfx-sharpening/Sharpening.h"
+#import "features/split-screen-upscaling/ViewRegions.h"
 #ifndef BG3MFX_NO_TRACE
 #endif
 #import "features/metalfx-frame-generation/FrameInterpolation.h"
@@ -521,7 +522,12 @@ static std::atomic<unsigned> labGeneration{1};
 // "scaling N" renders new command buffers as Upscaling Type N (1 FSR, 2 Spatial,
 // 3 Temporal) for same-scene comparisons; GPU time feeds perf.json.
 static std::atomic<int> labScaling{-1};
-static std::atomic<uint64_t> labGPUNanoseconds{0}, labCommits{0};
+static std::atomic<uint64_t> labGPUNanoseconds{0}, labCommits{0}, labMetal4Nanoseconds{0};
+// Metal 4 bridge submissions (MetalFX Temporal on Metal 4) run outside BG3's
+// command buffers, which only wait for them; their own GPU time, for perf.json.
+static void labMetal4Timing(NSString *, double seconds) {
+    if (seconds > 0 && seconds < 1) labMetal4Nanoseconds.fetch_add((uint64_t)(seconds*1e9),std::memory_order_relaxed);
+}
 enum LabCensus : uint8_t { LabIdle, LabArmed, LabRecording };
 static LabCensus labCensus;
 static NSString *labCensusName;
@@ -889,16 +895,17 @@ static void labWriteDumps(id<MTLCommandBuffer> buffer, __unsafe_unretained id en
 }
 // About once a second: presented frames, command buffers and GPU busy time.
 static void labPerf(void) {
-    static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU;
+    static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU, lastMetal4;
     double now = CACurrentMediaTime();
     if (now - last < 1.0) return;
-    uint64_t commits = labCommits.load(), gpu = labGPUNanoseconds.load();
+    uint64_t commits = labCommits.load(), gpu = labGPUNanoseconds.load(), metal4 = labMetal4Nanoseconds.load();
     if (last) {
         double span = now - last, presented = (double)(frames - lastFrames);
         labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
-            @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),@"frame":@(frames)});
+            @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),
+            @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames)});
     }
-    last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu;
+    last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu; lastMetal4 = metal4;
 }
 static void labFrameBoundary(void) {
     labPoll();
@@ -1255,11 +1262,13 @@ static NSString *temporalScalerKey(id<MTLDevice> device, NSUInteger iw, NSUInteg
 // scaler creation with about a thousand leaked threads. A size with no scaler
 // therefore runs BG3's native FSR until it has held for a moment; the first
 // scaler of the session is created at once.
+// Sizes with a scaler, including split-screen views' scalers (cached per view).
+static NSMutableSet<NSString *> *temporalSettledSizes() { static NSMutableSet *value = [NSMutableSet set]; return value; }
 static BOOL temporalSizeSettled(NSString *key) {
     static NSString *pendingKey;
     static double pendingSince;
     std::lock_guard<std::recursive_mutex> lock(guard());
-    if (temporalUpscalerCache()[key] || !temporalUpscalerCache().count) return YES;
+    if (temporalUpscalerCache()[key] || [temporalSettledSizes() containsObject:key] || !temporalUpscalerCache().count) return YES;
     double now=NSProcessInfo.processInfo.systemUptime;
     if (![key isEqualToString:pendingKey]) { pendingKey=key; pendingSince=now; return NO; }
     return now-pendingSince>=0.3;
@@ -1322,7 +1331,8 @@ static void validateMotionSample(id<MTLCommandBuffer> buffer, id<MTLTexture> mot
     }];
 }
 #endif
-static BOOL upscaleTemporal(id<MTLCommandBuffer> buffer, NSDictionary *inputs, id<MTLTexture> destination) {
+// view names a split-screen view: it gets a scaler, and so a history, of its own.
+static BOOL upscaleTemporal(id<MTLCommandBuffer> buffer, NSDictionary *inputs, id<MTLTexture> destination, NSString *view = nil) {
     id<MTLTexture> color = inputs[@"color"], depth = inputs[@"depth"], motion = inputs[@"motion"];
     if (!color || !depth || !motion || !destination) {
         failTemporal(@"The scene capture did not provide color, depth, motion, and final output textures.");
@@ -1332,8 +1342,11 @@ static BOOL upscaleTemporal(id<MTLCommandBuffer> buffer, NSDictionary *inputs, i
     NSString *reason = nil;
     if (!temporalParameters(inputs,&parameters,&reason)) { failTemporal(reason); return NO; }
     BOOL nativeAAWarmup = [inputs[@"nativeTAAPreserved"] boolValue];
-    parameters.reset |= nativeAAWarmup || temporalResetPending.exchange(false);
-    NSString *key = temporalScalerKey(buffer.device,color.width,color.height,destination.width,destination.height);
+    bool pendingReset = temporalResetPending.exchange(false);
+    parameters.reset |= nativeAAWarmup || pendingReset;
+    if (pendingReset && view) BG3MFXResetTemporalHistory();  // every view restarts, not only the first to see it
+    NSString *size = temporalScalerKey(buffer.device,color.width,color.height,destination.width,destination.height);
+    NSString *key = view ? [size stringByAppendingFormat:@"@%@",view] : size;
     BG3MFXTemporalUpscaler *upscaler;
     { std::lock_guard<std::recursive_mutex> lock(guard()); upscaler = temporalUpscalerCache()[key]; }
     NSError *error = nil;
@@ -1353,6 +1366,7 @@ static BOOL upscaleTemporal(id<MTLCommandBuffer> buffer, NSDictionary *inputs, i
             // leaks), and a bounded cache could evict the scaler it had just
             // added, recreating it every frame until the ANE was exhausted.
             temporalUpscalerCache()[key] = upscaler;
+            [temporalSettledSizes() addObject:size];
         }
     }
     #ifndef BG3MFX_NO_TRACE
@@ -1361,7 +1375,7 @@ static BOOL upscaleTemporal(id<MTLCommandBuffer> buffer, NSDictionary *inputs, i
     BOOL encoded = upscaler && [upscaler encodeColor:color deviceDepth:depth motion:motion parameters:parameters
         destination:destination commandBuffer:buffer error:&error];
     if (encoded) {
-        if(frameGeneration(buffer)) {
+        if(frameGeneration(buffer) && !view) {
             NSMutableDictionary *frames=objc_getAssociatedObject(buffer,&temporalFrameKey);
             frames[[NSValue valueWithPointer:(__bridge const void *)destination]]=inputs;
         }
@@ -1407,13 +1421,43 @@ static BOOL copyTemporalAAColor(id<MTLCommandBuffer> buffer, NSDictionary *input
 }
 // With sharpening, MetalFX writes an intermediate that BG3's own RCAS then
 // sharpens into the final target (see Sharpening.h); nil keeps the direct write.
+static char viewIntermediatesKey;
 static id<MTLTexture> sharpeningIntermediate(id<MTLCommandBuffer> buffer, NSDictionary *inputs) {
     if (!BG3MFXSharpeningEnabled() || !inputs[@"rcas"] || !inputs[@"scaled"] || !inputs[@"destination"]) return nil;
-    return [[BG3MFXNativeSharpening sharedForDevice:buffer.device] intermediateLike:inputs[@"destination"] commandBuffer:buffer];
+    if (!inputs[@"view"])
+        return [[BG3MFXNativeSharpening sharedForDevice:buffer.device] intermediateLike:inputs[@"destination"] commandBuffer:buffer];
+    // BG3 runs RCAS over the whole frame for each split-screen view, and so does
+    // the replay: the views share one intermediate, so the last view's pass
+    // sharpens every view's current result.
+    NSMutableDictionary *shared = objc_getAssociatedObject(buffer,&viewIntermediatesKey);
+    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)inputs[@"destination"]];
+    if (id<MTLTexture> texture = shared[key]) return texture;
+    id<MTLTexture> texture = [[BG3MFXNativeSharpening sharedForDevice:buffer.device] intermediateLike:inputs[@"destination"] commandBuffer:buffer];
+    if (!texture) return nil;
+    if (!shared) { shared = [NSMutableDictionary dictionary]; objc_setAssociatedObject(buffer,&viewIntermediatesKey,shared,OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    shared[key] = texture;
+    return texture;
+}
+// One split-screen view: crops its inputs, upscales them with `upscale` into a
+// view-sized output, and places that into the view's rectangle of `target`.
+static BOOL upscaleView(id<MTLCommandBuffer> buffer, NSDictionary *inputs, NSArray<NSString *> *crops, id<MTLTexture> target,
+                        BOOL (^upscale)(NSDictionary *cropped, id<MTLTexture> output)) {
+    BG3MFXViewRegions *regions = [BG3MFXViewRegions sharedForDevice:buffer.device];
+    NSArray *view = inputs[@"view"], *outputView = inputs[@"outputView"];
+    if (!regions || !view || !outputView || !target) return NO;
+    NSMutableDictionary *cropped = [inputs mutableCopy];
+    for (NSString *name in crops) {
+        id<MTLTexture> copy = [regions copyRegion:BG3MFXViewRegion(view) of:inputs[name] commandBuffer:buffer];
+        if (!copy) return NO;
+        cropped[name] = copy;
+    }
+    MTLRegion out = BG3MFXViewRegion(outputView);
+    id<MTLTexture> output = [regions textureWidth:out.size.width height:out.size.height format:target.pixelFormat commandBuffer:buffer];
+    return output && upscale(cropped,output) && [regions place:output into:target at:out.origin commandBuffer:buffer];
 }
 static void sharpenInto(id<MTLCommandBuffer> buffer, NSDictionary *inputs, id<MTLTexture> linear) {
     id<MTLTexture> destination = inputs[@"destination"];
-    BOOL encoded = [[BG3MFXNativeSharpening sharedForDevice:buffer.device] encodeFrom:linear fsrOutput:inputs[@"scaled"]
+    BOOL encoded = [[BG3MFXNativeSharpening sharedForDevice:buffer.device] encodeFrom:linear
         rcas:inputs[@"rcas"] destination:destination commandBuffer:buffer dispatch:^(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas) {
             NSArray *g = rcas[@"grid"], *n = rcas[@"threads"];
             MTLSize grid = MTLSizeMake([g[0] unsignedIntegerValue],[g[1] unsignedIntegerValue],[g[2] unsignedIntegerValue]);
@@ -1574,9 +1618,19 @@ static void endEncoder(id self, SEL cmd) {
         id<MTLTexture> intermediate = sharpeningIntermediate(commandBuffer,fsrInputs);
         NSMutableDictionary *spatialInputs = [fsrInputs mutableCopy];
         if (intermediate) spatialInputs[@"destination"] = intermediate;
+        BOOL upscaled = NO;
         if (!fsrInputs[@"destination"])
             failSpatial(@"The FSR dispatch sequence ended before a MetalFX output was identified.");
-        else if (upscaleSpatial(commandBuffer,spatialInputs)) {
+        else if (fsrInputs[@"view"]) {
+            NSMutableDictionary *viewInputs = [fsrInputs mutableCopy];
+            upscaled = upscaleView(commandBuffer,viewInputs,@[@"input"],intermediate ?: fsrInputs[@"destination"],
+                ^BOOL(NSDictionary *cropped, id<MTLTexture> output) {
+                    NSMutableDictionary *single = [cropped mutableCopy]; single[@"destination"] = output;
+                    return upscaleSpatial(commandBuffer,single);
+                });
+            if (!upscaled && !spatialFailed) failSpatial(@"Could not upscale a split-screen view.");
+        } else upscaled = upscaleSpatial(commandBuffer,spatialInputs);
+        if (upscaled) {
             if (intermediate) sharpenInto(commandBuffer,fsrInputs,intermediate);
             rememberUpscaledTAA(fsrInputs[@"nativeTAA"]);
             // As Temporal does, attach the frame's inputs to the upscaled output
@@ -1601,7 +1655,16 @@ static void endEncoder(id self, SEL cmd) {
             record(@{@"event":@"metalFXFrameSkipped",@"reason":@"The temporal scaler did not receive a matching scene color, depth, and motion frame."}); }
         else {
             id<MTLTexture> intermediate = sharpeningIntermediate(commandBuffer,fsrInputs);
-            if (upscaleTemporal(commandBuffer,frame,intermediate ?: destination) && intermediate) {
+            BOOL upscaled;
+            if (fsrInputs[@"view"]) {
+                NSMutableDictionary *viewInputs = [frame mutableCopy];
+                viewInputs[@"view"] = fsrInputs[@"view"]; viewInputs[@"outputView"] = fsrInputs[@"outputView"];
+                NSString *tag = [NSString stringWithFormat:@"%@,%@",fsrInputs[@"view"][0],fsrInputs[@"view"][1]];
+                upscaled = upscaleView(commandBuffer,viewInputs,@[@"color",@"depth",@"motion"],intermediate ?: destination,
+                    ^BOOL(NSDictionary *cropped, id<MTLTexture> output) { return upscaleTemporal(commandBuffer,cropped,output,tag); });
+                if (!upscaled && !temporalFailed) failTemporal(@"Could not upscale a split-screen view.");
+            } else upscaled = upscaleTemporal(commandBuffer,frame,intermediate ?: destination);
+            if (upscaled && intermediate) {
                 sharpenInto(commandBuffer,fsrInputs,intermediate);
                 // Frame Generation follows the frame from the texture MetalFX wrote.
                 NSValue *written = [NSValue valueWithPointer:(__bridge const void *)intermediate];
@@ -1930,6 +1993,26 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
         @"target":texture(target),@"buffer":@((uintptr_t)(__bridge void *)buffer)});
 }
 
+// The view this TAA draw renders, from BG3's Viewport constants: nil for the
+// whole texture (also when there are no constants, as Spatial never needed
+// them), [x, y, width, height] for one split-screen view. False when the
+// viewport is neither (cropped or scaled views are not supported).
+static bool sceneView(id encoder, id<MTLTexture> texture, NSArray **view) {
+    *view = nil;
+    NSData *viewport = constantBytes(encoder,StageFragment,9,168);
+    if (!viewport || !texture) return true;
+    const float *vp = (const float *)viewport.bytes;
+    const uint32_t *size = (const uint32_t *)((const uint8_t *)viewport.bytes+16);
+    const int32_t *minimum = (const int32_t *)((const uint8_t *)viewport.bytes+24);
+    if (vp[0] == 1 && vp[1] == 1 && vp[2] == 0 && vp[3] == 0 && size[0] == texture.width && size[1] == texture.height) return true;
+    // A split-screen view covers its share of the texture exactly.
+    if (minimum[0] < 0 || minimum[1] < 0 || !size[0] || !size[1] ||
+        minimum[0]+size[0] > texture.width || minimum[1]+size[1] > texture.height ||
+        std::abs(vp[0]*texture.width-size[0]) > 1 || std::abs(vp[1]*texture.height-size[1]) > 1 ||
+        std::abs(vp[2]*texture.width-minimum[0]) > 1 || std::abs(vp[3]*texture.height-minimum[1]) > 1) return false;
+    *view = @[@(minimum[0]),@(minimum[1]),@(size[0]),@(size[1])];
+    return true;
+}
 static void captureSceneInputs(id encoder, NSString *fragment) {
     std::lock_guard<std::recursive_mutex> lock(guard());
     if ((!sceneProbe && !metalFXEnabled) || (sceneProbe && sceneProbeAttempts && !metalFXEnabled)) return;
@@ -1962,6 +2045,9 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
         // follows it to the composition.
         if (!buffer || !sceneTracked(mode,buffer) || !taaTarget || taaTarget.pixelFormat != MTLPixelFormatRG11B10Float) return;
         spatialSeed = @{@"color":taaTarget,@"taaColor":taaTarget,@"nativeTAA":taaTarget};
+        NSArray *view = nil;
+        if (!sceneView(encoder,taaTarget,&view)) return;
+        if (view) spatialSeed = @{@"color":taaTarget,@"taaColor":taaTarget,@"nativeTAA":taaTarget,@"view":view};
         objc_setAssociatedObject(encoder, &taaInputsKey, spatialSeed, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         noteAssociation(encoder,AssocTAAInputs);
         // Frame Generation also needs this frame's depth, motion and camera,
@@ -1994,10 +2080,10 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
     if (!camera || !temporal || !viewport) {
         objc_setAssociatedObject(buffer,&sceneCaptureFailureKey,[NSString stringWithFormat:@"constants: camera %@, jitter %@, viewport %@",camera ? @"available" : @"missing",temporal ? @"available" : @"missing",viewport ? @"available" : @"missing"],OBJC_ASSOCIATION_RETAIN_NONATOMIC); return;
     }
-    const float *vp = (const float *)viewport.bytes;
-    const uint32_t *size = (const uint32_t *)((const uint8_t *)viewport.bytes+16);
-    // Split-screen, cropped, and scaled viewport support requires separate work.
-    if (vp[0] != 1 || vp[1] != 1 || vp[2] != 0 || vp[3] != 0 || size[0] != source.width || size[1] != source.height) return;
+    NSArray *view = nil;
+    if (!sceneView(encoder,source,&view)) return;
+    // Frame Generation pairs whole frames only.
+    if (spatialSeed && view) return;
     if (spatialSeed) {
         NSMutableDictionary *inputs = [spatialSeed mutableCopy];
         [inputs addEntriesFromDictionary:@{@"depth": depth, @"motion": motion, @"camera": camera, @"temporal": temporal, @"reset":@(resetMotion)}];
@@ -2005,11 +2091,11 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
         noteAssociation(encoder,AssocTAAInputs);
         return;
     }
-    objc_setAssociatedObject(encoder, &taaInputsKey,
-        @{@"color": source, @"taaColor": taaTarget, @"nativeTAA":taaTarget,
+    NSMutableDictionary *inputs = [@{@"color": source, @"taaColor": taaTarget, @"nativeTAA":taaTarget,
           @"nativeTAAPreserved":@(!knownUpscaledTAA(taaTarget)),
-          @"depth": depth, @"motion": motion, @"camera": camera, @"temporal": temporal, @"reset":@(resetMotion)},
-        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+          @"depth": depth, @"motion": motion, @"camera": camera, @"temporal": temporal, @"reset":@(resetMotion)} mutableCopy];
+    if (view) inputs[@"view"] = view;
+    objc_setAssociatedObject(encoder, &taaInputsKey, inputs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     noteAssociation(encoder,AssocTAAInputs);
 }
 static id<MTLBuffer> probeReadback(id<MTLCommandBuffer> buffer, id<MTLTexture> outputTexture) {
@@ -2392,6 +2478,12 @@ static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
             NSDictionary *frames = objc_getAssociatedObject(buffer,&temporalFrameKey);
             NSDictionary *frame = frames[[NSValue valueWithPointer:(__bridge const void *)source]];
             id<MTLTexture> spatialColor = frame[@"color"];
+            // A split-screen view is upscaled on its own, into its share of the output.
+            NSArray *view = frame[@"view"];
+            MTLRegion outputView = view ? BG3MFXScaleViewRegion(view,source.width,source.height,scaled.width,scaled.height)
+                                        : MTLRegionMake2D(0,0,scaled.width,scaled.height);
+            NSUInteger viewWidth = view ? [view[2] unsignedIntegerValue] : spatialColor.width;
+            NSUInteger viewHeight = view ? [view[3] unsignedIntegerValue] : spatialColor.height;
             if (temporal) {
                 if (!frame || source != frame[@"taaColor"] || scaled.width < source.width || scaled.height < source.height) {
 #ifndef BG3MFX_NO_TRACE
@@ -2403,7 +2495,7 @@ static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
                     fallBackToNative(self,YES,[NSString stringWithFormat:@"The native upscaling stage did not match the captured temporal scene inputs (%@).", !frame ? (objc_getAssociatedObject(buffer,&sceneCaptureFailureKey) ?: @"no matching scene color") : source != frame[@"taaColor"] ? @"different scene color target" : @"invalid output dimensions"]);
                     goto native;
                 }
-                if (!temporalSizeSettled(temporalScalerKey(buffer.device,spatialColor.width,spatialColor.height,scaled.width,scaled.height))) {
+                if (!temporalSizeSettled(temporalScalerKey(buffer.device,viewWidth,viewHeight,outputView.size.width,outputView.size.height))) {
                     fallBackToNative(self,YES,@"The output size is changing; waiting for it to settle before creating a Temporal scaler.");
                     goto native;
                 }
@@ -2412,9 +2504,13 @@ static void dispatchNative(id self, SEL cmd, MTLSize grid, MTLSize threads) {
                 fallBackToNative(self,NO,@"Could not match FSR input to BG3's linear HDR scene color.");
                 goto native;
             }
-            objc_setAssociatedObject(self,&fsrInputsKey,
-                @{@"input":temporal ? source : spatialColor,@"encodedInput":source,@"scaled":scaled,@"mode":@(mode),
-                  @"nativeTAA":frame[@"nativeTAA"]},OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NSMutableDictionary *replacement = [@{@"input":temporal ? source : spatialColor,@"encodedInput":source,@"scaled":scaled,
+                @"mode":@(mode),@"nativeTAA":frame[@"nativeTAA"]} mutableCopy];
+            if (view) {
+                replacement[@"view"] = view;
+                replacement[@"outputView"] = @[@(outputView.origin.x),@(outputView.origin.y),@(outputView.size.width),@(outputView.size.height)];
+            }
+            objc_setAssociatedObject(self,&fsrInputsKey,replacement,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             noteAssociation(self,AssocFSRInputs);
             suppressNative = YES;
         } else if ([pipelineName isEqualToString:@"FSR_RCAS"]) {
@@ -2881,6 +2977,7 @@ __attribute__((constructor)) static void start() {
             traceConstants = YES;  // installs the draw and dispatch hooks
             fprintf(stderr,"BG3 MetalFX lab mode: %s\n",labDirectory.UTF8String);
             BG3MFXLabInputStart(labDirectory);
+            if (!BG3MFXGPUTimingHook) BG3MFXGPUTimingHook = labMetal4Timing;
         }
         if (diagnostics) {
             constantSamples = [NSMutableDictionary dictionary];

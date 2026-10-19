@@ -7,9 +7,7 @@
 static std::atomic<NSUInteger> poolAllocations{0};
 extern "C" NSUInteger BG3MFXTexturePoolAllocations(void) { return poolAllocations.load(); }
 #endif
-#ifndef BG3MFX_NO_TRACE
 extern "C" void (*BG3MFXGPUTimingHook)(NSString *, double) = nullptr;
-#endif
 
 static NSError *resourceError(NSString *reason) {
     return [NSError errorWithDomain:@"BG3MFXGPUResources" code:1 userInfo:@{NSLocalizedDescriptionKey:reason}];
@@ -130,15 +128,11 @@ static NSError *resourceError(NSString *reason) {
     NSMutableArray *flight=[NSMutableArray arrayWithArray:retained];
     [flight addObjectsFromArray:allocations]; [flight addObject:residency];
     BG3MFXMetal4Bridge *bridge=self; void (^report)(NSError *)=[failure copy];
-#ifndef BG3MFX_NO_TRACE
     NSString *label=_label;
-#endif
     auto options=[MTL4CommitOptions new];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
         if (feedback.error && report) report(feedback.error);
-#ifndef BG3MFX_NO_TRACE
         if (auto hook=BG3MFXGPUTimingHook) hook(label,feedback.GPUEndTime-feedback.GPUStartTime);
-#endif
         [flight removeAllObjects];
         [slot.allocator reset];
         std::lock_guard<std::mutex> lock(bridge->_mutex); [bridge->_free addObject:slot];
