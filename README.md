@@ -8,7 +8,7 @@ game files on disk.
 
 - Framerate improvements anywhere from **50% to 100%** at no visual loss.
 
-- CPU consumption up t0 **~75% lower**, meaning less heat and fan noise.
+- CPU consumption up to **~75% lower**, meaning less heat and fan noise.
 
 ## About this fork
 
