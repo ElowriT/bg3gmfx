@@ -12,10 +12,10 @@ bool BG3MFXSharpeningEnabled(void) { return sharpening.load(std::memory_order_re
 void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
 
 @implementation BG3MFXNativeSharpening {
-    id<MTLDevice> _device;
     id<MTLComputePipelineState> _toFSRSpace;
-    NSMutableDictionary<NSString *, BG3MFXTexturePool *> *_pools, *_fsrSpacePools;
-    std::mutex _lock;
+    // Intermediates and RCAS inputs, one pool of each for the current size and
+    // the one before it, as Spatial keeps its scalers.
+    BG3MFXTexturePools *_pools;
 }
 
 + (instancetype)sharedForDevice:(id<MTLDevice>)device {
@@ -33,9 +33,7 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
     if (!(self = [super init])) return nil;
-    _device = device;
-    _pools = [NSMutableDictionary dictionary];
-    _fsrSpacePools = [NSMutableDictionary dictionary];
+    _pools = [[BG3MFXTexturePools alloc] initWithDevice:device capacity:4];
     // FSR_Tonemap's mapping, which FSR_RCAS undoes (c / (1 - max(c))) when it
     // writes BG3's RG11B10 target, which Metal fills rounding toward zero. The
     // MetalFX result is already on that grid, and the undo magnifies rounding by
@@ -63,23 +61,8 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
 
 - (id<MTLTexture>)intermediateLike:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer {
     // The final target's format: each MetalFX scaler writes the one it was made for.
-    NSString *key = [NSString stringWithFormat:@"%lu:%lu:%lu", (unsigned long)destination.width,
-                     (unsigned long)destination.height, (unsigned long)destination.pixelFormat];
-    BG3MFXTexturePool *pool;
-    {
-        std::lock_guard<std::mutex> hold(_lock);
-        pool = _pools[key];
-        if (!pool) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:destination.pixelFormat
-                width:destination.width height:destination.height mipmapped:NO];
-            desc.storageMode = MTLStorageModePrivate;
-            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
-            pool = _pools[key] = [[BG3MFXTexturePool alloc] initWithDevice:_device descriptor:desc];
-        }
-    }
-    id<MTLTexture> texture = [pool acquire];
-    if (texture) [pool relinquish:texture afterCommandBuffer:buffer];
-    return texture;
+    return [_pools textureWidth:destination.width height:destination.height format:destination.pixelFormat
+        usage:MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget commandBuffer:buffer];
 }
 
 // RCAS's input in FSR's space. BG3's own FSR output is RG11B10, whose rounding
@@ -90,22 +73,9 @@ static char fsrSpacesKey;
     NSMutableDictionary *shared = objc_getAssociatedObject(buffer, &fsrSpacesKey);
     NSValue *bufferKey = [NSValue valueWithPointer:(__bridge const void *)destination];
     if (id<MTLTexture> texture = shared[bufferKey]) return texture;
-    NSString *key = [NSString stringWithFormat:@"%lu:%lu", (unsigned long)destination.width, (unsigned long)destination.height];
-    BG3MFXTexturePool *pool;
-    {
-        std::lock_guard<std::mutex> hold(_lock);
-        pool = _fsrSpacePools[key];
-        if (!pool) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                width:destination.width height:destination.height mipmapped:NO];
-            desc.storageMode = MTLStorageModePrivate;
-            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            pool = _fsrSpacePools[key] = [[BG3MFXTexturePool alloc] initWithDevice:_device descriptor:desc];
-        }
-    }
-    id<MTLTexture> texture = [pool acquire];
+    id<MTLTexture> texture = [_pools textureWidth:destination.width height:destination.height format:MTLPixelFormatRGBA16Float
+        usage:MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite commandBuffer:buffer];
     if (!texture) return nil;
-    [pool relinquish:texture afterCommandBuffer:buffer];
     if (!shared) {
         shared = [NSMutableDictionary dictionary];
         objc_setAssociatedObject(buffer, &fsrSpacesKey, shared, OBJC_ASSOCIATION_RETAIN_NONATOMIC);

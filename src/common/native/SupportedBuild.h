@@ -94,6 +94,13 @@ inline constexpr size_t SelectionObservers = 0xc0;
 inline constexpr size_t SelectionObserverCount = 0xcc;
 inline constexpr size_t NativeUpscalingType = 0xf7;
 inline constexpr size_t NativeQuality = 0xf8;
+// Upscaling Sharpness (slider 101): the manager's FSR RCAS sharpness (0-1),
+// which SetResolutionUpscaleFSR1 resets to 0.8 whenever the quality changes,
+// and the slider's displayed value (0-100) with its value observers.
+inline constexpr size_t UpscaleSharpness = 0xfc;
+inline constexpr size_t SliderValue = 0xb8;
+inline constexpr size_t SliderObservers = 0xa8;
+inline constexpr size_t SliderObserverCount = 0xb4;
 inline constexpr size_t SettingsStorage = 0x60;
 inline constexpr size_t CallbackManager = 0x18;
 inline constexpr size_t CapturedManager = 0x50;
@@ -115,6 +122,13 @@ inline constexpr size_t SettingsQuality = 0x98;
 inline constexpr size_t ClassifierMethodSlot = 0x10;
 inline constexpr size_t VTable = 0, FrameIndex = 8, FrameIndexOffset = 12;
 inline constexpr size_t JitterIslandStride = 64;
+}
+
+// WorkerThreadBatch: atomic flags word; the completer sets Done, then opens
+// the inline completion event if a blocking waiter set Waiter.
+namespace ThreadIdling::Layout {
+inline constexpr size_t BatchFlags = 0x4;
+inline constexpr uint32_t BatchDone = 0x10, BatchWaiter = 0x20;
 }
 
 namespace ServerPacing::Layout {

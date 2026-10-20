@@ -14,7 +14,16 @@ MetalFX type temporarily invokes BG3's FSR setup callback to retain its quality
 and render-resolution behavior, then restores the custom menu value and stores
 the selected type separately. Startup and Options → Back use the same setup.
 The quality state is independent of the custom type. This bridge is
-build-specific and guarded by the executable's Mach-O UUID.
+build-specific and guarded by the executable's Mach-O UUID. BG3's FSR quality
+setter resets Upscaling Sharpness to 0.8 whenever the quality changes, and
+BG3's Upscaling Type callback redraws the slider from that setting. A moved
+slider reaches the setting only on Apply, so the bridge saves the slider's
+displayed value and restores both across type changes, Options → Back and
+MetalFX quality changes. The slider controls FSR's RCAS pass, which MetalFX
+replaces; bg3mfx replays that pass on the MetalFX result
+([MetalFX Sharpening](../../src/features/metalfx-sharpening/README.md)), so the
+slider stays live, and is dimmed for MetalFX Spatial or Temporal only with
+`BG3MFX_METALFX_SHARPENING=0`.
 
 Spatial keeps the native anti-aliasing option enabled unless Frame Generation is
 on. While Temporal or Frame Generation is on, the menu selects the Anti-Aliasing
@@ -45,6 +54,12 @@ FSR retain BG3's callbacks and native rendering.
 RGBA16Float, runs MetalFX Spatial in HDR mode, and copies the result into BG3's
 FSR output target. The input is after bloom and color grading but before
 `FSR_Tonemap`; BG3's tone mapping and UI composition remain downstream.
+Spatial needs only this color image, not TAA. With TAA on, the chain is seeded
+at BG3's TAA output as described below. With SMAA or no anti-aliasing there is
+no TAA pass, so an untagged `FSR_Tonemap` input (RG11B10Float, the same size as
+its output) seeds the chain there. A live trace with SMAA (October 19) showed
+SMAA, bloom and color grading writing that input; before this seeding, every
+SMAA frame fell back to native FSR.
 
 `Trace.mm` captures HDR scene color, device depth, motion, camera constants, and
 BG3's original jitter at the TAA stage. It copies current color into the skipped
@@ -113,8 +128,8 @@ whole frame once per view.
 ## Frame Generation
 
 Frame Generation is the "MetalFX Frame Generation" checkbox (item `0x7f02`),
-added right after the upscaling controls only on supported devices and saved
-as `BG3MFXFrameGenerationEnabled`. It combines with every Upscaling Type, which
+added right below VSync (after the upscaling controls if VSync is missing),
+only on supported devices, and saved as `BG3MFXFrameGenerationEnabled`. It combines with every Upscaling Type, which
 is back to BG3's Off and FSR plus MetalFX Spatial and Temporal (values 0–3).
 Startup migrates earlier settings: Upscaling Type values 4 (Temporal + Frame
 Generation) and 5 (Spatial + Frame Generation) become Temporal or Spatial with
@@ -137,6 +152,14 @@ runtime records the recent pass chain in each `frameGenerationNoScene` event.
 A live trace (October 13) showed Off + Frame Generation losing the scene at
 CAS, which reads the tone-mapped RGB10A2 scene and writes the one `CombineUI`
 composes; with the CAS forward, Off + Frame Generation works live.
+EoCSight (the stealth/visibility overlay, which ping-pongs a variable number of
+times) forwards the inputs like the other color passes. Two passes draw onto an
+image that already carries them, so they keep it in place instead of clearing it:
+`PPColorGradingApplyLUTPS` with bloom off (it reads the untagged TAA input and
+writes the tagged TAA output; with bloom on it reads the tagged output and
+forwards normally) and the `Shared_UI_VFX_UI_Model_*` 3D UI effects alpha-blended
+onto the final scene image. An unrecognized draw later in the same encoder still
+clears the tag.
 
 Presentation follows Apple's present-thread model. While Frame Generation is on, a
 `CAMetalLayer nextDrawable` hook gives BG3 stand-in drawables backed by three
@@ -227,11 +250,51 @@ Apple report. A live windowed-mode drag created one per frame
 until BG3 hung inside scaler creation with about 1,000 `ANEServicesThread`s
 (October 13). A size with no scaler now runs BG3's native FSR until it holds for
 0.3 s; the session's first scaler is created at once. The cache keeps every
-settled size: its former six-entry bound evicted by `NSDictionary` key order,
-which could drop the scaler just added, so a steady size recreated one every
-frame (about 1,000 in 35 s live, after nine window sizes) and hung BG3 the same
-way. `temporal-hook-smoke` resizes through nine sizes, returns to each, and
-checks that every size creates exactly one scaler.
+settled size whose scaler leaks: its former six-entry bound evicted by
+`NSDictionary` key order, which could drop the scaler just added, so a steady
+size recreated one every frame (about 1,000 in 35 s live, after nine window
+sizes) and hung BG3 the same way. Once another size is rendered, cached scalers
+with taller outputs, which MetalFX frees, are evicted. A split-screen frame's
+views have a scaler each and count as one size, the whole frame's, so the views
+neither wait for nor evict each other. `temporal-hook-smoke` resizes through
+nine sizes, returns to each, and checks that every size creates exactly one
+scaler.
+
+MetalFX scalers retain the textures last assigned to them, and a Metal 4
+residency set retains every allocation added to it (both verified standalone).
+A cached scaler for a size no longer rendered therefore kept that size's BG3
+color, depth and motion targets alive after BG3 freed them. The pipeline now
+clears the scaler's texture properties after encoding (the command buffer or
+the Metal 4 bridge keeps them for the GPU), and the previous size's scaler drops
+its residency set when the size changes. `temporal-hook-smoke` checks that no
+earlier size's textures survive (24 of 32 did before).
+
+BG3 also replaces render targets at the same size (live: save loads and
+settings changes), which no size change releases. Each Metal 4 bridge records
+the submission that last used each member of its residency set and rebuilds the
+set without members idle for 16 submissions; pooled textures rotate well within
+that. `metal4-bridge-smoke` replaces its inputs at the same size and checks that
+the old ones are freed (the earlier set kept them until it reached 64
+allocations). The diagnostic runtime logs each set change as `metal4Residency`.
+
+The Metal 4 queue waits on an event that BG3's command buffer signals before
+the FX work. If that buffer fails before signaling, the queue would wait
+forever and stall every later submission, so each slot's event is a shared
+event and BG3's buffer completion raises it when the buffer ended in error.
+This path has no regression: a command buffer cannot be made to fail on
+demand.
+
+Spatial uses the same 0.3 s settle and keeps at most two sizes, the current one
+and the one before it; MetalFX frees evicted Spatial scalers. Keeping every size
+held each one's scaler and pooled textures for the session: `spatial-hook-smoke
+resize` measured +170.8 MB of GPU allocations after 24 sizes at 200–384 px input,
+and +6.3 MB with the bound. As for Temporal, a split-screen frame's views settle
+as one size. The sharpening intermediates and split-screen view crops follow the
+frame's size as well, so their pools (`BG3MFXTexturePools`) keep only the most
+recently used sizes: sharpening its two textures for the current size and the
+one before it, the crops sixteen (two views of different sizes use eight). With
+sharpening on, the resize check measured +107.5 MB before that bound and
++12–17 MB with it.
 
 MetalFX consumes BG3's textures directly wherever it accepts their format and
 usage, avoiding per-frame conversion passes (about 0.7 ms each for Temporal and
@@ -244,15 +307,24 @@ at 4K); it is kept because it removes passes and memory, not for frame rate.
 
 ## Failure and diagnostics
 
-MetalFX initialization, resource, encoding, or GPU-completion failure presents
-an AppKit error and closes BG3 with exit code 78. The runtime does not continue
-through FSR after a failed MetalFX frame.
+No failure closes BG3: the player may have unsaved progress. Each turns off
+what failed and shows one notice on the main run loop (`showNotice` in
+`Trace.mm`); with `BG3MFX_TEST_ERRORS_STDERR=1` the message goes only to stderr.
 
-Frame Generation is the exception for frames it cannot reproduce: unexpected
-composition bindings or scene format, camera parameters, or an interpolator or
-presenter that cannot be created. It turns itself off with a notice naming the
-mismatch, the selected Upscaling Type continues, and turning the checkbox off
-and on again retries. Encoding and GPU failures after it starts still close BG3.
+- A MetalFX Spatial or Temporal initialization, resource, sequencing,
+  encoding, or GPU-completion failure turns that upscaler off. BG3's TAA and
+  FSR + RCAS, which the menu already configured underneath, render instead:
+  the FSR dispatches are forwarded and the TAA draw is no longer replaced.
+  Choosing another Upscaling Type clears the failure, so selecting the
+  MetalFX type again retries.
+- Frame Generation turns itself off with a notice naming the problem for
+  frames it cannot reproduce (unexpected composition bindings or scene
+  format, camera parameters) and for interpolator or presenter creation,
+  encoding, allocation, and GPU failures. The selected Upscaling Type
+  continues, and turning the checkbox off and on again retries.
+- Native menu problems leave BG3's own options working and show one notice.
+  If the native integration cannot be installed at startup, BG3 runs without
+  MetalFX or the other optimizations.
 
 `libBG3MetalFX.dylib` is the quiet development runtime. `libBG3MetalFXTrace.dylib`
 adds JSONL traces, shader reflection, and opt-in captures. Diagnostics are not
@@ -335,6 +407,12 @@ fixtures keep independent layouts/expected instructions to catch drift.
   next block in an interposed `semaphore_wait`/`semaphore_timedwait`, and the
   present hooks in `Trace.mm` count frames. Decisions are logged to subsystem
   `com.bg3mfx`, category `threads`.
+- `src/features/cluster-buffer-guard/ClusterBufferGuard.*`: Character Creation Crash Fix (on by default;
+  `BG3MFX_CLUSTER_BUFFER_GUARD=0` disables it). `Trace.mm` binds a zero-filled,
+  untracked stand-in at compute buffer indices 1 and 6 and fragment index 1 on
+  each new encoder, so a clustered-lighting pass that BG3 dispatches without
+  `ClusterInfoBuffer` reads no lights instead of faulting the GPU. Diagnostic
+  builds record `clusterBufferGuard` when one of those passes reads the stand-in.
 - `src/features/lua-jump-fix/LuaJumpFix.*`: BG3's Lua error handling uses `_setjmp`/`_longjmp`,
   avoiding two system calls per protected call (on by default;
   `BG3MFX_LUA_SYSTEM_CALL_ELIMINATION=0` disables it).

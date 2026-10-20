@@ -52,6 +52,7 @@ int main(int argc, char **argv) {
         NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "vertex float4 Fullscreen(uint id [[vertex_id]]) {float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};return float4(p[id],0,1);}\n"
             "fragment float4 PPTAA_PS(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return src.read(uint2(p.xy));}\n"
+            "fragment float4 SMAANeighborhoodBlending_PS(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return src.read(uint2(p.xy));}\n"
             "fragment float4 PPBloomUpsampleBlurAndCombine_PS(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return float4(src.read(uint2(p.xy)).rgb+1.0,1);}\n"
             "fragment float4 PPColorGradingApplyLUTPS(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return float4(src.read(uint2(p.xy)).rgb+1.0,1);}\n"
             "fragment float4 FSR_Tonemap(float4 p [[position]], texture2d<float> src [[texture(0)]]) {float3 c=src.read(uint2(p.xy)).rgb;return float4(c/(1+max(c.r,max(c.g,c.b))),1);}\n"
@@ -74,7 +75,7 @@ int main(int argc, char **argv) {
             if (!state) { fprintf(stderr,"%s\n",error.description.UTF8String); return 4; } [pipelines addObject:state];
         }
         NSMutableArray *renderPipelines = [NSMutableArray array];
-        for (NSString *name in @[@"PPTAA_PS",@"PPBloomUpsampleBlurAndCombine_PS",@"PPColorGradingApplyLUTPS",@"FSR_Tonemap"]) {
+        for (NSString *name in @[@"PPTAA_PS",@"PPBloomUpsampleBlurAndCombine_PS",@"PPColorGradingApplyLUTPS",@"FSR_Tonemap",@"SMAANeighborhoodBlending_PS"]) {
             MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
             desc.vertexFunction = [library newFunctionWithName:@"Fullscreen"];
             desc.fragmentFunction = [library newFunctionWithName:name];
@@ -103,7 +104,8 @@ int main(int argc, char **argv) {
             id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
             [encoder setComputePipelineState:pipelines[0]]; [encoder setTexture:input atIndex:0];
             [encoder dispatchThreads:MTLSizeMake(256,256,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [encoder endEncoding];
-            drawPass(buffer,input,taa,renderPipelines[0]);
+            // "no-taa": BG3 with SMAA (or no AA) runs no TAA pass to seed the chain.
+            drawPass(buffer,input,taa,renderPipelines[[mode isEqualToString:@"no-taa"] ? 4 : 0]);
             drawPass(buffer,taa,bloom,renderPipelines[1]);
             drawPass(buffer,bloom,graded,renderPipelines[2]);
             drawPass(buffer,graded,tonemapped,renderPipelines[3]);
@@ -125,6 +127,17 @@ int main(int argc, char **argv) {
             [encoder dispatchThreads:MTLSizeMake(512,512,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
             [encoder endEncoding]; [buffer commit]; [buffer waitUntilCompleted];
             if (buffer.status != MTLCommandBufferStatusCompleted) return 6;
+            // "bad-format": MetalFX cannot write BG3's destination. The first
+            // frame's failure must turn Spatial off without ending the process,
+            // and BG3's own FSR and RCAS must run on every later frame.
+            if ([mode isEqualToString:@"bad-format"]) {
+                const uint32_t *native = (const uint32_t *)nativeDispatches.contents;
+                if (native[0] != uint32_t(frame) || native[1] != uint32_t(frame)) {
+                    fprintf(stderr,"Frame %d after a Spatial failure ran %u native FSR and %u RCAS dispatches, expected %d each\n",
+                        frame,native[0],native[1],frame); return 24;
+                }
+                continue;
+            }
             // Steady-state frames must reuse pooled intermediates, not allocate.
             if (frame == 0) warm = allocations();
             else if (allocations() != warm) { fprintf(stderr,"Spatial allocated textures after warmup\n"); return 12; }
@@ -139,7 +152,67 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        puts(sharpening ? "MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR stayed suppressed and BG3's RCAS sharpened the MetalFX result once per frame, including a displaced creation hook."
+        if ([mode isEqualToString:@"resize"]) {
+            // A window drag gives every frame a new size. Run the chain through
+            // many sizes, as BG3 does, then check that the earlier sizes' memory
+            // was released: their textures are gone and GPU allocations return.
+            auto frameAt = [&](NSUInteger size, __weak id<MTLTexture> *probe) -> int {
+                @autoreleasepool {
+                    id<MTLTexture> sInput=texture(device,size), sTAA=texture(device,size), sBloom=texture(device,size);
+                    id<MTLTexture> sGraded=texture(device,size), sTonemapped=texture(device,size);
+                    id<MTLTexture> sScaled=texture(device,size*2), sDestination=texture(device,size*2);
+                    if (probe) *probe=sDestination;
+                    *(uint32_t *)nativeDispatches.contents=0;
+                    id<MTLCommandBuffer> buffer=[queue commandBuffer];
+                    id<MTLComputeCommandEncoder> e=[buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+                    [e setComputePipelineState:pipelines[0]]; [e setTexture:sInput atIndex:0];
+                    [e dispatchThreads:MTLSizeMake(size,size,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [e endEncoding];
+                    drawPass(buffer,sInput,sTAA,renderPipelines[0]);
+                    drawPass(buffer,sTAA,sBloom,renderPipelines[1]);
+                    drawPass(buffer,sBloom,sGraded,renderPipelines[2]);
+                    drawPass(buffer,sGraded,sTonemapped,renderPipelines[3]);
+                    e=[buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+                    [e setComputePipelineState:pipelines[1]]; [e setTexture:sTonemapped atIndex:0]; [e setTexture:sScaled atIndex:1];
+                    [e setBuffer:nativeDispatches offset:0 atIndex:0];
+                    [e dispatchThreads:MTLSizeMake(size*2,size*2,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+                    [e setComputePipelineState:pipelines[2]]; [e setTexture:sScaled atIndex:0]; [e setTexture:sDestination atIndex:2];
+                    [e dispatchThreads:MTLSizeMake(size*2,size*2,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [e endEncoding];
+                    [buffer commit]; [buffer waitUntilCompleted];
+                    if (buffer.status!=MTLCommandBufferStatusCompleted) return -1;
+                    return *(uint32_t *)nativeDispatches.contents==0;
+                }
+            };
+            // Returns whether MetalFX took over, allowing a new size to settle first.
+            auto settledFrameAt = [&](NSUInteger size, __weak id<MTLTexture> *probe) -> int {
+                int replaced=0;
+                for (int attempt=0; attempt<6 && replaced==0; ++attempt) {
+                    if ((replaced=frameAt(size,probe))<0) return -1;
+                    if (!replaced) [NSThread sleepForTimeInterval:0.35];
+                }
+                return replaced;
+            };
+            const NSUInteger first=192, sizes=24;
+            if (settledFrameAt(first,nullptr)!=1) { fprintf(stderr,"Spatial did not replace FSR at %lux%lu\n",first,first); return 20; }
+            double baseline=device.currentAllocatedSize/1048576.0;
+            __weak id<MTLTexture> earlier[sizes];
+            for (NSUInteger i=0;i<sizes;++i)
+                if (settledFrameAt(first+8*(i+1),&earlier[i])!=1) { fprintf(stderr,"Spatial did not replace FSR during the sweep\n"); return 21; }
+            // Back at the first size: only its own resources should remain.
+            if (settledFrameAt(first,nullptr)!=1) return 22;
+            double grown=device.currentAllocatedSize/1048576.0-baseline;
+            NSUInteger pinned=0; for (auto &texture:earlier) if (texture) ++pinned;
+            printf("Spatial resize sweep: %lu sizes, GPU allocations %+.1f MB, %lu earlier destinations still alive\n",
+                (unsigned long)sizes,grown,(unsigned long)pinned);
+            // At most one other size (the cache keeps two) stays: about 7 MB here,
+            // against 170 MB when every size was kept.
+            if (grown>24 || pinned) { fprintf(stderr,"Spatial kept resources for earlier sizes\n"); return 23; }
+        }
+        if ([mode isEqualToString:@"bad-format"]) {
+            puts("A MetalFX Spatial failure turned Spatial off without closing; BG3's native FSR/RCAS ran on the following frames.");
+            return 0;
+        }
+        if ([mode isEqualToString:@"no-taa"]) puts("MetalFX Spatial without TAA scaled FSR_Tonemap's linear HDR input across three frames; native FSR/RCAS stayed suppressed.");
+        else puts(sharpening ? "MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR stayed suppressed and BG3's RCAS sharpened the MetalFX result once per frame, including a displaced creation hook."
                         : "MetalFX Spatial scaled post-bloom/color-grade linear HDR across three frames; native FSR/RCAS stayed suppressed (sharpening off), including a displaced creation hook.");
     }
 }

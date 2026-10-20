@@ -86,7 +86,7 @@ GPU profiler: see [lab mode](docs/dev/lab.md).
 | **MetalFX Frame Generation** | Creates extra in-between frames for smoother motion. | **~100% more FPS** |
 | **MetalFX Spatial Upscaling** | Upscales a smaller rendered image to the final game resolution. | **~30% more FPS** |
 | **MetalFX Temporal Upscaling** | Builds an upscaled image from current and earlier frames; better quality than spatial. | **~20% more FPS** |
-| **Shadow Rendering Optimizations** | Fixes shadow rendering bugs and adds other optimizations. | **~15% more FPS** |
+| **Shadow Rendering Optimizations** | Fixes base game shadow rendering bugs and adds other optimizations. | **~15% more FPS** |
 | **Depth Prepass Optimization** | Skips some repeated work when drawing scene depth. | **~2% more FPS** |
 
 ### CPU features
@@ -104,6 +104,7 @@ GPU profiler: see [lab mode](docs/dev/lab.md).
 | --- | --- |
 | **Metal HUD** | Shows Apple's on-screen performance overlay. |
 | **Video Options Menu Fix** | Fixes a base game bug that can make the video menu unresponsive in fullscreen. |
+| **Character Creation Crash Fix** | Fixes a base game bug that can freeze or crash the game when entering character creation at certain screen resolutions. |
 
 ## How it works
 
@@ -158,6 +159,9 @@ Baldur's Gate 3 starts with features available. In the game, go to
   FPS limiter to half the frame rate you want to see (for example, 60 on a
   120 Hz display).
 - The frame limiter will significantly reduce cpu and gpu usage.
+- After you untick **Frame Generation**, the Metal HUD keeps showing its frame
+  interpolation panel until the game restarts. That is the HUD, not Frame
+  Generation: when the HUD's FPS matches its rendered FPS, it is off.
 
 ## Troubleshooting
 
@@ -169,10 +173,12 @@ release for the new game version yet, play from Steam as usual in the meantime.
 If you opened the app, it lets you choose the game's location. In Terminal, use
 `bg3mfx --game "/path/to/Baldur's Gate 3.app"`.
 
-**The game shows a "MetalFX … could not continue" message and closes.** Please
+**"MetalFX Spatial is off" or "MetalFX Temporal is off."** MetalFX ran into a
+problem, so the game switched to AMD FSR 1.0 and keeps running. To try again,
+choose another Upscaling Type and then the MetalFX one in Options > Video. If
+it keeps happening, please
 [open an issue](https://github.com/AndrewTriesToCode/bg3mfx/issues) with the
-message text, your Mac model, and what you were doing. In the meantime, choose
-Off or AMD FSR 1.0 in Upscaling Type, or play from Steam as usual.
+message text, your Mac model, and what you were doing.
 
 **"MetalFX Frame Generation is off."** Frame Generation couldn't handle the
 game's frames, so it turned itself off. The game keeps running with your

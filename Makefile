@@ -1,4 +1,4 @@
-VERSION ?= 0.3.0
+VERSION ?= 0.3.1
 PREFIX ?= /usr/local
 BIN_DIR ?= build/bin
 EVIDENCE_DIR ?= build/evidence
@@ -71,6 +71,7 @@ $(BIN_DIR):
 	mkdir -p "$(BIN_DIR)"
 
 RUNTIME_SOURCES = \
+	src/features/cluster-buffer-guard/ClusterBufferGuard.mm \
 	src/features/depth-prepass/DepthPrepass.mm \
 	src/features/metalfx-spatial-upscaling/SpatialUpscaler.mm \
 	src/features/metalfx-temporal-upscaling/TemporalUpscaler.mm \
@@ -103,6 +104,7 @@ RUNTIME_HEADERS = \
 	src/features/metalfx-sharpening/Sharpening.h \
 	src/features/split-screen-upscaling/ViewRegions.h \
 	src/common/native/SupportedBuild.h \
+	src/features/cluster-buffer-guard/ClusterBufferGuard.h \
 	src/features/depth-prepass/DepthPrepass.h \
 	src/features/render-thread-optimizations/BindFilter.h \
 	src/features/metalfx-spatial-upscaling/SpatialUpscaler.h \
@@ -145,6 +147,8 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib hdr
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib scaled
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib scaled
+	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib overlays
+	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib overlays
 	$(BIN_DIR)/frame-interpolation-smoke
 	BG3MFX_TEST_DIRECT_INPUTS=1 $(BIN_DIR)/frame-interpolation-smoke
 	$(BIN_DIR)/metal4-bridge-smoke
@@ -159,6 +163,12 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib no-taa
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib no-taa
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib resize
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib resize
+	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib bad-format
+	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib bad-format
 	$(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	BG3MFX_DEPTH_PREPASS_OPTIMIZATION=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-trim

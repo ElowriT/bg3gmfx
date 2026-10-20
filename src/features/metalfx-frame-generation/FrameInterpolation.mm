@@ -180,16 +180,23 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
         e.aspectRatio=aspect; e.deltaTime=delta;
         e.shouldResetHistory=reset; e.uiTexture=nil;
     };
+    // The effect retains its textures (BG3's own when read directly); the
+    // command buffer or Metal 4 bridge keeps them until the GPU finishes.
+    void (^release)(id<MTLFXFrameInterpolatorBase>)=^(id<MTLFXFrameInterpolatorBase> e) {
+        e.colorTexture=nil; e.prevColorTexture=nil; e.outputTexture=nil;
+        e.depthTexture=nil; e.motionTexture=nil;
+    };
     if (_effect4) {
         id<MTL4FXFrameInterpolator> effect=_effect4;
         if (![_bridge encodeIntoBuffer:buffer allocations:previous ? @[color,z,mv,out,previous] : @[color,z,mv,out] retained:@[effect]
                 encode:^(id<MTL4CommandBuffer> commands) {
                     configure(effect);
                     commands.label=@"BG3MFX generated scene"; [effect encodeToCommandBuffer:commands];
+                    release(effect);
                 } failure:self.failureHandler error:error]) {
             [_lock unlock]; return nil;
         }
-    } else { configure(_effect3); [_effect3 encodeToCommandBuffer:buffer]; }
+    } else { configure(_effect3); [_effect3 encodeToCommandBuffer:buffer]; release(_effect3); }
     if (!_directColor) {
         if (_previous) [_colors relinquish:_previous afterCommandBuffer:buffer];
         [_colors retainTexture:color]; _previous=color;
@@ -199,6 +206,9 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
 @end
 
 static thread_local bool presentationThread=false;
+// Set when the presenter is released on its own thread: blocks or stand-ins
+// dropped at the end of a presentation step can hold its last reference.
+static thread_local bool presenterReleasedHere=false;
 
 // Bounds stand-ins in flight. Unlike a semaphore its limit can change per
 // request: BG3's double-buffered vsync allows two, otherwise three.
@@ -315,7 +325,11 @@ struct PresentTask {
 }
 - (void)dealloc {
     { std::lock_guard<std::mutex> lock(_mutex); _stop=true; _wake.notify_all(); }
-    if (_thread.joinable()) _thread.join();
+    if (!_thread.joinable()) return;
+    // A thread cannot join itself. Released between presentation steps, the
+    // worker stops before touching this object again (see run).
+    if (_thread.get_id()==std::this_thread::get_id()) { presenterReleasedHere=true; _thread.detach(); return; }
+    _thread.join();
 }
 - (BG3MFXTexturePool *)poolLike:(id<MTLTexture>)texture standIn:(BOOL)standIn
                           width:(NSUInteger)w height:(NSUInteger)h format:(MTLPixelFormat)format {
@@ -458,7 +472,7 @@ static void waitUntilMediaTime(CFTimeInterval target) {
     // main thread can resolve it. Keep the last valid value during Space moves.
     auto refresh=std::make_shared<std::atomic<double>>(1.0/60);
     unsigned refreshCheck=0;
-    for (;;) { @autoreleasepool {
+    for (;;) { if (presenterReleasedHere) return; @autoreleasepool {
         PresentTask task;
 #ifndef BG3MFX_NO_TRACE
         CFTimeInterval idleStart=CACurrentMediaTime();

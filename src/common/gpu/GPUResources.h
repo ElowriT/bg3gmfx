@@ -18,6 +18,19 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)relinquish:(id<MTLTexture>)texture afterCommandBuffer:(id<MTLCommandBuffer>)buffer;
 @end
 
+// Pools for private textures that follow the frame's size, by size, format and
+// usage. Only the `capacity` most recently used are kept: a window drag or a
+// resolution change would otherwise hold every earlier size's textures for the
+// rest of the session. Textures in flight still return to an evicted pool, which
+// is freed once they have.
+@interface BG3MFXTexturePools : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+- (instancetype)initWithDevice:(id<MTLDevice>)device capacity:(NSUInteger)capacity;
+// A pooled texture, released after `buffer`.
+- (nullable id<MTLTexture>)textureWidth:(NSUInteger)width height:(NSUInteger)height format:(MTLPixelFormat)format
+                                  usage:(MTLTextureUsage)usage commandBuffer:(id<MTLCommandBuffer>)buffer;
+@end
+
 // Runs Metal 4 FX work between earlier and later commands of a Metal 3 command
 // buffer, entirely on the GPU timeline. Allocators, command buffers, events and
 // the residency set are reused once their previous submission completes.
@@ -33,6 +46,9 @@ NS_ASSUME_NONNULL_BEGIN
                   encode:(void (^)(id<MTL4CommandBuffer> commands))encode
                  failure:(nullable void (^)(NSError *error))failure
                    error:(NSError **)error;
+// The residency set retains its allocations. Drop it while idle; submissions
+// in flight keep their own reference, and the next one starts a new set.
+- (void)releaseResidency;
 @end
 
 // Submission order. A bridge submission waits on its Metal 4 queue for a signal
@@ -56,6 +72,14 @@ uint64_t BG3MFXMetal4Reordered(void);
 // Diagnostics and lab mode (both runtimes): when set, receives each Metal 4
 // bridge submission's GPU time.
 extern "C" void (*_Nullable BG3MFXGPUTimingHook)(NSString *label, double gpuSeconds);
+#ifndef BG3MFX_NO_TRACE
+// Diagnostics: when set, receives each change to a bridge's residency set: its
+// allocation count and bytes after the change, how many allocations were added,
+// and whether the set was rebuilt (dropping members idle for 16 submissions,
+// or on reaching its 64-allocation bound).
+extern "C" void (*_Nullable BG3MFXResidencyHook)(NSString *label, NSUInteger allocations, uint64_t bytes,
+    NSUInteger added, BOOL replaced);
+#endif
 
 NS_ASSUME_NONNULL_END
 

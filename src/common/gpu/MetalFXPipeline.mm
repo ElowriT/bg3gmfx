@@ -118,6 +118,7 @@ static void failure(NSError **error, NSString *message) {
 
 - (BOOL)usesMetal4 { return _temporal4 != nil; }
 - (void)resetHistory { _reset = YES; }
+- (void)releaseIdleResources { [_bridge releaseResidency]; }
 
 - (BOOL)validTexture:(id<MTLTexture>)texture format:(MTLPixelFormat)format usage:(MTLTextureUsage)usage {
     return texture.device == _device && texture.textureType == MTLTextureType2D && texture.sampleCount == 1 &&
@@ -175,6 +176,8 @@ static void failure(NSError **error, NSString *message) {
         _spatial.inputContentWidth = color.width;
         _spatial.inputContentHeight = color.height;
         [_spatial encodeToCommandBuffer:buffer];
+        // The scaler retains its textures; the command buffer keeps them for the GPU.
+        _spatial.colorTexture = nil; _spatial.outputTexture = nil;
     } else {
         // Captured values: the Metal 4 bridge may encode this frame later.
         BOOL reset = _reset || parameters.reset;
@@ -193,6 +196,13 @@ static void failure(NSError **error, NSString *message) {
             scaler.preExposure = 1.0f;
             scaler.reset = reset;
         };
+        // The scaler retains its textures, which would keep a cached size's last
+        // BG3 render targets alive after a resize. Encoding is done, and the
+        // command buffer (or the Metal 4 bridge) keeps them until the GPU finishes.
+        void (^release)(id<MTLFXTemporalScalerBase>) = ^(id<MTLFXTemporalScalerBase> scaler) {
+            scaler.colorTexture = nil; scaler.depthTexture = nil;
+            scaler.motionTexture = nil; scaler.outputTexture = nil;
+        };
         if (_temporal4) {
             // GPU-only bridge: producer passes -> Metal 4 FX -> native consumers.
             // Never commit/split BG3's buffer or wait for GPU work on the CPU.
@@ -201,10 +211,11 @@ static void failure(NSError **error, NSString *message) {
                     encode:^(id<MTL4CommandBuffer> commands) {
                         configure(scaler);
                         commands.label=@"BG3 Metal 4 Temporal upscale"; [scaler encodeToCommandBuffer:commands];
+                        release(scaler);
                     } failure:self.gpuFailureHandler error:error]) {
                 [self resetHistory]; return nil;
             }
-        } else { configure(_temporal3); [_temporal3 encodeToCommandBuffer:buffer]; }
+        } else { configure(_temporal3); [_temporal3 encodeToCommandBuffer:buffer]; release(_temporal3); }
     }
     _reset = NO;
     return frame;

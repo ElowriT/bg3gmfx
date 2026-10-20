@@ -18,9 +18,9 @@ MTLRegion BG3MFXScaleViewRegion(NSArray<NSNumber *> *view, NSUInteger inputWidth
 }
 
 @implementation BG3MFXViewRegions {
-    id<MTLDevice> _device;
-    NSMutableDictionary<NSString *, BG3MFXTexturePool *> *_pools;
-    std::mutex _lock;
+    // Two views of different sizes use eight pools (Temporal's three crops and
+    // an output each); twice that also keeps the previous size's.
+    BG3MFXTexturePools *_pools;
 }
 
 + (instancetype)sharedForDevice:(id<MTLDevice>)device {
@@ -31,8 +31,7 @@ MTLRegion BG3MFXScaleViewRegion(NSArray<NSNumber *> *view, NSUInteger inputWidth
     BG3MFXViewRegions *instance = [instances objectForKey:device];
     if (!instance && device) {
         instance = [[self alloc] init];
-        instance->_device = device;
-        instance->_pools = [NSMutableDictionary dictionary];
+        instance->_pools = [[BG3MFXTexturePools alloc] initWithDevice:device capacity:16];
         [instances setObject:instance forKey:device];
     }
     return instance;
@@ -40,24 +39,10 @@ MTLRegion BG3MFXScaleViewRegion(NSArray<NSNumber *> *view, NSUInteger inputWidth
 
 - (id<MTLTexture>)textureWidth:(NSUInteger)width height:(NSUInteger)height format:(MTLPixelFormat)format
                  commandBuffer:(id<MTLCommandBuffer>)buffer {
-    if (!width || !height) return nil;
-    NSString *key = [NSString stringWithFormat:@"%lu:%lu:%lu", (unsigned long)width, (unsigned long)height, (unsigned long)format];
-    BG3MFXTexturePool *pool;
-    {
-        std::lock_guard<std::mutex> hold(_lock);
-        pool = _pools[key];
-        if (!pool) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
-            desc.storageMode = MTLStorageModePrivate;
-            // Depth crops are read only; color and motion crops and outputs are also written by MetalFX or kernels.
-            bool depth = format == MTLPixelFormatDepth32Float_Stencil8 || format == MTLPixelFormatDepth32Float;
-            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | (depth ? 0 : MTLTextureUsageShaderWrite);
-            pool = _pools[key] = [[BG3MFXTexturePool alloc] initWithDevice:_device descriptor:desc];
-        }
-    }
-    id<MTLTexture> texture = [pool acquire];
-    if (texture) [pool relinquish:texture afterCommandBuffer:buffer];
-    return texture;
+    // Depth crops are read only; color and motion crops and outputs are also written by MetalFX or kernels.
+    bool depth = format == MTLPixelFormatDepth32Float_Stencil8 || format == MTLPixelFormatDepth32Float;
+    return [_pools textureWidth:width height:height format:format
+        usage:MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | (depth ? 0 : MTLTextureUsageShaderWrite) commandBuffer:buffer];
 }
 
 - (id<MTLTexture>)copyRegion:(MTLRegion)region of:(id<MTLTexture>)source commandBuffer:(id<MTLCommandBuffer>)buffer {

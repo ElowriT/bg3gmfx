@@ -8,6 +8,7 @@
 #endif
 #import "features/thread-idling/ThreadIdling.h"
 #import "features/window-rebind-click/RebindClick.h"
+#import "features/metalfx-sharpening/Sharpening.h"
 #import "features/dynamic-worker-prioritization/DynamicWorkers.h"
 #import <MetalFX/MetalFX.h>
 #import <AppKit/AppKit.h>
@@ -82,10 +83,13 @@ static void setContentViewWithFocusRepair(NSWindow *window, SEL selector, NSView
 
     original(window, selector, view);
 
-    if (!view || pendingFocusWindow != window || pendingFocusView != view) return;
+    if (!view || pendingFocusWindow != window) return;
+    // Any view set in this window ends the pair; a different view must not
+    // keep the old render view (and its layer) alive.
     NSView *restoreView = pendingFocusView;
     pendingFocusWindow = nil;
     pendingFocusView = nil;
+    if (restoreView != view) return;
 
     NSWindow *modalWindow = NSApp.modalWindow;
     bool eligible = NSThread.isMainThread && NSApp.isActive && window.isKeyWindow &&
@@ -210,7 +214,46 @@ static void selectAntiAliasing(void *aa, int value) {
         if (table && table[0]) reinterpret_cast<void(*)(void *,int)>(table[0])(entry+Layout::ObserverContext,value);
     }
 }
+static void *findItemByID(void *manager, uint16_t id) {
+    void **items = field<void **>(manager,Layout::Items);
+    uint32_t count = field<uint32_t>(manager,Layout::ItemCount);
+    if (!items || count > 256) return nullptr;
+    for (uint32_t i=0;i<count;++i) if (field<uint16_t>(items[i],Layout::ItemID) == id) return items[i];
+    return nullptr;
+}
+static const uint16_t upscaleSharpnessID = 101;
+// The player's sharpness is what the slider shows: moving it updates only the
+// slider until Apply copies it to the manager (VideoOptionsManager::ApplySlider).
+static float currentSharpness(void *manager) {
+    void *slider = findItemByID(manager,upscaleSharpnessID);
+    return slider ? field<float>(slider,Layout::SliderValue)/100 : field<float>(manager,Layout::UpscaleSharpness);
+}
+// BG3's FSR quality setter resets Upscaling Sharpness to 0.8 whenever the quality
+// changes, which the MetalFX bridge does behind the player's back. Put back the
+// player's value and show it, as the native Upscaling Type callback does.
+static bool restoreSharpness(void *manager, float value) {
+    bool changed = field<float>(manager,Layout::UpscaleSharpness) != value;
+    field<float>(manager,Layout::UpscaleSharpness) = value;
+    void *slider = findItemByID(manager,upscaleSharpnessID);
+    if (!slider) return changed;
+    if (field<float>(slider,Layout::SliderValue) == value*100) return changed;
+    float shown = value*100;
+    field<float>(slider,Layout::SliderValue) = shown;
+    void *observers = field<void *>(slider,Layout::SliderObservers);
+    int32_t observerCount = field<int32_t>(slider,Layout::SliderObserverCount);
+    if (observers && observerCount >= 0 && observerCount <= 256) for (int32_t j=0;j<observerCount;++j) {
+        char *entry = static_cast<char *>(observers)+j*Layout::ObserverStride;
+        void **table = field<void **>(entry,Layout::VTable);
+        if (table && table[0]) reinterpret_cast<void(*)(void *,float)>(table[0])(entry+Layout::ObserverContext,shown);
+    }
+    return changed;
+}
 static void updateDependentControls(void *manager, int mode) {
+    // Upscaling Sharpness drives FSR's RCAS pass, which MetalFX replaces. bg3mfx
+    // replays that pass on the MetalFX result (metalfx-sharpening), so the slider
+    // stays live; dim it only with that turned off. BG3 enables it for its FSR
+    // type, which the MetalFX types run as.
+    if (metalFXValue(mode) && !BG3MFXSharpeningEnabled()) setItemEnabled(findItemByID(manager,upscaleSharpnessID),0);
     // MetalFX Temporal and Frame Generation use the depth, motion and camera
     // data of BG3's TAA pass (Temporal then replaces its draw). While either is
     // on, select TAA and dim the control; afterwards restore the player's choice.
@@ -269,10 +312,13 @@ static void restoreCustomQuality(void *manager, int value, BOOL refresh) {
 static void qualityChanged(void *storage, const void *item) {
     int value = item ? field<int32_t>(const_cast<void *>(item),Layout::ComboSelection) : -1;
     int mode = selectedScalingMode.load();
+    void *manager = storage ? field<void *>(storage,Layout::CallbackManager) : nullptr;
+    float sharpness = manager ? currentSharpness(manager) : 0;
     if (originalQualityCall) originalQualityCall(storage,item);
     if (storage) {
-        void *manager = field<void *>(storage,Layout::CallbackManager);
         if (manager) {
+            if (metalFXValue(mode) && restoreSharpness(manager,sharpness))
+                at<void(*)(void *,bool)>(Native::PublishSettings)(manager,false);
             if (metalFXValue(mode) && value >= 0 && value <= 3) {
                 [NSUserDefaults.standardUserDefaults setInteger:value forKey:qualityPreference];
                 event(@{@"event":@"nativeQualityChanged",@"value":@(value),@"nativeQuality":@(field<uint8_t>(manager,Layout::NativeQuality)),
@@ -290,10 +336,12 @@ static void applyCombo(void *manager, const void *item) {
     int value = upscale ? field<int32_t>(mutableItem,Layout::ComboSelection) : -1;
     bool custom = metalFXValue(value);
     int quality = custom ? customQuality(manager) : -1;
+    float sharpness = currentSharpness(manager);
     if (custom) field<int32_t>(mutableItem,Layout::ComboSelection) = 1;
     originalApplyCombo(manager,item);
     if (custom) {
         restoreCustomQuality(manager,quality,YES);
+        restoreSharpness(manager,sharpness);
         field<int32_t>(mutableItem,Layout::ComboSelection) = value;
         updateDependentControls(manager,value);
         event(@{@"event":@"nativeUpscalingApplied",@"value":@(value),@"nativeType":@(field<uint8_t>(manager,Layout::NativeUpscalingType))});
@@ -319,13 +367,16 @@ static void upscaleChanged(void *storage, const void *item) {
     // selected, so the native Off and FSR paths remain unchanged.
     int appliedValue = metalFXValue(value) ? 1 : value;
     int quality = metalFXValue(value) ? customQuality(manager) : -1;
+    float sharpness = currentSharpness(manager);
     field<int32_t>(const_cast<void *>(item),Layout::ComboSelection) = appliedValue;
     originalUpscaleCall(storage,item);
     if (quality >= 0) restoreCustomQuality(manager,quality,YES);
+    // Changing the type is not a sharpness choice, even to or from FSR.
+    bool sharpnessRestored = restoreSharpness(manager,sharpness);
     field<int32_t>(const_cast<void *>(item),Layout::ComboSelection) = value;
     // The selection callback already published Balanced before we restored
     // the manager's quality. Publish the restored settings to the renderer too.
-    if (quality >= 0) at<void(*)(void *,bool)>(Native::PublishSettings)(manager,false);
+    if (quality >= 0 || sharpnessRestored) at<void(*)(void *,bool)>(Native::PublishSettings)(manager,false);
     int previous = selectedScalingMode.exchange(value);
     updateDependentControls(manager,value);
     if (metalFXValue(value))
@@ -341,7 +392,7 @@ static void upscaleChanged(void *storage, const void *item) {
 // These native types/functions use BG3's observed ARM64 ABI. In particular,
 // AddTranslatedString returns its nontrivial Handle through explicit argument 0,
 // consumes argument 2, and takes StringView in registers 3/4.
-static BOOL makeText(Text &text, const char *identifier, const char *literal) {
+static BOOL makeText(Text &text, const char *identifier, const char *literal, bool &constructed) {
     void *repository = *at<void **>(Native::TranslationRepository);
     if (!repository) return NO;
     Handle input{}, output{};
@@ -352,6 +403,7 @@ static BOOL makeText(Text &text, const char *identifier, const char *literal) {
     at<void(*)(Handle *,void *,Handle *,const char *,uint32_t,void *,uint32_t)>(Native::AddTranslatedString)
         (&output,repository,&input,literal,static_cast<uint32_t>(strlen(literal)),map,0);
     at<void(*)(Text *,const Handle *)>(Native::MakeText)(&text,&output);
+    constructed = true;
     at<void(*)(Handle *)>(Native::DestroyHandle)(&output);
     View resolved = at<View(*)(const Text *,uint32_t,uint32_t)>(Native::ResolveText)(&text,0,0);
     BOOL matches = resolved.size == strlen(literal) && resolved.data && memcmp(resolved.data,literal,resolved.size) == 0;
@@ -403,21 +455,33 @@ static void menuInit(void *manager) {
         return;
     }
     Text spatialName{}, spatialDescription{}, temporalName{}, temporalDescription{}, hudName{}, hudDescription{}, frameName{}, frameDescription{};
-    BOOL ok = makeText(spatialName,"h00000000g0000g0000g0000g00000000f001","MetalFX Spatial") &&
-        makeText(spatialDescription,"h00000000g0000g0000g0000g00000000f002","Upscales each frame with MetalFX Spatial. Anti-aliasing remains a separate setting.") &&
-        makeText(temporalName,"h00000000g0000g0000g0000g00000000f005","MetalFX Temporal") &&
-        makeText(temporalDescription,"h00000000g0000g0000g0000g00000000f006","Uses MetalFX Temporal history to upscale each frame and replaces TAA.") &&
-        makeText(hudName,"h00000000g0000g0000g0000g00000000f003","Show Metal HUD") &&
-        makeText(hudDescription,"h00000000g0000g0000g0000g00000000f004","Shows Apple's Metal performance overlay. Changes take effect immediately.") &&
-        makeText(frameName,"h00000000g0000g0000g0000g00000000f00b","MetalFX Frame Generation") &&
-        makeText(frameDescription,"h00000000g0000g0000g0000g00000000f00c","Adds a MetalFX-generated frame between rendered frames, with any Upscaling Type. Uses the game's TAA depth and motion data. The FPS limiter controls rendered frames.");
-    if (!ok) { event(@{@"event":@"nativeMenuError",@"error":@"Could not register menu text"}); return; }
+    // A Text that failed its check is still constructed; one never constructed
+    // stays zero and must not be destroyed.
+    Text *made[8];
+    unsigned madeCount = 0;
+    auto make = [&](Text &text, const char *identifier, const char *literal) {
+        bool constructed = false;
+        BOOL matches = makeText(text,identifier,literal,constructed);
+        if (constructed) made[madeCount++] = &text;
+        return matches;
+    };
+    auto destroyTexts = [&] { for (unsigned i=0;i<madeCount;++i) destroyText(*made[i]); };
+    BOOL ok = make(spatialName,"h00000000g0000g0000g0000g00000000f001","MetalFX Spatial") &&
+        make(spatialDescription,"h00000000g0000g0000g0000g00000000f002","Upscales each frame with MetalFX Spatial. Anti-aliasing remains a separate setting.") &&
+        make(temporalName,"h00000000g0000g0000g0000g00000000f005","MetalFX Temporal") &&
+        make(temporalDescription,"h00000000g0000g0000g0000g00000000f006","Uses MetalFX Temporal history to upscale each frame and replaces TAA.") &&
+        make(hudName,"h00000000g0000g0000g0000g00000000f003","Show Metal HUD") &&
+        make(hudDescription,"h00000000g0000g0000g0000g00000000f004","Shows Apple's Metal performance overlay. Changes take effect immediately.") &&
+        make(frameName,"h00000000g0000g0000g0000g00000000f00b","MetalFX Frame Generation") &&
+        make(frameDescription,"h00000000g0000g0000g0000g00000000f00c","Adds a MetalFX-generated frame between rendered frames, with any Upscaling Type. Uses the game's TAA depth and motion data. The FPS limiter controls rendered frames.");
+    if (!ok) { destroyTexts(); event(@{@"event":@"nativeMenuError",@"error":@"Could not register menu text"}); return; }
     if (nativeOptions) {
         at<void(*)(void *,int,const Text *,const Text *)>(Native::AppendComboValue)(upscale,2,&spatialName,&spatialDescription);
         at<void(*)(void *,int,const Text *,const Text *)>(Native::AppendComboValue)(upscale,3,&temporalName,&temporalDescription);
     }
     if (field<uint32_t>(upscale,Layout::ComboCount) != extendedValues.count) {
         event(@{@"event":@"nativeMenuError",@"error":@"Could not append the MetalFX options"});
+        destroyTexts();
         return;
     }
     void *selectionCall = field<void *>(upscale,Layout::SelectionCallback);
@@ -442,6 +506,7 @@ static void menuInit(void *manager) {
     if (metalFXValue(mode)) {
         if (field<void *>(upscale,Layout::CapturedManager) != manager || !originalUpscaleCall) {
             event(@{@"event":@"nativeMenuError",@"error":@"Unsupported native upscaling callback storage."});
+            destroyTexts();
             return;
         }
         field<int32_t>(upscale,Layout::ComboSelection) = mode;
@@ -466,24 +531,24 @@ static void menuInit(void *manager) {
         void *frameItem = at<void *(*)(void *,uint16_t,const Text *,const Text *,bool)>(Native::AddTickBox)
             (manager,frameGenerationID,&frameName,&frameDescription,frameGenerationChecked.load());
         field<void *>(frameItem,Layout::SelectionCallback) = reinterpret_cast<void *>(frameGenerationChanged);
-        // Put Frame Generation right after the upscaling controls (Upscaling
-        // Type, then Upscaling Quality when BG3 lists it).
+        // Put Frame Generation right below VSync (combo 82, EVSyncMode), which
+        // also governs presentation; without it, after the upscaling controls
+        // (Upscaling Type, then Upscaling Quality when BG3 lists it).
         items = field<void **>(manager,Layout::Items); count = field<uint32_t>(manager,Layout::ItemCount);
         if (count && items[count-1] == frameItem) {
-            uint32_t anchor = count;
+            uint32_t anchor = count, vsync = count;
             for (uint32_t i=0;i+1<count;++i) {
                 uint16_t id = field<uint8_t>(items[i],Layout::ItemType) == 3 ? field<uint16_t>(items[i],Layout::ItemID) : 0;
                 if (id == 99 || id == 100) anchor = i;
+                if (id == 82) vsync = i;
             }
+            if (vsync < count) anchor = vsync;
             if (anchor+2 < count) {
                 memmove(items+anchor+2,items+anchor+1,(count-anchor-2)*sizeof(void *)); items[anchor+1] = frameItem;
             }
         }
     }
-    destroyText(frameName); destroyText(frameDescription);
-    destroyText(spatialName); destroyText(spatialDescription);
-    destroyText(temporalName); destroyText(temporalDescription);
-    destroyText(hudName); destroyText(hudDescription);
+    destroyTexts();
     if (NSThread.isMainThread) applyHUD(); else dispatch_async(dispatch_get_main_queue(),^{ applyHUD(); });
     event(@{@"event":@"nativeMenuReady",@"upscalingOptions":@[@"Off",@"AMD FSR 1.0",@"MetalFX Spatial",@"MetalFX Temporal"],
             @"frameGenerationOption":@(frameGeneration),@"frameGeneration":@(frameGenerationChecked.load()),

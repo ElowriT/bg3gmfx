@@ -223,6 +223,95 @@ Local traces, captures, samples and replay inputs under `build/` were deleted on
 October 12, 2026. Validation pages that cite those paths describe results that
 can no longer be re-inspected locally.
 
+## Spatial without TAA (October 19, 2026)
+
+With Anti-Aliasing set to SMAA, MetalFX Spatial fell back to native FSR on every
+frame ("Could not match FSR input to BG3's linear HDR scene color"): the scene
+chain was seeded only at BG3's TAA pass. A diagnostic trace with SMAA showed
+SMAA, bloom and color grading writing `FSR_Tonemap`'s input, RG11B10Float at
+render size (640×400 → 1280×800 windowed). Spatial now seeds the chain there
+when nothing upstream tagged it. `spatial-hook-smoke no-taa` reproduced the
+fallback before the change and passes its pixel checks after it in both
+runtimes. Live, quiet runtime, SMAA, windowed: zero fallback messages at the
+main menu and in game, and the user reported the image looks good. Displayed
+acceptance only; no frame-rate comparison.
+
+## Scaler caches across resizes (October 19, 2026)
+
+A static review found two leaks in the per-size scaler caches; regression
+checks reproduced both before the change. Offscreen, `spatial-hook-smoke
+resize` measured +170.8 MB of GPU allocations after a 24-size sweep (every
+Spatial size kept); with a two-size cache and the 0.3 s settle it measures
++6.3 MB (+10.8 MB diagnostic runtime). `temporal-hook-smoke` found 24 of 32
+earlier-size BG3 textures kept alive by cached Temporal scalers (texture
+properties and the Metal 4 residency set); none survive now. Live, before the
+change, a 10 s Spatial window drag in BG3 (SMAA, 1280×800 window) retained
++280 MB of graphics memory, and a second shorter drag +6 MB; how much of the
+first was BG3's own resize cost was not isolated. Live re-measurement after the
+change is pending.
+
+## Metal 4 residency at a steady size (October 19, 2026)
+
+Live in BG3 with Frame Generation on, then MetalFX Temporal, in a window and
+without changing the output size, the diagnostic `metal4Residency` events
+showed sets gaining entries for replaced BG3 targets: Frame Generation from 4
+to 7 allocations (+13.5 MB at that size) with no settings change, plausibly a
+save load, and Temporal by one allocation twice after settings changes. The
+sets were rebuilt only when the render size changed or at 64 allocations. Each
+bridge now drops members idle for 16 submissions; `metal4-bridge-smoke`
+reproduced the retention before the change and passes after it (offscreen).
+Live after the change, same window and settings toggles (bloom, ambient
+occlusion, shadows) plus save loads: each time BG3 replaced targets the sets
+returned to their steady size within 1–3 s (`replaced`): Temporal 11 → 9 → 4
+allocations (18.9 → 7.8 MB), Frame Generation 7 → 4 (21.2 → 14.5 MB). The run
+before it, accidentally on the unfixed library, grew Temporal to 14.
+
+## Character creation GPU hang (October 19, 2026)
+
+Unmodified BG3 4.1.1.7631656 hung the GPU on entering character creation in
+fullscreen 2336×1460 with AMD FSR 1.0 Ultra Quality (render 1796×1123). The
+AGX driver wedged, WindowServer hit its watchdog, and the process stayed until
+a reboot. bg3mfx 0.3.0 and 0.3.1 reached it only through a saved MetalFX
+Ultra Quality setting; Off and other FSR qualities passed. Metal API validation
+showed, within about 110 ms before the fault, `ClusterAssignment` (index 6),
+`ClusteredLighting_0..13`, `VolumetricFogInitialize`, `VolumetricFogLighting`
+(index 1) and the character lash and tearline fragment shaders (fragment index
+1) running without `ClusterInfoBuffer`. The hang was intermittent: one run at
+the same settings passed.
+
+The [cluster buffer guard](../../../src/features/cluster-buffer-guard/README.md)
+binds a zero-filled stand-in at those indices on each new encoder. Live with
+the diagnostic runtime and API validation, at the same settings, a first run of
+many character-creation entries (some at higher output resolutions) never
+reproduced the trigger: BG3 bound the buffer itself every time. In a second
+run, the first entry into character creation did reproduce it.
+`ClusterAssignment`, `VolumetricFogInitialize` and `VolumetricFogLighting` ran
+on the stand-in every frame for about 1 min 47 s: about 2,100 frames, 6,400
+dispatches, at render 1796×1123 for 2336×1460 output. There was no hang and no
+validation error, and the user saw normal lighting and fog. The reads stopped
+when the user returned to the menu. Later entries, including one made with
+Upscaling Off and then switched to FSR inside character creation, bound the
+buffer normally. `ClusteredLighting_*` and the fragment shaders bound it in
+this run. Changing the starting character loaded geometry slowly under
+validation and tracing; this has not been compared on the quiet runtime. The
+first run's `VolumetricFogGather`/`VolumetricFogLighting` stand-in events were
+a diagnostic gap (compute `setBytes`, and passes that don't declare the
+buffer), fixed before the second run. Evidence:
+`build/evidence/2026-10-19-cc-crash/` (`trace-guard-2.jsonl`).
+
+Live lldb tracing (diagnostic runtime, guard on) of a reproduced entry found
+the mechanism. Entering character creation loads `ecl::BasicGameObjectRenderer`
+with its own scene graph and a 300×300 `ClusteredAssignmentStage`. The main
+scene graph's next `rf::SceneGraph::ConfigureAliasing` cleared the main stage's
+`ClusterInfoBuffer` entry: the binding at entry `+0x80`, written at
+`0x106433e38`. The next call's create pass (`0x106438798`) copied a null view
+into it. In a normal resize the same call clears and refills the entry. The
+main stage stayed marked rendering with the null entry until the preview
+renderer was destroyed, when two more main-graph reconfigurations restored a
+buffer. Why the create pass found no view is not pinned down. lldb scripts and
+logs: `build/evidence/2026-10-19-cc-crash/cluster_lldb*.py` and
+`lldb-cluster*.txt`.
+
 ## Metal 4 Temporal path
 
 Temporal now chooses the Metal 4 scaler on supported devices and retains the
@@ -291,7 +380,7 @@ changed.
 | Temporal | Native jitter converted to MetalFX displacement, HDR color, depth, and motion feed MetalFX; TAA output is replaced and separate AA is disabled | Corrected jitter improves analytic reconstruction and captured-game replay; user confirms clearly better and stable in the quiet Temporal/Balanced saved-camera and slow-motion test. MetalFX shader-validation fault remains unresolved |
 | Native Off and FSR | Original settings callbacks and rendering paths remain in use | Off, TAA, native FSR callbacks/dispatches were observed in live menu tests |
 | Metal HUD | Persistent menu checkbox controls the Metal layer overlay | Menu ordering and HUD on/off were visually verified |
-| Error path | Setup and resource failures display a clear error and exit 78. A frame whose FSR input matches no captured scene (transitions) runs BG3's native FSR + RCAS for that frame, logs `metalFXNativeFallback`, and restarts Temporal history | Synthetic invalid-resource regressions pass; the hook fixture checks the unmatched-frame fallback. User reported scene-match closures before this change; not yet retested live |
+| Error path | No failure closes BG3. A failed MetalFX upscaler turns off with a notice and BG3's native TAA and FSR + RCAS render until another Upscaling Type is chosen; Frame Generation failures turn Frame Generation off; menu and startup problems show a notice and BG3 continues. A frame whose FSR input matches no captured scene (transitions) runs BG3's native FSR + RCAS for that frame, logs `metalFXNativeFallback`, and restarts Temporal history | Synthetic invalid-resource regressions pass; the hook fixture checks the unmatched-frame fallback. `spatial-hook-smoke bad-format` checks that a Spatial failure keeps the process running with native FSR/RCAS on later frames (October 19); not yet triggered live |
 | Video Options Menu Fix | Restores `LSMTLView` first responder after BG3 detaches and reattaches it during fullscreen graphics-setting changes | User confirmed the fullscreen Video menu remains responsive after changing settings; modal and windowed paths still need broader checks |
 | Split screen | Fog composite uses view-relative UV mapping; each view is upscaled on its own | User-confirmed fog and seam fixes in two-player split screen on the 0.2.2-based branch, rechecked on the feature layout with lab virtual controllers; synthetic split-screen tests |
 | MetalFX Sharpening | BG3's RCAS replayed on MetalFX output | Live matched-frame detail measurement; hook tests with and without sharpening |
