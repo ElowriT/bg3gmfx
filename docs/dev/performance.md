@@ -270,5 +270,11 @@ samples) and cut its protected Lua call time by 14%.
   Super-core share (`xcrun clang -O2 tools/analysis/procpower.c -o procpower`; no root).
 - `tools/analysis/threadcpu.c PID [seconds]`: CPU use per named thread, as consumed
   rather than sampled.
+- `tools/analysis/socpower.c [seconds] [samples] [--json]`: whole-machine power by
+  subsystem (CPU, GPU, DRAM, memory controller and fabric, display engines, other)
+  from IOReport's energy counters, like powermetrics but without root
+  (`clang -fblocks -O2 tools/analysis/socpower.c -framework CoreFoundation -o socpower`).
+  Counters other than the GPU's advance about every 2 s: use 2 s samples or more.
+  On an M5 Pro the idle machine draws about 1.8 W, half of it memory and fabric.
 - Dynamic worker decisions: `log stream --predicate 'subsystem == "com.bg3mfx"
   AND category == "threads"'`.
