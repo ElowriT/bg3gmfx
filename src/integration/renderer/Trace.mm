@@ -1562,9 +1562,9 @@ static id<MTLTexture> sharpeningIntermediate(id<MTLCommandBuffer> buffer, NSDict
     if (!BG3MFXSharpeningEnabled() || !inputs[@"rcas"] || !inputs[@"scaled"] || !inputs[@"destination"]) return nil;
     if (!inputs[@"view"])
         return [[BG3MFXNativeSharpening sharedForDevice:buffer.device] intermediateLike:inputs[@"destination"] commandBuffer:buffer];
-    // BG3 runs RCAS over the whole frame for each split-screen view, and so does
-    // the replay: the views share one intermediate, so the last view's pass
-    // sharpens every view's current result.
+    // BG3 runs RCAS over the whole frame for each split-screen view. The views
+    // share one intermediate; each view's replay covers its own rectangle (see
+    // sharpenInto), and the last one, like BG3's, every view's current result.
     NSMutableDictionary *shared = objc_getAssociatedObject(buffer,&viewIntermediatesKey);
     NSValue *key = [NSValue valueWithPointer:(__bridge const void *)inputs[@"destination"]];
     if (id<MTLTexture> texture = shared[key]) return texture;
@@ -1593,10 +1593,21 @@ static BOOL upscaleView(id<MTLCommandBuffer> buffer, NSDictionary *inputs, NSArr
 }
 static void sharpenInto(id<MTLCommandBuffer> buffer, NSDictionary *inputs, id<MTLTexture> linear) {
     id<MTLTexture> destination = inputs[@"destination"];
+    // A split-screen view's pass only has to produce its own rectangle: BG3
+    // tone-maps each view right after its RCAS. A dispatch starts at the origin,
+    // so its grid shrinks to the rectangle's far corner (the left view, half).
+    NSArray *outputView = inputs[@"outputView"];
+    MTLRegion region = outputView ? BG3MFXViewRegion(outputView) : MTLRegionMake2D(0,0,destination.width,destination.height);
     BOOL encoded = [[BG3MFXNativeSharpening sharedForDevice:buffer.device] encodeFrom:linear
-        rcas:inputs[@"rcas"] destination:destination commandBuffer:buffer dispatch:^(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas) {
+        rcas:inputs[@"rcas"] destination:destination region:region commandBuffer:buffer
+        dispatch:^(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas, MTLSize extent) {
             NSArray *g = rcas[@"grid"], *n = rcas[@"threads"];
             MTLSize grid = MTLSizeMake([g[0] unsignedIntegerValue],[g[1] unsignedIntegerValue],[g[2] unsignedIntegerValue]);
+            // Each grid unit covers destination / grid pixels or more.
+            if (extent.width < destination.width && grid.width)
+                grid.width = std::min(grid.width, (extent.width * grid.width + destination.width - 1) / destination.width);
+            if (extent.height < destination.height && grid.height)
+                grid.height = std::min(grid.height, (extent.height * grid.height + destination.height - 1) / destination.height);
             MTLSize threads = MTLSizeMake([n[0] unsignedIntegerValue],[n[1] unsignedIntegerValue],[n[2] unsignedIntegerValue]);
             SEL dispatch = [rcas[@"threadgroups"] boolValue] ? @selector(dispatchThreadgroups:threadsPerThreadgroup:) : @selector(dispatchThreads:threadsPerThreadgroup:);
             // BG3's own pipeline: straight to Metal, not through the FSR replacement.

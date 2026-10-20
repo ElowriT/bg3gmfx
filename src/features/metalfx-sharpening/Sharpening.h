@@ -15,13 +15,19 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)sharedForDevice:(id<MTLDevice>)device;
 // A pooled texture like destination for MetalFX to write; released after buffer.
 - (nullable id<MTLTexture>)intermediateLike:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer;
-// rcas: the replayed dispatch (see Trace.mm, FSR_RCAS). dispatch issues the
-// dispatch on the encoder without bg3mfx's own dispatch hook.
+// rcas: the replayed dispatch (see Trace.mm, FSR_RCAS). region: the part of
+// destination this pass is for (all of it, or one split-screen view). Only that
+// part (and the pixels RCAS reads around it) is mapped into FSR's space, into a
+// texture the command buffer's views share, so a later view's whole-frame pass
+// still reads every earlier view. dispatch issues the dispatch on the encoder
+// without bg3mfx's own dispatch hook; extent is the region's far corner, which
+// a dispatch from the origin needs to cover.
 - (BOOL)encodeFrom:(id<MTLTexture>)linear
               rcas:(NSDictionary *)rcas
        destination:(id<MTLTexture>)destination
+            region:(MTLRegion)region
      commandBuffer:(id<MTLCommandBuffer>)buffer
-          dispatch:(void (^)(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas))dispatch;
+          dispatch:(void (^)(id<MTLComputeCommandEncoder> encoder, NSDictionary *rcas, MTLSize extent))dispatch;
 @end
 
 // Default on; BG3MFX_METALFX_SHARPENING=0 or the lab switch turn it off.

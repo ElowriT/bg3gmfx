@@ -3,7 +3,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
+#include <objc/runtime.h>
 
 static std::atomic<bool> sharpening{[] { const char *v = getenv("BG3MFX_METALFX_SHARPENING"); return !v || strcmp(v, "0") != 0; }()};
 bool BG3MFXSharpeningEnabled(void) { return sharpening.load(std::memory_order_relaxed); }
@@ -41,8 +43,10 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
     // step darker. Rounding up instead returns at or just above it.
     NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
         "kernel void BG3MFXToFSRSpace(texture2d<float,access::read> src [[texture(0)]], "
-        "texture2d<half,access::write> dst [[texture(1)]], uint2 p [[thread_position_in_grid]]) {\n"
-        "  if (p.x >= dst.get_width() || p.y >= dst.get_height()) return;\n"
+        "texture2d<half,access::write> dst [[texture(1)]], constant uint4 &area [[buffer(0)]], "
+        "uint2 g [[thread_position_in_grid]]) {\n"
+        "  uint2 p = g + area.xy;\n"
+        "  if (p.x >= area.z || p.y >= area.w) return;\n"
         "  float3 c = max(src.read(p).rgb, 0.0);\n"
         "  float3 t = c / (max3(c.r, c.g, c.b) + 1.0);\n"
         "  half3 h = half3(t);\n"
@@ -79,8 +83,13 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
 }
 
 // RCAS's input in FSR's space. BG3's own FSR output is RG11B10, whose rounding
-// RCAS's undo magnifies near white; half float keeps highlights intact.
+// RCAS's undo magnifies near white; half float keeps highlights intact. One per
+// destination and command buffer, shared by its split-screen views.
+static char fsrSpacesKey;
 - (id<MTLTexture>)fsrSpaceLike:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer {
+    NSMutableDictionary *shared = objc_getAssociatedObject(buffer, &fsrSpacesKey);
+    NSValue *bufferKey = [NSValue valueWithPointer:(__bridge const void *)destination];
+    if (id<MTLTexture> texture = shared[bufferKey]) return texture;
     NSString *key = [NSString stringWithFormat:@"%lu:%lu", (unsigned long)destination.width, (unsigned long)destination.height];
     BG3MFXTexturePool *pool;
     {
@@ -95,24 +104,36 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
         }
     }
     id<MTLTexture> texture = [pool acquire];
-    if (texture) [pool relinquish:texture afterCommandBuffer:buffer];
+    if (!texture) return nil;
+    [pool relinquish:texture afterCommandBuffer:buffer];
+    if (!shared) {
+        shared = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(buffer, &fsrSpacesKey, shared, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    shared[bufferKey] = texture;
     return texture;
 }
 
 - (BOOL)encodeFrom:(id<MTLTexture>)linear rcas:(NSDictionary *)rcas
-       destination:(id<MTLTexture>)destination commandBuffer:(id<MTLCommandBuffer>)buffer
-          dispatch:(void (^)(id<MTLComputeCommandEncoder>, NSDictionary *))dispatch {
+       destination:(id<MTLTexture>)destination region:(MTLRegion)region commandBuffer:(id<MTLCommandBuffer>)buffer
+          dispatch:(void (^)(id<MTLComputeCommandEncoder>, NSDictionary *, MTLSize))dispatch {
     id<MTLComputePipelineState> pipeline = rcas[@"pipeline"];
     id<MTLTexture> fsrSpace = pipeline ? [self fsrSpaceLike:destination commandBuffer:buffer] : nil;
     if (!fsrSpace) return NO;
     id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
     if (!encoder) return NO;
     encoder.label = @"BG3MFX native sharpening";
+    // The region and the one-pixel ring RCAS reads around it.
+    NSUInteger right = std::min(destination.width, region.origin.x + region.size.width);
+    NSUInteger bottom = std::min(destination.height, region.origin.y + region.size.height);
+    uint32_t area[4] = {(uint32_t)(region.origin.x ? region.origin.x - 1 : 0), (uint32_t)(region.origin.y ? region.origin.y - 1 : 0),
+                        (uint32_t)std::min(destination.width, right + 1), (uint32_t)std::min(destination.height, bottom + 1)};
     [encoder setComputePipelineState:_toFSRSpace];
     [encoder setTexture:linear atIndex:0];
     [encoder setTexture:fsrSpace atIndex:1];
+    [encoder setBytes:area length:sizeof(area) atIndex:0];
     MTLSize threads = MTLSizeMake(16, 16, 1);
-    [encoder dispatchThreadgroups:MTLSizeMake((destination.width + 15) / 16, (destination.height + 15) / 16, 1) threadsPerThreadgroup:threads];
+    [encoder dispatchThreadgroups:MTLSizeMake((area[2] - area[0] + 15) / 16, (area[3] - area[1] + 15) / 16, 1) threadsPerThreadgroup:threads];
     [encoder memoryBarrierWithScope:MTLBarrierScopeTextures];
     [encoder setComputePipelineState:pipeline];
     [encoder setTexture:fsrSpace atIndex:0];
@@ -120,7 +141,7 @@ void BG3MFXSetSharpeningEnabled(bool enabled) { sharpening = enabled; }
     [encoder setTexture:destination atIndex:2];
     if (NSData *bytes = rcas[@"constants"]) [encoder setBytes:bytes.bytes length:bytes.length atIndex:0];
     else [encoder setBuffer:rcas[@"constantsBuffer"] offset:[rcas[@"constantsOffset"] unsignedIntegerValue] atIndex:0];
-    dispatch(encoder, rcas);
+    dispatch(encoder, rcas, MTLSizeMake(right, bottom, 1));
     [encoder endEncoding];
     return YES;
 }

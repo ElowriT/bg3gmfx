@@ -40,7 +40,8 @@ int main(int argc, char **argv) {
             "kernel void FSR(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]], device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {"
             "if(all(p==uint2(0))) atomic_fetch_add_explicit(count,1,memory_order_relaxed);dst.write(src.read(p/2),p);}\n"
             "kernel void FSR_RCAS(texture2d<float,access::read> src [[texture(0)]], texture2d<float,access::write> dst [[texture(2)]], device atomic_uint *count [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {"
-            "if(all(p==uint2(0))) atomic_fetch_add_explicit(count+1,1,memory_order_relaxed);float3 c=src.read(p).rgb;dst.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p);}\n"
+            "if(all(p==uint2(0))) atomic_fetch_add_explicit(count+1,1,memory_order_relaxed);if(p.x>=dst.get_width()/2) atomic_fetch_add_explicit(count+2,1,memory_order_relaxed);"
+            "float3 c=src.read(p).rgb;dst.write(float4(c/(1-max(c.r,max(c.g,c.b))),1),p);}\n"
             "kernel void Read(texture2d<float,access::read> src [[texture(0)]], device float4 *out [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {out[p.y*src.get_width()+p.x]=src.read(p);}";
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (!library) { fprintf(stderr,"%s\n",error.description.UTF8String); return 4; }
@@ -69,7 +70,9 @@ int main(int argc, char **argv) {
         id<MTLTexture> scaled = texture(device,OW,OH,MTLPixelFormatRGBA16Float,rw);
         id<MTLTexture> output = texture(device,OW,OH,MTLPixelFormatRG11B10Float,rw);
         id<MTLBuffer> pixels = [device newBufferWithLength:OW*OH*sizeof(float)*4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> count = [device newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        // Per view: FSR dispatches, RCAS dispatches, RCAS threads in the right half.
+        id<MTLBuffer> count = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> afterFirst = [device newBufferWithLength:OW*OH*sizeof(float)*4 options:MTLResourceStorageModeShared];
         id<MTLCommandQueue> queue = [device newCommandQueue];
         float camera[56]={}, temporal[56]={};
         camera[21]=1.7320508; camera[48]=0.1; camera[49]=1000;
@@ -99,7 +102,7 @@ int main(int argc, char **argv) {
             // Frame 0 runs Spatial (BG3's TAA kept, +0.25); later frames run Temporal per view.
             bool spatial = frame == 0;
             if (!select(spatial ? 2 : 3)) return 7;
-            memset(count.contents,0,8);
+            memset(count.contents,0,32);
             id<MTLCommandBuffer> b=[queue commandBufferWithUnretainedReferences];
             id<MTLComputeCommandEncoder> c=[b computeCommandEncoder];
             [c setComputePipelineState:compute[0]]; [c setTexture:color atIndex:0]; [c setTexture:motion atIndex:1];
@@ -121,10 +124,17 @@ int main(int argc, char **argv) {
                 pass(b,tonemapped,render[3],@[graded],view,YES);
                 c=[b computeCommandEncoder];
                 [c setTexture:tonemapped atIndex:0]; [c setTexture:scaled atIndex:1]; [c setComputePipelineState:compute[1]];
-                [c setBuffer:count offset:0 atIndex:0];
+                [c setBuffer:count offset:view*16 atIndex:0];
                 [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
                 [c setTexture:scaled atIndex:0]; [c setTexture:output atIndex:2]; [c setComputePipelineState:compute[2]];
                 [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [c endEncoding];
+                // BG3 tone-maps each view right after its RCAS: the left view's
+                // half must be final before the right view is processed.
+                if (view==0) {
+                    c=[b computeCommandEncoder]; [c setComputePipelineState:compute[3]];
+                    [c setTexture:output atIndex:0]; [c setBuffer:afterFirst offset:0 atIndex:0];
+                    [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [c endEncoding];
+                }
             }
             c=[b computeCommandEncoder]; [c setComputePipelineState:compute[3]];
             [c setTexture:output atIndex:0]; [c setBuffer:pixels offset:0 atIndex:0];
@@ -132,11 +142,24 @@ int main(int argc, char **argv) {
             [b commit]; [b waitUntilCompleted];
             if (b.status!=MTLCommandBufferStatusCompleted) { fprintf(stderr,"frame %d failed: %s\n",frame,b.error.description.UTF8String); return 8; }
             const uint32_t *n=(const uint32_t *)count.contents;
-            if (n[0]!=0 || n[1]!=(sharpening ? 2u : 0u)) { fprintf(stderr,"frame %d: %u FSR and %u RCAS dispatches\n",frame,n[0],n[1]); return 9; }
+            if (n[0]+n[4]!=0 || n[1]+n[5]!=(sharpening ? 2u : 0u)) {
+                fprintf(stderr,"frame %d: %u FSR and %u RCAS dispatches\n",frame,n[0]+n[4],n[1]+n[5]); return 9;
+            }
+            // The left view's RCAS replay covers only its half; the right view's, like BG3's, the frame.
+            if (sharpening && (n[2]!=0 || n[6]==0)) {
+                fprintf(stderr,"frame %d: RCAS threads in the right half: %u for the left view, %u for the right\n",frame,n[2],n[6]); return 12;
+            }
             // Spatial keeps BG3's TAA; Temporal replaces it from its first frame,
             // since Spatial already identified this TAA target as upscaled.
             const float added = spatial ? 0.25f : 0;
             const float *p=(const float *)pixels.contents;
+            const float *first=(const float *)afterFirst.contents;
+            for (NSUInteger x=0;x<OW/2;++x) for (int ch=0;ch<3;++ch) {
+                float actual=first[((OH/2)*OW+x)*4+ch], expected=viewColor[0][ch]+added;
+                if ((!std::isfinite(actual) || fabs(actual-expected)>0.08f)) {
+                    fprintf(stderr,"%s frame %d: the left view at %lu after its own pass: %f != %f\n",spatial ? "Spatial" : "Temporal",frame,x,actual,expected); return 13;
+                }
+            }
             // Every column, including the two at the seam, holds only its own view.
             for (NSUInteger x=0;x<OW;++x) for (NSUInteger y=OH/2-8;y<OH/2+8;y+=4) for (int ch=0;ch<3;++ch) {
                 float actual=p[(y*OW+x)*4+ch], expected=viewColor[x<OW/2 ? 0 : 1][ch]+added;

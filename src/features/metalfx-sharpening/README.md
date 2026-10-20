@@ -28,3 +28,15 @@ default strength a little strong for Temporal and can lower the slider. The
 cost is one full-screen kernel plus BG3's own RCAS. The Spatial, Temporal and
 Frame Generation hook tests check that RCAS runs once per upscaled frame on the
 MetalFX result and that the round trip leaves unsharpened colors unchanged.
+
+In split screen BG3 runs RCAS over the whole frame for each view and tone-maps
+that view's half right after it. The replay keeps that order but does no more
+than each view needs: the views share one FSR-space texture per frame, each
+view maps only its own rectangle (and the one-pixel ring RCAS reads), and the
+left view's RCAS grid stops at its right edge, so per frame the frame is mapped
+once instead of twice and RCAS covers one and a half frames instead of two. The
+right view's pass, like BG3's, still covers the frame, from the same data, so
+the image is unchanged. Measured on October 20 before this change (2560×1440,
+two views, 30 FPS): sharpening cost about 0.5 W of whole-machine power.
+`split-screen-upscale-smoke` checks that the left view's half is final before
+the right view is processed and that its RCAS pass stays in its half.
