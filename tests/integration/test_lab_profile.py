@@ -32,6 +32,7 @@ class ProfileSummaryTests(unittest.TestCase):
         self.assertEqual(lab.pass_category({"draws": {"BG3MFXViewportVS|DeferredFog_Cubic_PS": 1}}), "fog and clouds")
         self.assertEqual(lab.pass_category({"draws": {"PPDefaultVS|PPTAA_PS": 1}}), "TAA and upscaling")
         self.assertEqual(lab.pass_category({"draws": {"PassPosVS|PPToneMap_LUT": 1}}), "post-processing")
+        self.assertEqual(lab.pass_category({"draws": {"PPDefaultVS|PPSAO_PS": 4}}), "ambient occlusion")
 
     def test_summary_adds_up_and_finds_repeated_full_target_passes(self):
         target = [{"width": 2560, "height": 1440}]

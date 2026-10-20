@@ -145,8 +145,20 @@ buffers in one order and enqueues them in the other: submitted in encoding
 order it fails with the same GPU timeout after about 10 s; submitting in
 enqueue order alone still stalled about 4 s, because the temporal scaler links
 frames in encoding order. With the scaler work recorded at submission time it
-completes in milliseconds. Not yet rechecked live with the frame cap off;
-`perf.json` reports `metal4Reordered`, the submissions that this reordered.
+completes in milliseconds. `perf.json` reports `metal4Reordered`, the
+submissions that this reordered.
+
+Rechecked live on October 20 (started from Steam with the overlay, 2560×1440,
+Temporal Quality, frame cap off, two-player split screen with lab virtual
+controllers): 60 s at about 86 FPS with the GPU at 100%, no GPU errors in the
+kernel log, the game kept running. `metal4Reordered` stayed 0, so the original
+trigger (turning the cap off while already in split screen) was not
+reproduced. A serialized profile of the same scene: BG3's passes 10.1 ms per
+frame plus 2.0 ms of MetalFX (before 0.3.0, 12.8 ms in a similar scene);
+post-processing 2.4 ms (the tone map at output resolution 0.6 ms of it),
+G-buffer 1.6, lighting 1.3, depth prepass 1.0, shadows 0.6, ambient occlusion
+0.6, velocity 0.6. No pass repeats over the whole frame per view beyond about
+0.1 ms of clears.
 
 ## Frame Generation
 

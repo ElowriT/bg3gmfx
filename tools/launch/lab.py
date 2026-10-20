@@ -200,7 +200,7 @@ CATEGORIES = [
     ("G-buffer", r"_DEF_"),
     ("fog and clouds", r"Fog|Volumetric|Clouds"),
     ("lighting and decals", r"ClusteredLighting|Cluster|Decal|DirLight|Light"),
-    ("ambient occlusion", r"SSAO|GTAO|HBAO"),
+    ("ambient occlusion", r"SSAO|GTAO|HBAO|PPSAO"),
     ("TAA and upscaling", r"PPTAA|FSR|BG3MFX|MetalFX"),
     ("post-processing", r"\|PP|^PP|Bloom|ToneMap|ColorGrading|SSSS|Outline|Exposure|RoomTrigger"),
     ("UI and HUD", r"31_|CombineUI|libMTLHud"),
