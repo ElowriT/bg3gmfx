@@ -14,7 +14,7 @@ game files on disk.
 
 BG3GMFX is [ElowriT](https://github.com/ElowriT)'s fork of
 [BG3MFX](https://github.com/AndrewTriesToCode/bg3mfx) by AndrewTriesToCode,
-based on its 0.3.0 release. It keeps every BG3MFX feature below and adds:
+based on its 0.3.1 release. It keeps every BG3MFX feature below and adds:
 
 | Change | What you get |
 | --- | --- |
