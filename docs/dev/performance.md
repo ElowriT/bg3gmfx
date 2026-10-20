@@ -255,6 +255,32 @@ samples) and cut its protected Lua call time by 14%.
   changes, foliage shadow cuts beyond resolution, the room-trigger mask and
   velocity passes.
 
+## Power at 30 FPS, split screen (October 20, 2026)
+
+Whole-machine power from `tools/analysis/socpower.c`, 30 s per row, M5 Pro,
+2560×1440, BG3 started from Steam with the overlay and lab mode, MetalFX
+Temporal Quality, two-player split screen with lab virtual controllers, a
+static camera. Rows remove one thing with a lab `skip` rule (wrong image, real
+cost) or switch the upscaler with lab `scaling`. Two baselines 30 min apart
+agreed within 0.2 W.
+
+| Row | Total | GPU | Memory and fabric | CPU (machine) |
+| --- | --- | --- | --- | --- |
+| Baseline | 20.1 W | 8.8 | 4.4 | 4.5 |
+| MetalFX Spatial instead of Temporal | 16.6 | 7.2 | 3.7 | 4.1 |
+| FSR 1.0 instead of Temporal | 16.3 | 7.1 | 3.6 | 4.2 |
+| Without volumetric fog and clouds | 18.1 | 8.2 | 3.7 | 4.2 |
+| Without SSAO | 19.7 | 8.3 | 4.2 | 5.0 |
+| Without sharpening (RCAS replay) | 19.4 | 8.4 | 4.3 | 4.5 |
+| Without shadow depth, tone map LUT or SSSS | about 20.0 | | | |
+| One view, Temporal | 16.6 | 7.6 | 3.9 | 3.1 |
+
+MetalFX Temporal is the largest single cost (about 3.5 W against Spatial or FSR
+at the same render size), then volumetric fog and clouds. BG3 itself used
+1.9 W of CPU in split screen; the rest of the machine's CPU power came from
+other applications. Skipping bloom or the outline passes broke the chain that
+MetalFX follows and fell back to FSR, so those rows measure nothing useful.
+
 ## Tools
 
 - `tools/analysis/hudfps.sh [seconds]`: mean/min fps from the Metal HUD log.
