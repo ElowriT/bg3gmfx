@@ -18,6 +18,14 @@
 - (id<MTLTexture>)encodeScene:(id<MTLTexture>)scene depth:(id<MTLTexture>)depth motion:(id<MTLTexture>)motion
                       camera:(NSData *)camera parameters:(BG3MFXFrameParameters)p deltaTime:(float)delta
                commandBuffer:(id<MTLCommandBuffer>)buffer error:(NSError **)error;
+// One split-screen view: interpolates the region of `scene` at `sceneOrigin`
+// from depth and motion at `inputOrigin`, sized as this interpolator's output
+// and input. Regions are read through the pooled copies, so an interpolator
+// for a view is made without textures (-initWithDevice:width:height:...).
+- (id<MTLTexture>)encodeScene:(id<MTLTexture>)scene origin:(MTLOrigin)sceneOrigin depth:(id<MTLTexture>)depth
+                       motion:(id<MTLTexture>)motion origin:(MTLOrigin)inputOrigin camera:(NSData *)camera
+                   parameters:(BG3MFXFrameParameters)p deltaTime:(float)delta
+                commandBuffer:(id<MTLCommandBuffer>)buffer error:(NSError **)error;
 - (void)resetHistory;
 @end
 

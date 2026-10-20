@@ -2,8 +2,8 @@
 
 Technical name: `split-screen-upscaling`.
 
-Active with MetalFX Spatial and Temporal whenever BG3 renders more than one
-view. A single view is unchanged.
+Active with MetalFX Spatial and Temporal, and with MetalFX Frame Generation,
+whenever BG3 renders more than one view. A single view is unchanged.
 
 In split screen BG3 renders each view into its own rectangle of shared
 full-size textures and runs FSR over the whole frame once per view. The
@@ -39,6 +39,14 @@ about 2.1 ms of MetalFX time for both views, and no visible seam. In split
 screen the Metal HUD shows "Jitter Sequence Len 1": both views' scalers encode
 the same jitter one after the other. BG3's TAA constants still change the jitter
 every frame, as in a single view.
+With MetalFX Frame Generation, each view is interpolated on its own too, from
+its rectangles of the scene, depth and motion and with its own camera and
+history, and the views' results make up the generated frame (see
+[architecture](../../../docs/dev/architecture.md#frame-generation)). Not yet
+checked live.
 `split-screen-upscale-smoke` renders two views with different contents and
 checks that each output half holds only its own view, that every view gets its
-own Temporal scaler, and that a single view still uses one.
+own Temporal scaler, and that a single view still uses one. With
+`frame-generation` it also composes the frame with the UI and checks that each
+view gets its own interpolator and that the generated frame matches the real
+one in both halves.

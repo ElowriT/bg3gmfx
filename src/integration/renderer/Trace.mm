@@ -85,6 +85,20 @@ static bool frameGeneration(id buffer) { return [objc_getAssociatedObject(buffer
 // followed through post-processing: for MetalFX Spatial and Temporal, and for
 // every Upscaling Type while Frame Generation needs them at the composition.
 static bool sceneTracked(int mode, id buffer) { return mode == 2 || mode == 3 || (buffer && frameGeneration(buffer)); }
+// Split screen: each view's depth, motion and camera from its TAA pass, by view
+// rectangle. The scene that reaches the composition carries the last view's;
+// Frame Generation interpolates every view of the frame on its own.
+static char frameGenerationViewsKey;
+static void noteFrameGenerationView(id<MTLCommandBuffer> buffer, NSDictionary *inputs) {
+    NSArray *view = inputs[@"view"];
+    if (!view || !inputs[@"depth"] || !buffer || !frameGeneration(buffer)) return;
+    NSMutableDictionary *views = objc_getAssociatedObject(buffer,&frameGenerationViewsKey);
+    if (!views) {
+        views = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(buffer,&frameGenerationViewsKey,views,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    views[[view componentsJoinedByString:@","]] = inputs;
+}
 
 // Per-encoder hook state, one object per encoder. BG3 issues about 12,000 draws
 // and many more binds per frame; sampling showed half of its render thread in
@@ -1390,6 +1404,12 @@ static BG3MFXFrameInterpolation *frameInterpolator;
 static BG3MFXFramePresenter *framePresenter;
 static NSString *frameConfiguration;
 static double previousFrameTime;
+// Split screen: one interpolator, and so one history, per view, by view rectangle.
+static NSMutableDictionary<NSString *, BG3MFXFrameInterpolation *> *frameViewInterpolators;
+static NSString *frameViewConfiguration;
+#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+static std::atomic<NSUInteger> frameInterpolatorsCreated{0};
+#endif
 // Menu callbacks run on another thread; the render thread applies their reset
 // at its next generated frame instead of touching its objects concurrently.
 static std::atomic<bool> frameGenerationResetPending{false};
@@ -1400,6 +1420,7 @@ static void releaseFrameGeneration(void) {
     BG3MFXFramePresenter *presenter;
     { std::lock_guard<std::recursive_mutex> lock(guard()); presenter=framePresenter; framePresenter=nil; }
     frameInterpolator=nil; frameConfiguration=nil; previousFrameTime=0;
+    frameViewInterpolators=nil; frameViewConfiguration=nil;
     if (presenter) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{ (void)presenter; });
     record(@{@"event":@"frameGenerationReleased"});
 }
@@ -1938,6 +1959,7 @@ static void endEncoder(id self, SEL cmd) {
                 objc_setAssociatedObject(commandBuffer,&temporalFrameKey,frames,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
             frames[[NSValue valueWithPointer:(__bridge const void *)temporalInputs[@"taaColor"]]] = temporalInputs;
+            noteFrameGenerationView(commandBuffer,temporalInputs);
         }
         if (temporalMode && (!replaceTAA || copyTemporalAAColor(commandBuffer,temporalInputs))) {
             labRecord(@{@"event":@"temporalFrameStored",@"taaColor":texture(temporalInputs[@"taaColor"]),@"view":temporalInputs[@"view"] ?: @[]});
@@ -1947,6 +1969,7 @@ static void endEncoder(id self, SEL cmd) {
                 objc_setAssociatedObject(commandBuffer,&temporalFrameKey,frames,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
             frames[[NSValue valueWithPointer:(__bridge const void *)temporalInputs[@"taaColor"]]] = temporalInputs;
+            noteFrameGenerationView(commandBuffer,temporalInputs);
         }
     }
     int replacementMode = [fsrInputs[@"mode"] intValue];
@@ -1999,6 +2022,10 @@ static void endEncoder(id self, SEL cmd) {
                 upscaled = upscaleView(commandBuffer,viewInputs,@[@"color",@"depth",@"motion"],intermediate ?: destination,
                     ^BOOL(NSDictionary *cropped, id<MTLTexture> output) { return upscaleTemporal(commandBuffer,cropped,output,tag); });
                 if (!upscaled && !temporalFailed) failTemporal(@"Could not upscale a split-screen view.");
+                // Frame Generation follows the frame from BG3's output (sharpened
+                // into it or written directly), with this view's full-size inputs.
+                if (upscaled && frameGeneration(commandBuffer))
+                    frames[[NSValue valueWithPointer:(__bridge const void *)destination]] = frame;
             } else upscaled = upscaleTemporal(commandBuffer,frame,intermediate ?: destination);
             if (upscaled && intermediate) {
                 sharpenInto(commandBuffer,fsrInputs,intermediate);
@@ -2256,6 +2283,71 @@ static void recordDisplayed(BOOL generated, CFTimeInterval time, CFTimeInterval 
     realToGenerated.clear(); generatedToReal.clear(); lateness[0].clear(); lateness[1].clear(); intervals.clear();
 }
 #endif
+// Split screen: the views must tile the frame exactly, as BG3 lays them out;
+// any other layout is presented unpaired.
+static BOOL viewsTileFrame(NSArray<NSDictionary *> *views) {
+    id<MTLTexture> depth=views.firstObject[@"depth"];
+    if (views.count<2 || !depth) return NO;
+    NSUInteger area=0;
+    for (NSUInteger i=0;i<views.count;++i) {
+        MTLRegion r=BG3MFXViewRegion(views[i][@"view"]);
+        id<MTLTexture> z=views[i][@"depth"], m=views[i][@"motion"];
+        if (z.width!=depth.width || z.height!=depth.height || m.width<r.origin.x+r.size.width || m.height<r.origin.y+r.size.height ||
+            r.origin.x+r.size.width>depth.width || r.origin.y+r.size.height>depth.height) return NO;
+        for (NSUInteger k=0;k<i;++k) {
+            MTLRegion o=BG3MFXViewRegion(views[k][@"view"]);
+            if (r.origin.x<o.origin.x+o.size.width && o.origin.x<r.origin.x+r.size.width &&
+                r.origin.y<o.origin.y+o.size.height && o.origin.y<r.origin.y+r.size.height) return NO;
+        }
+        area+=r.size.width*r.size.height;
+    }
+    return area==depth.width*depth.height;
+}
+// Each view is interpolated on its own, with its camera and history, from its
+// rectangles of BG3's scene, depth and motion; the results are placed into one
+// full scene for the composition. Returns nil with `error` set on failure.
+static id<MTLTexture> interpolateViews(id<MTLCommandBuffer> buffer, id<MTLTexture> scene, NSArray<NSDictionary *> *views,
+                                       NSString *configuration, BOOL reset, double interval, NSError **error) {
+    auto failed=[error](NSString *reason) {
+        if (error && !*error) *error=[NSError errorWithDomain:@"BG3MetalFX" code:1 userInfo:@{NSLocalizedDescriptionKey:reason ?: @""}];
+    };
+    if (![configuration isEqualToString:frameViewConfiguration]) {
+        frameViewInterpolators=[NSMutableDictionary dictionary]; frameViewConfiguration=configuration;
+    }
+    BG3MFXViewRegions *regions=[BG3MFXViewRegions sharedForDevice:buffer.device];
+    id<MTLTexture> full=[regions textureWidth:scene.width height:scene.height format:MTLPixelFormatRGBA16Float commandBuffer:buffer];
+    if (!full) { failed(@"Could not allocate the split-screen generated scene."); return nil; }
+    for (NSDictionary *view in views) {
+        id<MTLTexture> depth=view[@"depth"];
+        MTLRegion in=BG3MFXViewRegion(view[@"view"]);
+        MTLRegion out=BG3MFXScaleViewRegion(view[@"view"],depth.width,depth.height,scene.width,scene.height);
+        NSString *key=[NSString stringWithFormat:@"%@>%lux%lu",[view[@"view"] componentsJoinedByString:@","],
+            (unsigned long)out.size.width,(unsigned long)out.size.height];
+        BG3MFXFrameInterpolation *interpolator=frameViewInterpolators[key];
+        if (!interpolator) {
+            interpolator=[[BG3MFXFrameInterpolation alloc] initWithDevice:buffer.device width:in.size.width height:in.size.height
+                outputWidth:out.size.width outputHeight:out.size.height error:error];
+            if (!interpolator) { failed(@"Could not initialize frame generation for a split-screen view."); return nil; }
+            interpolator.failureHandler=^(NSError *e){declineFrameGeneration(e.localizedDescription ?: @"Metal could not complete frame generation.");};
+            frameViewInterpolators[key]=interpolator;
+#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+            ++frameInterpolatorsCreated;
+#endif
+            record(@{@"event":@"frameGenerationCreated",@"api":interpolator.usesMetal4 ? @"metal4" : @"metal3",
+                @"input":texture(depth),@"scene":texture(scene),@"view":view[@"view"]});
+        }
+        BG3MFXFrameParameters parameters={}; NSString *reason=nil;
+        if (!temporalParameters(view,&parameters,&reason)) { failed(reason); return nil; }
+        parameters.reset=parameters.reset || reset;
+        id<MTLTexture> generated=[interpolator encodeScene:scene origin:out.origin depth:depth motion:view[@"motion"]
+            origin:in.origin camera:view[@"camera"] parameters:parameters deltaTime:interval commandBuffer:buffer error:error];
+        if (!generated) { failed(@"Could not encode a split-screen view's generated frame."); return nil; }
+        if (![regions place:generated into:full at:out.origin commandBuffer:buffer]) {
+            failed(@"Could not place a split-screen view's generated frame."); return nil;
+        }
+    }
+    return full;
+}
 static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *request) {
     id<MTLTexture> scene=request[@"scene"], ui=request[@"ui"], target=request[@"target"];
     // Only frames composed into a stand-in drawable can be paired. A frame that
@@ -2264,6 +2356,11 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
     { std::lock_guard<std::recursive_mutex> lock(guard()); presenter=framePresenter; }
     if(![presenter ownsTexture:target]) return;
     NSDictionary *inputs=request[@"inputs"];
+    NSArray<NSDictionary *> *views=request[@"views"];
+    if(views && !viewsTileFrame(views)) {
+        record(@{@"event":@"frameGenerationUnpaired",@"reason":@"split-screen views do not tile the frame",@"views":@(views.count)});
+        return;
+    }
     id<MTLTexture> depth=inputs[@"depth"], motion=inputs[@"motion"];
     BG3MFXFrameParameters parameters={}; NSString *reason=nil;
     if(!temporalParameters(inputs,&parameters,&reason)) { declineFrameGeneration(reason); return; }
@@ -2271,22 +2368,39 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
         depth.width,depth.height,scene.width,scene.height,[objc_getAssociatedObject(buffer,&bufferScalingModeKey) intValue],target.pixelFormat,
         scene.pixelFormat,scene.usage,depth.pixelFormat,depth.usage,motion.pixelFormat,motion.usage];
     NSError *error=nil;
-    if(![configuration isEqualToString:frameConfiguration]) {
+    if(views) { frameInterpolator=nil; frameConfiguration=nil; }
+    else if(![configuration isEqualToString:frameConfiguration]) {
+        frameViewInterpolators=nil; frameViewConfiguration=nil;
         frameInterpolator=[[BG3MFXFrameInterpolation alloc] initWithDevice:buffer.device scene:scene depth:depth motion:motion error:&error];
         if(!frameInterpolator) {declineFrameGeneration(error.localizedDescription ?: @"Could not initialize frame generation.");return;}
         frameInterpolator.failureHandler=^(NSError *e){declineFrameGeneration(e.localizedDescription ?: @"Metal could not complete frame generation.");};
         frameConfiguration=configuration;previousFrameTime=0;
+#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+        ++frameInterpolatorsCreated;
+#endif
         record(@{@"event":@"frameGenerationCreated",@"api":frameInterpolator.usesMetal4 ? @"metal4" : @"metal3",
             @"input":texture(depth),@"scene":texture(scene),@"direct":@[@(frameInterpolator.directColor),
             @(frameInterpolator.directDepth),@(frameInterpolator.directMotion)]});
     }
-    if(frameGenerationResetPending.exchange(false)) { [frameInterpolator resetHistory]; previousFrameTime=0; }
+    if(frameGenerationResetPending.exchange(false)) {
+        [frameInterpolator resetHistory];
+        for(BG3MFXFrameInterpolation *interpolator in frameViewInterpolators.allValues) [interpolator resetHistory];
+        previousFrameTime=0;
+    }
     double now=NSProcessInfo.processInfo.systemUptime;
     double interval=previousFrameTime>0 ? now-previousFrameTime : 1.0/60;
     previousFrameTime=now;
     if(interval<=0 || interval>0.1) {parameters.reset=YES;interval=1.0/60;}
     encodingFrameGeneration=true;
-    id<MTLTexture> interpolated=[frameInterpolator encodeScene:scene depth:depth motion:motion camera:inputs[@"camera"]
+    id<MTLTexture> interpolated;
+    if(views) {
+        // The layout is part of the configuration: another layout starts over.
+        NSMutableArray *layout=[NSMutableArray array];
+        for(NSDictionary *view in views) [layout addObject:[view[@"view"] componentsJoinedByString:@","]];
+        [layout sortUsingSelector:@selector(compare:)];
+        interpolated=interpolateViews(buffer,scene,views,[configuration stringByAppendingFormat:@"|%@",[layout componentsJoinedByString:@";"]],
+            parameters.reset,interval,&error);
+    } else interpolated=[frameInterpolator encodeScene:scene depth:depth motion:motion camera:inputs[@"camera"]
         parameters:parameters deltaTime:interval commandBuffer:buffer error:&error];
     if(!interpolated) {encodingFrameGeneration=false;declineFrameGeneration(error.localizedDescription ?: @"Could not encode the generated frame.");return;}
     // BG3's own CombineUI already composes the real frame into the stand-in;
@@ -2329,6 +2443,7 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
     objc_setAssociatedObject(buffer,&generatedPairKey,@{@"generated":generated,@"presenter":presenter,
         @"interval":@(interval),@"target":target},OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     record(@{@"event":@"frameGenerationEncoded",@"scene":texture(scene),@"generated":texture(generated),@"reset":@(parameters.reset),
+        @"views":@(views.count),
         @"interval":@(interval),@"mode":objc_getAssociatedObject(buffer,&bufferScalingModeKey) ?: @0,
         @"target":texture(target),@"buffer":@((uintptr_t)(__bridge void *)buffer)});
 }
@@ -2422,8 +2537,6 @@ static void captureSceneInputs(id encoder, NSString *fragment) {
     }
     NSArray *view = nil;
     if (!sceneView(encoder,source,&view)) { labRecord(@{@"event":@"sceneCaptureSkipped",@"reason":@"unsupported viewport"}); return; }
-    // Frame Generation pairs whole frames only.
-    if (spatialSeed && view) return;
     if (spatialSeed) {
         NSMutableDictionary *inputs = [spatialSeed mutableCopy];
         [inputs addEntriesFromDictionary:@{@"depth": depth, @"motion": motion, @"camera": camera, @"temporal": temporal, @"reset":@(resetMotion)}];
@@ -2607,6 +2720,7 @@ static void captureFrameComposition(id encoder, const CompositionDraw &call) {
         @"vertexOffset":@(vertexBinding->offset),@"constants":constants,@"sampler":sampler,
         @"draw":[NSData dataWithBytes:&draw length:sizeof(draw)]} mutableCopy];
     if(vertexBinding->buffer) request[@"vertices"]=vertexBinding->buffer; else request[@"vertexBytes"]=vertexBytes;
+    if(inputs[@"view"]) request[@"views"]=[objc_getAssociatedObject(buffer,&frameGenerationViewsKey) allValues] ?: @[];
     if(call.indexBuffer) request[@"indexBuffer"]=call.indexBuffer;
     if(s->hasViewport) request[@"viewport"]=[NSData dataWithBytes:&s->viewport length:sizeof(s->viewport)];
     if(s->hasScissor) request[@"scissor"]=[NSData dataWithBytes:&s->scissor length:sizeof(s->scissor)];
@@ -3380,6 +3494,7 @@ static id commandBuffer(id self, SEL cmd) {
     objc_setAssociatedObject(buffer,&generatedPairKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(buffer,&deferredPresentKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(buffer,&temporalFrameKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(buffer,&frameGenerationViewsKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 #ifndef BG3MFX_NO_TRACE
     objc_setAssociatedObject(buffer,&temporalPassHistoryKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 #endif
@@ -3508,6 +3623,10 @@ extern "C" NSDictionary *BG3MFXStandaloneGeneratedPair(id<MTLCommandBuffer> buff
 extern "C" NSUInteger BG3MFXStandaloneTemporalScalersCreated(void) {
     if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return 0;
     return temporalScalersCreated.load();
+}
+extern "C" NSUInteger BG3MFXStandaloneFrameInterpolatorsCreated(void) {
+    if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return 0;
+    return frameInterpolatorsCreated.load();
 }
 extern "C" NSUInteger BG3MFXStandalonePresentedPairs(void) {
     if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return 0;

@@ -31,7 +31,7 @@ $(BIN_DIR)/split-screen-fog-smoke: tests/features/split-screen-fog/split_screen_
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
 
 $(BIN_DIR)/split-screen-upscale-smoke: tests/features/split-screen-upscaling/split_screen_upscale_smoke.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -o $@
 
 $(BIN_DIR)/spatial-hook-smoke: tests/features/metalfx-spatial-upscaling/spatial_hook_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework AppKit -o $@
@@ -186,6 +186,8 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib frame-generation
+	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib frame-generation
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: $(BIN_DIR)/bg3mfx

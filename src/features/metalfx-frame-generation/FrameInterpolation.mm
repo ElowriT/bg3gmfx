@@ -108,8 +108,9 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
     _directMotion=_effect && fgUsable(motion,_effect.motionTextureUsage) && motion.width==w && motion.height==h;
     if (_effect4) _bridge=[[BG3MFXMetal4Bridge alloc] initWithDevice:device label:@"BG3 Metal 4 Frame Generation" error:error];
     NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
-        "kernel void Copy(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height())))d.write(s.read(p),p);}\n"
-        "kernel void Depth(depth2d<float> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height()))){constexpr sampler q(coord::pixel,filter::nearest);d.write(s.sample(q,float2(p)+.5),p);}}";
+        // `o`: the region's origin in the source (a split-screen view's).
+        "kernel void Copy(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint2 &o [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height())))d.write(s.read(p+o),p);}\n"
+        "kernel void Depth(depth2d<float> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint2 &o [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height()))){constexpr sampler q(coord::pixel,filter::nearest);d.write(s.sample(q,float2(p+o)+.5),p);}}";
     auto library=[device newLibraryWithSource:source options:nil error:error];
     _copy=library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"Copy"] error:error] : nil;
     _copyDepth=library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"Depth"] error:error] : nil;
@@ -127,8 +128,22 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
 - (id<MTLTexture>)encodeScene:(id<MTLTexture>)scene depth:(id<MTLTexture>)depth motion:(id<MTLTexture>)motion
                       camera:(NSData *)camera parameters:(BG3MFXFrameParameters)p deltaTime:(float)delta
                commandBuffer:(id<MTLCommandBuffer>)buffer error:(NSError **)error {
-    if (scene.width!=_outW || scene.height!=_outH || depth.width!=_w || depth.height!=_h ||
-        motion.width!=_w || motion.height!=_h || motion.pixelFormat!=MTLPixelFormatRG16Float ||
+    if (scene.width!=_outW || scene.height!=_outH || depth.width!=_w || depth.height!=_h || motion.width!=_w || motion.height!=_h) {
+        if (error) *error=fgError(@"Frame generation received unsupported scene, depth, motion, or camera inputs."); return nil;
+    }
+    return [self encodeScene:scene origin:MTLOriginMake(0,0,0) depth:depth motion:motion origin:MTLOriginMake(0,0,0)
+                      camera:camera parameters:p deltaTime:delta commandBuffer:buffer error:error];
+}
+- (id<MTLTexture>)encodeScene:(id<MTLTexture>)scene origin:(MTLOrigin)sceneOrigin depth:(id<MTLTexture>)depth
+                       motion:(id<MTLTexture>)motion origin:(MTLOrigin)inputOrigin camera:(NSData *)camera
+                   parameters:(BG3MFXFrameParameters)p deltaTime:(float)delta
+                commandBuffer:(id<MTLCommandBuffer>)buffer error:(NSError **)error {
+    // Inputs read in place are exactly the effect's size; the copies read a region.
+    BOOL whole=!sceneOrigin.x && !sceneOrigin.y && !inputOrigin.x && !inputOrigin.y && scene.width==_outW && scene.height==_outH &&
+        depth.width==_w && depth.height==_h && motion.width==_w && motion.height==_h;
+    if (scene.width<sceneOrigin.x+_outW || scene.height<sceneOrigin.y+_outH ||
+        depth.width<inputOrigin.x+_w || depth.height<inputOrigin.y+_h || motion.width<inputOrigin.x+_w || motion.height<inputOrigin.y+_h ||
+        ((_directColor || _directDepth || _directMotion) && !whole) || motion.pixelFormat!=MTLPixelFormatRG16Float ||
         scene.framebufferOnly || camera.length<224 || !std::isfinite(delta) || delta<=0 ||
         !(scene.usage&MTLTextureUsageShaderRead) || !(depth.usage&MTLTextureUsageShaderRead) ||
         depth.hazardTrackingMode==MTLHazardTrackingModeUntracked || motion.hazardTrackingMode==MTLHazardTrackingModeUntracked) {
@@ -162,8 +177,9 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
         for (NSUInteger i=0;i<3;++i) {
             id<MTLTexture> t=targets[i];
             if (t==sources[i]) continue;
+            MTLOrigin origin=i==0 ? sceneOrigin : inputOrigin; uint32_t o[2]={uint32_t(origin.x),uint32_t(origin.y)};
             [encoder setComputePipelineState:i==1 ? _copyDepth : _copy];
-            [encoder setTexture:sources[i] atIndex:0]; [encoder setTexture:t atIndex:1];
+            [encoder setTexture:sources[i] atIndex:0]; [encoder setTexture:t atIndex:1]; [encoder setBytes:o length:sizeof(o) atIndex:0];
             [encoder dispatchThreads:MTLSizeMake(t.width,t.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         }
         [encoder endEncoding];

@@ -123,7 +123,8 @@ whole frame once per view.
   color, depth and motion are cropped, upscaled by the view's own scaler (own
   Temporal history) and placed into its rectangle of the output. Scene
   associations follow BG3's blit copies between bloom and colour grading.
-  Frame Generation pairs whole frames only and stays unpaired in split screen.
+  With Frame Generation, each view is also interpolated on its own (see
+  [Frame Generation](#frame-generation)).
 
 ## Frame Generation
 
@@ -147,7 +148,14 @@ recognized color passes and tone mapping then carry them to `CombineUI`. Jitter
 comes from BG3's constants, so the native eight-phase sequence is described as
 is. Frames that reach `CombineUI` without these inputs (menus, loading screens,
 native-FSR fallback frames) are presented unpaired, and pairing resumes with the
-next frame that has them. With `BG3MFX_TRACE_TEMPORAL_CHAIN=1`, the diagnostic
+next frame that has them. In split screen each view's TAA pass records its
+depth, motion and camera, and the scene that reaches `CombineUI` carries the
+last view's. Each view is then interpolated on its own, with an interpolator
+(and so a history) per view: its rectangles of BG3's scene, depth and motion
+are copied into the interpolator's inputs (the copies an unsplit frame needs
+only for formats MetalFX cannot read), and the results are placed into one
+full scene that `CombineUI` composes as usual. A frame whose views do not tile
+it exactly is presented unpaired. With `BG3MFX_TRACE_TEMPORAL_CHAIN=1`, the diagnostic
 runtime records the recent pass chain in each `frameGenerationNoScene` event.
 A live trace (October 13) showed Off + Frame Generation losing the scene at
 CAS, which reads the tone-mapped RGB10A2 scene and writes the one `CombineUI`

@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include <dlfcn.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -9,6 +11,9 @@
 // over the whole frame once per view. MetalFX Spatial and Temporal must upscale
 // each view on its own (Temporal with a scaler, and so a history, per view),
 // write only that view's half, and never blend the two halves at the seam.
+// "frame-generation": with Frame Generation, each view is also interpolated on
+// its own (an interpolator per view), and the generated frame composes like
+// the real one in both halves.
 static id<MTLTexture> texture(id<MTLDevice> device, NSUInteger width, NSUInteger height, MTLPixelFormat format, MTLTextureUsage usage) {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
     d.storageMode = MTLStorageModePrivate; d.usage = usage;
@@ -16,13 +21,18 @@ static id<MTLTexture> texture(id<MTLDevice> device, NSUInteger width, NSUInteger
 }
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc != 2) return 1;
+        if (argc != 2 && !(argc == 3 && !strcmp(argv[2],"frame-generation"))) return 1;
+        bool fg = argc == 3;
         setenv("BG3MFX_ENABLE_METALFX","1",1);
         void *runtime = dlopen(argv[1],RTLD_NOW | RTLD_LOCAL);
         if (!runtime) { fprintf(stderr,"%s\n",dlerror()); return 2; }
         auto select = (BOOL(*)(int))dlsym(runtime,"BG3MFXSetStandaloneScalingMode");
         auto created = (NSUInteger(*)(void))dlsym(runtime,"BG3MFXStandaloneTemporalScalersCreated");
-        if (!select || !created) return 3;
+        auto setFrameGeneration = (BOOL(*)(BOOL))dlsym(runtime,"BG3MFXSetStandaloneFrameGeneration");
+        auto pair = (NSDictionary *(*)(id<MTLCommandBuffer>))dlsym(runtime,"BG3MFXStandaloneGeneratedPair");
+        auto presented = (NSUInteger(*)(void))dlsym(runtime,"BG3MFXStandalonePresentedPairs");
+        auto interpolators = (NSUInteger(*)(void))dlsym(runtime,"BG3MFXStandaloneFrameInterpolatorsCreated");
+        if (!select || !created || !setFrameGeneration || !pair || !presented || !interpolators) return 3;
         const char *sharpeningSetting = getenv("BG3MFX_METALFX_SHARPENING");
         bool sharpening = !sharpeningSetting || strcmp(sharpeningSetting,"0");
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -34,6 +44,11 @@ int main(int argc, char **argv) {
             "fragment float2 VelocityBufferCamera_PS() {return float2(0);}\n"
             "fragment float4 PPTAA_PS(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return float4(src.read(uint2(p.xy)).rgb+0.25,1);}\n"
             "fragment float4 FSR_Tonemap(float4 p [[position]], texture2d<float> src [[texture(0)]]) {float3 c=src.read(uint2(p.xy)).rgb;return float4(c/(1+max(c.r,max(c.g,c.b))),1);}\n"
+            "fragment float4 PPToneMap_LUT(float4 p [[position]], texture2d<float> src [[texture(0)]]) {return float4(src.read(uint2(p.xy)).rgb*0.5,1);}\n"
+            // Like BG3's: a quad strip with texture coordinates over the whole output, once for both views.
+            "struct Q{float4 p [[position]];float2 uv;};vertex Q Quad(uint i [[vertex_id]]){float2 c=float2(i&1,i>>1);return {float4(c*2-1,0,1),float2(c.x,1-c.y)};}\n"
+            "struct C{float4 tint;};fragment float4 CombineUI(Q q [[stage_in]],texture2d<float> scene [[texture(0)]],texture2d<float> ui [[texture(1)]],constant C &c [[buffer(0)]],sampler s [[sampler(0)]])"
+            "{return float4(scene.sample(s,q.uv).rgb*.75+ui.sample(s,q.uv).rgb*.25,1)*c.tint;}\n"
             // Two views: the left half one color, the right half another.
             "kernel void Fill(texture2d<float,access::write> color [[texture(0)]], texture2d<float,access::write> motion [[texture(1)]], uint2 p [[thread_position_in_grid]]) {"
             "color.write(p.x < color.get_width()/2 ? float4(0.5,0.75,1.0,1) : float4(1.0,0.25,0.5,1),p);motion.write(float4(0),p);}\n"
@@ -51,10 +66,11 @@ int main(int argc, char **argv) {
             if (!state) return 5; [compute addObject:state];
         }
         NSMutableArray *render = [NSMutableArray array];
-        for (NSString *name in @[@"LinearizeDepth",@"PPTAA_PS",@"VelocityBufferCamera_PS",@"FSR_Tonemap"]) {
+        for (NSString *name in @[@"LinearizeDepth",@"PPTAA_PS",@"VelocityBufferCamera_PS",@"FSR_Tonemap",@"PPToneMap_LUT",@"CombineUI"]) {
             MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-            d.vertexFunction = [library newFunctionWithName:@"Fullscreen"]; d.fragmentFunction = [library newFunctionWithName:name];
-            d.colorAttachments[0].pixelFormat = [name isEqualToString:@"LinearizeDepth"] ? MTLPixelFormatR32Float : [name isEqualToString:@"VelocityBufferCamera_PS"] ? MTLPixelFormatRG16Float : MTLPixelFormatRG11B10Float;
+            d.vertexFunction = [library newFunctionWithName:[name isEqualToString:@"CombineUI"] ? @"Quad" : @"Fullscreen"]; d.fragmentFunction = [library newFunctionWithName:name];
+            d.colorAttachments[0].pixelFormat = [name isEqualToString:@"LinearizeDepth"] ? MTLPixelFormatR32Float : [name isEqualToString:@"VelocityBufferCamera_PS"] ? MTLPixelFormatRG16Float :
+                [name isEqualToString:@"PPToneMap_LUT"] ? MTLPixelFormatRGB10A2Unorm : [name isEqualToString:@"CombineUI"] ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRG11B10Float;
             id state = [device newRenderPipelineStateWithDescriptor:d error:&error];
             if (!state) { fprintf(stderr,"%s\n",error.description.UTF8String); return 6; } [render addObject:state];
         }
@@ -70,6 +86,16 @@ int main(int argc, char **argv) {
         id<MTLTexture> scaled = texture(device,OW,OH,MTLPixelFormatRGBA16Float,rw);
         id<MTLTexture> output = texture(device,OW,OH,MTLPixelFormatRG11B10Float,rw);
         id<MTLBuffer> pixels = [device newBufferWithLength:OW*OH*sizeof(float)*4 options:MTLResourceStorageModeShared];
+        // Frame Generation: BG3 tone-maps each view into the final scene, then composes it with the UI once.
+        id<MTLTexture> scene = texture(device,OW,OH,MTLPixelFormatRGB10A2Unorm,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
+        id<MTLTexture> ui = texture(device,OW,OH,MTLPixelFormatRGBA8Unorm,MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget);
+        id<MTLBuffer> vertices = [device newBufferWithLength:80 options:MTLResourceStorageModeShared];
+        id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
+        id<MTLBuffer> composites[2] = {[device newBufferWithLength:OW*OH*4 options:MTLResourceStorageModeShared],
+                                       [device newBufferWithLength:OW*OH*4 options:MTLResourceStorageModeShared]};
+        CAMetalLayer *layer = [CAMetalLayer layer]; layer.device = device; layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = NO; layer.drawableSize = CGSizeMake(OW,OH);
+        Class standIn = NSClassFromString(@"BG3MFXStandInDrawable");
         // Per view: FSR dispatches, RCAS dispatches, RCAS threads in the right half.
         id<MTLBuffer> count = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
         id<MTLBuffer> afterFirst = [device newBufferWithLength:OW*OH*sizeof(float)*4 options:MTLResourceStorageModeShared];
@@ -101,9 +127,14 @@ int main(int argc, char **argv) {
         for (int frame=0; frame<5; ++frame) {
             // Frame 0 runs Spatial (BG3's TAA kept, +0.25); later frames run Temporal per view.
             bool spatial = frame == 0;
-            if (!select(spatial ? 2 : 3)) return 7;
+            if (!select(spatial ? 2 : 3) || !setFrameGeneration(fg)) return 7;
             memset(count.contents,0,32);
+            id<CAMetalDrawable> drawable = fg ? [layer nextDrawable] : nil;
+            if (fg && ![drawable isKindOfClass:standIn]) { fprintf(stderr,"frame %d: Frame Generation did not give BG3 a stand-in drawable\n",frame); return 14; }
+            NSUInteger presentedBefore = fg ? presented() : 0;
             id<MTLCommandBuffer> b=[queue commandBufferWithUnretainedReferences];
+            // BG3 schedules its present before it encodes CombineUI.
+            if (fg) [b presentDrawable:drawable];
             id<MTLComputeCommandEncoder> c=[b computeCommandEncoder];
             [c setComputePipelineState:compute[0]]; [c setTexture:color atIndex:0]; [c setTexture:motion atIndex:1];
             [c dispatchThreads:MTLSizeMake(W,H,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [c endEncoding];
@@ -128,6 +159,14 @@ int main(int argc, char **argv) {
                 [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
                 [c setTexture:scaled atIndex:0]; [c setTexture:output atIndex:2]; [c setComputePipelineState:compute[2]];
                 [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [c endEncoding];
+                if (fg) {
+                    MTLRenderPassDescriptor *p=[MTLRenderPassDescriptor new]; p.colorAttachments[0].texture=scene;
+                    p.colorAttachments[0].loadAction=MTLLoadActionLoad; p.colorAttachments[0].storeAction=MTLStoreActionStore;
+                    id<MTLRenderCommandEncoder> e=[b renderCommandEncoderWithDescriptor:p];
+                    [e setViewport:(MTLViewport){double(view*OW/2),0,double(OW/2),double(OH),0,1}];
+                    [e setFragmentTexture:output atIndex:0]; [e setRenderPipelineState:render[4]];
+                    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [e endEncoding];
+                }
                 // BG3 tone-maps each view right after its RCAS: the left view's
                 // half must be final before the right view is processed.
                 if (view==0) {
@@ -139,6 +178,29 @@ int main(int argc, char **argv) {
             c=[b computeCommandEncoder]; [c setComputePipelineState:compute[3]];
             [c setTexture:output atIndex:0]; [c setBuffer:pixels offset:0 atIndex:0];
             [c dispatchThreads:MTLSizeMake(OW,OH,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)]; [c endEncoding];
+            NSDictionary *generatedPair = nil;
+            if (fg) {
+                MTLRenderPassDescriptor *p=[MTLRenderPassDescriptor new]; p.colorAttachments[0].texture=ui;
+                p.colorAttachments[0].loadAction=MTLLoadActionClear; p.colorAttachments[0].storeAction=MTLStoreActionStore;
+                p.colorAttachments[0].clearColor=MTLClearColorMake(.8,.2,.4,1);
+                [[b renderCommandEncoderWithDescriptor:p] endEncoding];
+                p=[MTLRenderPassDescriptor new]; p.colorAttachments[0].texture=drawable.texture;
+                p.colorAttachments[0].loadAction=MTLLoadActionDontCare; p.colorAttachments[0].storeAction=MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> e=[b renderCommandEncoderWithDescriptor:p];
+                float tint[4]={1,1,1,1};
+                [e setRenderPipelineState:render[5]]; [e setVertexBuffer:vertices offset:0 atIndex:0];
+                [e setFragmentBytes:tint length:sizeof(tint) atIndex:0]; [e setFragmentSamplerState:sampler atIndex:0];
+                [e setFragmentTexture:scene atIndex:0]; [e setFragmentTexture:ui atIndex:1];
+                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [e endEncoding];
+                generatedPair = pair(b);
+                if (!generatedPair) { fprintf(stderr,"frame %d: no generated pair for the split-screen frame\n",frame); return 15; }
+                id<MTLBlitCommandEncoder> blit=[b blitCommandEncoder];
+                id<MTLTexture> images[2]={drawable.texture,generatedPair[@"generated"]};
+                for (int i=0;i<2;++i)
+                    [blit copyFromTexture:images[i] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(OW,OH,1)
+                                 toBuffer:composites[i] destinationOffset:0 destinationBytesPerRow:OW*4 destinationBytesPerImage:OW*OH*4];
+                [blit endEncoding];
+            }
             [b commit]; [b waitUntilCompleted];
             if (b.status!=MTLCommandBufferStatusCompleted) { fprintf(stderr,"frame %d failed: %s\n",frame,b.error.description.UTF8String); return 8; }
             const uint32_t *n=(const uint32_t *)count.contents;
@@ -167,8 +229,27 @@ int main(int argc, char **argv) {
                     fprintf(stderr,"%s frame %d pixel %lu,%lu channel %d: %f != %f\n",spatial ? "Spatial" : "Temporal",frame,x,y,ch,actual,expected); return 10;
                 }
             }
+            if (fg) {
+                // A static scene: each half of the generated composite matches the
+                // real one, and the halves keep their own colors at the seam.
+                const uint8_t *real=(const uint8_t *)composites[0].contents, *generated=(const uint8_t *)composites[1].contents;
+                int worst=0;
+                for (NSUInteger i=0;i<OW*OH*4;++i) worst=std::max(worst,abs(int(real[i])-int(generated[i])));
+                int seam=abs(int(generated[((OH/2)*OW+OW/2-1)*4])-int(generated[((OH/2)*OW+OW/2)*4]));
+                if (worst>8 || seam<16) {
+                    fprintf(stderr,"%s frame %d: generated composite differs from the real one by %d, %d across the seam\n",spatial ? "Spatial" : "Temporal",frame,worst,seam); return 16;
+                }
+                for (int i=0;i<200 && presented()==presentedBefore;++i) [NSThread sleepForTimeInterval:.01];
+                if (presented()!=presentedBefore+1) { fprintf(stderr,"frame %d: the generated pair was not presented\n",frame); return 17; }
+            }
         }
         if (created()!=2) { fprintf(stderr,"%lu Temporal scalers for two split-screen views\n",(unsigned long)created()); return 11; }
+        // One interpolator per view for Spatial (frame 0) and again for Temporal.
+        if (fg && interpolators()!=4) { fprintf(stderr,"%lu frame interpolators for two views in two modes\n",(unsigned long)interpolators()); return 18; }
+        if (fg) {
+            puts("Split screen with Frame Generation: Spatial and Temporal upscaled and interpolated each view on its own (an interpolator per view), and the generated frame composed like the real one, halves intact at the seam.");
+            return 0;
+        }
         puts(sharpening ? "Split screen: Spatial and Temporal upscaled each view on its own, one Temporal scaler per view, no blending at the seam, and BG3's RCAS sharpened each view's pass."
                         : "Split screen: Spatial and Temporal upscaled each view on its own, one Temporal scaler per view, and no blending at the seam (sharpening off).");
     }
