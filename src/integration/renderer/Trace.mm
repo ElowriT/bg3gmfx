@@ -618,6 +618,8 @@ static std::atomic<unsigned> labGeneration{1};
 // 3 Temporal) for same-scene comparisons; GPU time feeds perf.json.
 static std::atomic<int> labScaling{-1};
 static std::atomic<uint64_t> labGPUNanoseconds{0}, labCommits{0}, labMetal4Nanoseconds{0};
+// Frame Generation: real frames presented with a generated one before them.
+static std::atomic<uint64_t> labGeneratedPairs{0};
 // Metal 4 bridge submissions (MetalFX Temporal on Metal 4) run outside BG3's
 // command buffers, which only wait for them; their own GPU time, for perf.json.
 static void labMetal4Timing(NSString *, double seconds) {
@@ -1084,19 +1086,20 @@ static void labWriteDumps(id<MTLCommandBuffer> buffer, __unsafe_unretained id en
 }
 // About once a second: presented frames, command buffers and GPU busy time.
 static void labPerf(void) {
-    static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU, lastMetal4;
+    static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU, lastMetal4, lastPairs;
     double now = CACurrentMediaTime();
     if (now - last < 1.0) return;
     uint64_t commits = labCommits.load(), gpu = labGPUNanoseconds.load(), metal4 = labMetal4Nanoseconds.load();
+    uint64_t pairs = labGeneratedPairs.load();
     if (last) {
         double span = now - last, presented = (double)(frames - lastFrames);
         labMetal4MsPerFrame = presented ? (metal4-lastMetal4)*1e-6/presented : 0;
         labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
             @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),
             @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames),
-            @"metal4Reordered":@(BG3MFXMetal4Reordered())});
+            @"metal4Reordered":@(BG3MFXMetal4Reordered()),@"generatedPerSecond":@((pairs-lastPairs)/span)});
     }
-    last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu; lastMetal4 = metal4;
+    last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu; lastMetal4 = metal4; lastPairs = pairs;
 }
 static void labFrameBoundary(void) {
     labPoll();
@@ -1392,6 +1395,7 @@ static std::atomic<bool> frameGenerationDeclined{false};
 static void declineFrameGeneration(NSString *reason) {
     if(frameGenerationDeclined.exchange(true)) return;
     record(@{@"event":@"frameGenerationDeclined",@"reason":reason ?: @""});
+    labRecord(@{@"event":@"frameGenerationDeclined",@"reason":reason ?: @""});
     fprintf(stderr,"MetalFX Frame Generation is off: %s\n",(reason ?: @"").UTF8String); fflush(stderr);
     showNotice(@"MetalFX Frame Generation is off",[(reason ?: @"") stringByAppendingString:
         @"\n\nThe game continues with the selected Upscaling Type and without Frame Generation. "
@@ -2359,6 +2363,7 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
     NSArray<NSDictionary *> *views=request[@"views"];
     if(views && !viewsTileFrame(views)) {
         record(@{@"event":@"frameGenerationUnpaired",@"reason":@"split-screen views do not tile the frame",@"views":@(views.count)});
+        labRecord(@{@"event":@"frameGenerationUnpaired",@"reason":@"split-screen views do not tile the frame",@"views":@(views.count)});
         return;
     }
     id<MTLTexture> depth=inputs[@"depth"], motion=inputs[@"motion"];
@@ -2442,6 +2447,7 @@ static void encodeGeneratedPair(id<MTLCommandBuffer> buffer, NSDictionary *reque
     encodingFrameGeneration=false;
     objc_setAssociatedObject(buffer,&generatedPairKey,@{@"generated":generated,@"presenter":presenter,
         @"interval":@(interval),@"target":target},OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    labRecord(@{@"event":@"frameGenerationEncoded",@"views":@(views.count),@"reset":@(parameters.reset),@"interval":@(interval)});
     record(@{@"event":@"frameGenerationEncoded",@"scene":texture(scene),@"generated":texture(generated),@"reset":@(parameters.reset),
         @"views":@(views.count),
         @"interval":@(interval),@"mode":objc_getAssociatedObject(buffer,&bufferScalingModeKey) ?: @0,
@@ -3381,6 +3387,7 @@ static void commit(id self, SEL cmd) {
     id<CAMetalDrawable> drawable=request[@"drawable"];
     BOOL paired=drawable && pair && pair[@"target"]==drawable.texture;
     if (pair && !paired) [pair[@"presenter"] discardGeneratedTarget:pair[@"generated"] afterCommandBuffer:self];
+    if (paired && labEnabled) labGeneratedPairs.fetch_add(1,std::memory_order_relaxed);
     if (drawable) {
 #ifndef BG3MFX_NO_TRACE
         // BG3's vsync option toggles displaySyncEnabled on its layer at runtime.
