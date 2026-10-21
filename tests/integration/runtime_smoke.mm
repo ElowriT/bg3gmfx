@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -89,9 +90,23 @@ int main(int argc, const char **argv) {
         [encoder setComputePipelineState:compute]; [encoder setBuffer:computed offset:0 atIndex:0];
         [encoder dispatchThreads:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(4,1,1)];
         [encoder endEncoding];
-        // Another library exchanging -commit with a method of its own, as the
-        // Steam overlay does, leaves the runtime's hook under that selector.
+        // Another library exchanging a hooked method with one of its own, as
+        // the Steam overlay does, leaves the runtime's hook under that selector.
+        // With VSync BG3 presents with a minimum duration, whose hook shares its
+        // replacement with -presentDrawable:atTime:.
         Class committedClass = object_getClass(buffer);
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        layer.device = device; layer.pixelFormat = MTLPixelFormatBGRA8Unorm; layer.drawableSize = CGSizeMake(64,64);
+        id<CAMetalDrawable> drawable = [layer nextDrawable];
+        if (!drawable) return 11;
+        SEL timed = @selector(presentDrawable:afterMinimumDuration:);
+        SEL overlayTimed = sel_registerName("overlaySmoke_presentDrawable:afterMinimumDuration:");
+        class_addMethod(committedClass, overlayTimed, imp_implementationWithBlock(^(id self, id shown, CFTimeInterval duration) {
+            ((void(*)(id,SEL,id,CFTimeInterval))objc_msgSend)(self, overlayTimed, shown, duration);
+        }), "v@:@d");
+        method_exchangeImplementations(class_getInstanceMethod(committedClass, timed),
+                                       class_getInstanceMethod(committedClass, overlayTimed));
+        [buffer presentDrawable:drawable afterMinimumDuration:1.0/60];
         SEL overlayCommit = sel_registerName("overlaySmoke_commit");
         class_addMethod(committedClass, overlayCommit, imp_implementationWithBlock(^(id self) {
             ((void(*)(id,SEL))objc_msgSend)(self, overlayCommit);
@@ -105,7 +120,7 @@ int main(int argc, const char **argv) {
         uint8_t pixel[4];
         [texture getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(32,32,1,1) mipmapLevel:0];
         if (pixel[0] < 62 || pixel[0] > 65 || pixel[1] < 126 || pixel[1] > 129 || pixel[2] < 190 || pixel[2] > 193) return 7;
-        puts("Runtime loaded; hooked Metal command buffer completed, also with -commit exchanged by another library");
+        puts("Runtime loaded; hooked Metal command buffer completed, also with -commit and the timed present exchanged by another library");
     }
     return 0;
 }

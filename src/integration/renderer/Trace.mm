@@ -1209,19 +1209,27 @@ static IMP originalSlow(Class concrete, SEL selector, unsigned generation, Origi
         if (it != originals().end()) { entry = {concrete, selector, it->second, generation}; return it->second; }
     }
     // Another library exchanged a hooked method with one of its own (the Steam
-    // overlay does this for -commit), so a replacement runs under that
-    // library's selector. Find the hooked method by the replacement it carries.
+    // overlay does this for -commit and, with VSync, the timed present), so a
+    // replacement runs under that library's selector. Find the hooked method
+    // by the replacement it carries. One replacement can serve several
+    // selectors (presentTimed takes both timed presents): the exchanged one is
+    // the one no longer running it under its own name.
     if (Method method = class_getInstanceMethod(concrete, selector)) {
-        IMP running = method_getImplementation(method), found = nullptr;
-        bool ambiguous = false;
+        IMP running = method_getImplementation(method), any = nullptr, exchanged = nullptr;
+        bool anyAmbiguous = false, exchangedAmbiguous = false;
         for (Class cls = concrete; cls; cls = class_getSuperclass(cls))
-            for (auto &[key, replacement] : replacements())
-                if (key.first == cls && replacement == running) {
-                    IMP imp = originals()[key];
-                    if (found && imp != found) ambiguous = true;
-                    found = imp;
-                }
-        if (found && !ambiguous) { entry = {concrete, selector, found, generation}; return found; }
+            for (auto &[key, replacement] : replacements()) {
+                if (key.first != cls || replacement != running) continue;
+                IMP imp = originals()[key];
+                if (any && imp != any) anyAmbiguous = true;
+                any = imp;
+                Method hooked = class_getInstanceMethod(cls, key.second);
+                if (hooked && method_getImplementation(hooked) == replacement) continue;
+                if (exchanged && imp != exchanged) exchangedAmbiguous = true;
+                exchanged = imp;
+            }
+        IMP found = exchanged && !exchangedAmbiguous ? exchanged : any && !anyAmbiguous ? any : nullptr;
+        if (found) { entry = {concrete, selector, found, generation}; return found; }
     }
     abort();
 }

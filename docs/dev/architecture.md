@@ -206,9 +206,13 @@ the original method. Hooks now keep one `BG3MFXEncoderState` per encoder with
 fixed binding slots. Pipelines are classified once, at creation, and draws with
 unrecognized pipelines go straight to Metal. Original-method lookups are cached
 per thread. When another library exchanges a hooked method with one of its own
-(the Steam overlay does this for `-commit`), the hook runs under that library's
-selector; the original is then found by the replacement the method carries
-(`runtime-smoke` covers this). An unrecognized draw's only effect, dropping a scene association for
+(the Steam overlay does this for `-commit` and, with VSync, for
+`presentDrawable:afterMinimumDuration:`), the hook runs under that library's
+selector; the original is then found by the replacement the method carries.
+Where one replacement serves several selectors (both timed presents), the
+exchanged selector is the one no longer running it; the lookup used to give up
+there and abort, which closed BG3 when VSync was turned on with the overlay
+(`runtime-smoke` covers both). An unrecognized draw's only effect, dropping a scene association for
 the encoder's target, is applied once at `endEncoding`. A synthetic run of
 20,000 draws and 80,000 binds took 5.5 ms without hooks, 50.2 ms with the
 original hooks, and 7.2 ms after the first rewrite. In the live game the hooks'

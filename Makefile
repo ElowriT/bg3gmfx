@@ -22,7 +22,7 @@ install: $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/bg3mfx
 	install -m 644 $(BIN_DIR)/libBG3MetalFX.dylib "$(PREFIX)/lib/bg3mfx/libBG3MetalFX.dylib"
 
 $(BIN_DIR)/runtime-smoke: tests/integration/runtime_smoke.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
+	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -o $@
 
 $(BIN_DIR)/lab-smoke: tests/integration/lab_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework QuartzCore -framework GameController -o $@
@@ -161,6 +161,7 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/f
 	$(BIN_DIR)/temporal-upscaler-smoke
 	BG3MFX_TEST_DIRECT_OUTPUT=1 $(BIN_DIR)/temporal-upscaler-smoke
 	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
+	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFX.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib no-taa
