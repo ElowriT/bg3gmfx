@@ -1208,19 +1208,27 @@ static IMP originalSlow(Class concrete, SEL selector, unsigned generation, Origi
         auto it = originals().find({cls, selector});
         if (it != originals().end()) { entry = {concrete, selector, it->second, generation}; return it->second; }
     }
-    // Another library exchanged a hooked method with one of its own (the Steam
-    // overlay does this for -commit and, with VSync, the timed present), so a
-    // replacement runs under that library's selector. Find the hooked method
-    // by the replacement it carries. One replacement can serve several
-    // selectors (presentTimed takes both timed presents): the exchanged one is
-    // the one no longer running it under its own name.
+    // Another library exchanged a hooked method with one of its own, so a
+    // replacement runs under that library's selector: the Steam overlay
+    // exchanges -commit and every present variant with steamoverlay_<name>.
+    // Find the hooked method by the replacement it carries. One replacement
+    // can serve several selectors (presentTimed takes both timed presents),
+    // and the overlay exchanges both: prefer the hooked selector that ends the
+    // running one's name, then the one no longer running its replacement.
     if (Method method = class_getInstanceMethod(concrete, selector)) {
-        IMP running = method_getImplementation(method), any = nullptr, exchanged = nullptr;
-        bool anyAmbiguous = false, exchangedAmbiguous = false;
+        IMP running = method_getImplementation(method), named = nullptr, exchanged = nullptr, any = nullptr;
+        bool exchangedAmbiguous = false, anyAmbiguous = false;
+        size_t namedLength = 0, length = strlen(sel_getName(selector));
+        const char *name = sel_getName(selector);
         for (Class cls = concrete; cls; cls = class_getSuperclass(cls))
             for (auto &[key, replacement] : replacements()) {
                 if (key.first != cls || replacement != running) continue;
                 IMP imp = originals()[key];
+                const char *hookedName = sel_getName(key.second);
+                size_t hookedLength = strlen(hookedName);
+                if (hookedLength < length && hookedLength > namedLength && !strcmp(name+length-hookedLength,hookedName)) {
+                    named = imp; namedLength = hookedLength;
+                }
                 if (any && imp != any) anyAmbiguous = true;
                 any = imp;
                 Method hooked = class_getInstanceMethod(cls, key.second);
@@ -1228,9 +1236,10 @@ static IMP originalSlow(Class concrete, SEL selector, unsigned generation, Origi
                 if (exchanged && imp != exchanged) exchangedAmbiguous = true;
                 exchanged = imp;
             }
-        IMP found = exchanged && !exchangedAmbiguous ? exchanged : any && !anyAmbiguous ? any : nullptr;
+        IMP found = named ? named : exchanged && !exchangedAmbiguous ? exchanged : any && !anyAmbiguous ? any : nullptr;
         if (found) { entry = {concrete, selector, found, generation}; return found; }
     }
+    fprintf(stderr, "BG3MFX: no original method for -[%s %s]\n", class_getName(concrete), sel_getName(selector));
     abort();
 }
 static void hook(id object, const char *name, IMP replacement) {

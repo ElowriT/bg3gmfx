@@ -90,29 +90,34 @@ int main(int argc, const char **argv) {
         [encoder setComputePipelineState:compute]; [encoder setBuffer:computed offset:0 atIndex:0];
         [encoder dispatchThreads:MTLSizeMake(64,1,1) threadsPerThreadgroup:MTLSizeMake(4,1,1)];
         [encoder endEncoding];
-        // Another library exchanging a hooked method with one of its own, as
-        // the Steam overlay does, leaves the runtime's hook under that selector.
-        // With VSync BG3 presents with a minimum duration, whose hook shares its
-        // replacement with -presentDrawable:atTime:.
+        // The Steam overlay exchanges -commit and every present variant with
+        // steamoverlay_<name> methods of its own, which call that selector, so
+        // the runtime's hooks run under the overlay's selectors. Both timed
+        // presents share one hook replacement; with VSync BG3 uses one of them.
         Class committedClass = object_getClass(buffer);
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = device; layer.pixelFormat = MTLPixelFormatBGRA8Unorm; layer.drawableSize = CGSizeMake(64,64);
-        id<CAMetalDrawable> drawable = [layer nextDrawable];
-        if (!drawable) return 11;
-        SEL timed = @selector(presentDrawable:afterMinimumDuration:);
-        SEL overlayTimed = sel_registerName("overlaySmoke_presentDrawable:afterMinimumDuration:");
-        class_addMethod(committedClass, overlayTimed, imp_implementationWithBlock(^(id self, id shown, CFTimeInterval duration) {
-            ((void(*)(id,SEL,id,CFTimeInterval))objc_msgSend)(self, overlayTimed, shown, duration);
-        }), "v@:@d");
-        method_exchangeImplementations(class_getInstanceMethod(committedClass, timed),
-                                       class_getInstanceMethod(committedClass, overlayTimed));
-        [buffer presentDrawable:drawable afterMinimumDuration:1.0/60];
-        SEL overlayCommit = sel_registerName("overlaySmoke_commit");
-        class_addMethod(committedClass, overlayCommit, imp_implementationWithBlock(^(id self) {
-            ((void(*)(id,SEL))objc_msgSend)(self, overlayCommit);
-        }), "v@:");
-        method_exchangeImplementations(class_getInstanceMethod(committedClass, @selector(commit)),
-                                       class_getInstanceMethod(committedClass, overlayCommit));
+        id<CAMetalDrawable> drawables[3] = {[layer nextDrawable],[layer nextDrawable],[layer nextDrawable]};
+        if (!drawables[0] || !drawables[1] || !drawables[2]) return 11;
+        auto exchange = [&](const char *name, id block, const char *types) {
+            SEL selector = sel_registerName(name);
+            SEL overlay = sel_registerName([@"steamoverlay_" stringByAppendingString:@(name)].UTF8String);
+            class_addMethod(committedClass, overlay, imp_implementationWithBlock(block), types);
+            method_exchangeImplementations(class_getInstanceMethod(committedClass, selector),
+                                           class_getInstanceMethod(committedClass, overlay));
+        };
+        SEL overlayCommit = sel_registerName("steamoverlay_commit"), overlayPresent = sel_registerName("steamoverlay_presentDrawable:");
+        SEL overlayAfter = sel_registerName("steamoverlay_presentDrawable:afterMinimumDuration:");
+        SEL overlayAt = sel_registerName("steamoverlay_presentDrawable:atTime:");
+        exchange("commit", ^(id self) { ((void(*)(id,SEL))objc_msgSend)(self, overlayCommit); }, "v@:");
+        exchange("presentDrawable:", ^(id self, id shown) { ((void(*)(id,SEL,id))objc_msgSend)(self, overlayPresent, shown); }, "v@:@");
+        exchange("presentDrawable:afterMinimumDuration:", ^(id self, id shown, CFTimeInterval duration) {
+            ((void(*)(id,SEL,id,CFTimeInterval))objc_msgSend)(self, overlayAfter, shown, duration); }, "v@:@d");
+        exchange("presentDrawable:atTime:", ^(id self, id shown, CFTimeInterval time) {
+            ((void(*)(id,SEL,id,CFTimeInterval))objc_msgSend)(self, overlayAt, shown, time); }, "v@:@d");
+        [buffer presentDrawable:drawables[0]];
+        [buffer presentDrawable:drawables[1] afterMinimumDuration:1.0/60];
+        [buffer presentDrawable:drawables[2] atTime:CACurrentMediaTime()];
         [buffer commit];
         [buffer waitUntilCompleted];
         if (buffer.status != MTLCommandBufferStatusCompleted) return 4;
@@ -120,7 +125,7 @@ int main(int argc, const char **argv) {
         uint8_t pixel[4];
         [texture getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(32,32,1,1) mipmapLevel:0];
         if (pixel[0] < 62 || pixel[0] > 65 || pixel[1] < 126 || pixel[1] > 129 || pixel[2] < 190 || pixel[2] > 193) return 7;
-        puts("Runtime loaded; hooked Metal command buffer completed, also with -commit and the timed present exchanged by another library");
+        puts("Runtime loaded; hooked Metal command buffer completed, also with -commit and every present exchanged as the Steam overlay does");
     }
     return 0;
 }
