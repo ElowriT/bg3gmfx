@@ -413,17 +413,16 @@ fixtures keep independent layouts/expected instructions to catch drift.
   [`docs/dev/performance.md`](performance.md).
 - `src/features/thread-idling/ThreadIdling.*`: CPU Thread Idling (on by default;
   `BG3MFX_CPU_THREAD_IDLING=0` disables it). BG3's idle workers, job scheduler,
-  frame limiter (`GameClock::CapFrame`, the server tick and client frame cap)
-  and batch waits sleep instead of spinning.
-- `src/features/dynamic-worker-prioritization/DynamicWorkers.*`: Dynamic Worker Prioritization (on by default;
-  `BG3MFX_DYNAMIC_WORKER_PRIORITIZATION=0` disables it). Puts the `WT/High` workers and the
-  job scheduler in Darwin background while frame-rate trials show it costs no
-  frame rate. It changes no BG3 code: threads apply their placement when they
-  next block in an interposed `semaphore_wait`/`semaphore_timedwait`, and the
-  present hooks in `Trace.mm` count frames. Decisions are logged to subsystem
-  `com.bg3mfx`, category `threads`.
-- `src/features/cluster-buffer-guard/ClusterBufferGuard.*`: Character Creation Crash Fix (on by default;
-  `BG3MFX_CLUSTER_BUFFER_GUARD=0` disables it). `Trace.mm` binds a zero-filled,
+  and frame limiter (`GameClock::CapFrame`, the server tick and client frame
+  cap) sleep instead of spinning; batch completion waits keep BG3's yield.
+- `src/features/reduce-locking/UniformSlices.*`: Reduced Locking
+  (experimental; the launcher passes `BG3MFX_REDUCE_LOCKING=0` unless the
+  player sets `=1`). `BindMaterialParameters` and
+  `SetupEngineParameters` take their uniform allocations from a per-thread
+  slice reserved through BG3's own `MetalRenderer` lock; a hook on
+  `BeginFrame`'s reset retires the slices.
+- `src/features/cluster-buffer-guard/ClusterBufferGuard.*`: Character Creation Crash Fix (experimental;
+  the launcher passes `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0` unless the player sets `=1`). `Trace.mm` binds a zero-filled,
   untracked stand-in at compute buffer indices 1 and 6 and fragment index 1 on
   each new encoder, so a clustered-lighting pass that BG3 dispatches without
   `ClusterInfoBuffer` reads no lights instead of faulting the GPU. Diagnostic
@@ -451,7 +450,7 @@ fixtures keep independent layouts/expected instructions to catch drift.
   (`BG3MFX_TRACE_SERVER_PACING=1`, diagnostic runtime) of the server tick's work,
   CPU time and limiter, logged to category `pacing`.
 - Header-padding islands: Temporal jitter `0x000`–`0x0c0`, Lua `0x700`, server
-  pacing probe `0x800`, thread idling `0x9a0` and `0x9c0` (offsets from
+  pacing probe `0x800`, thread idling `0x9c0`, uniform slices `0xa00` (offsets from
   `0x100004000`). Each install checks its range is still zero.
 - `src/integration/renderer/Trace.mm`: Metal hooks, exact texture association, pass replacement,
   diagnostic instrumentation.

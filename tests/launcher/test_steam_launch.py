@@ -65,6 +65,21 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertIn(f"DYLD_INSERT_LIBRARIES={self.runtime}", arguments)
         self.assertEqual(arguments[-4], str(other))
 
+    def test_experimental_features_stay_off_unless_set(self):
+        def values(arguments):
+            return [arguments[i + 1] for i, a in enumerate(arguments) if a == "--env"]
+        result, arguments = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for key in ("BG3MFX_REDUCE_LOCKING", "BG3MFX_CHARACTER_CREATION_CRASH_FIX"):
+            self.assertIn(f"{key}=0", values(arguments))
+        # steam-launch.env or the environment (Steam's launch options) turns one on.
+        self.env_file.write_text("BG3MFX_REDUCE_LOCKING=1\n")
+        result, arguments = self.launch(BG3MFX_CHARACTER_CREATION_CRASH_FIX="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = values(arguments)
+        self.assertEqual([v for v in environment if v.startswith("BG3MFX_REDUCE_LOCKING=")], ["BG3MFX_REDUCE_LOCKING=1"])
+        self.assertIn("BG3MFX_CHARACTER_CREATION_CRASH_FIX=1", environment)
+
     def test_missing_runtime_does_not_start_the_game(self):
         self.runtime.unlink()
         result, arguments = self.launch()

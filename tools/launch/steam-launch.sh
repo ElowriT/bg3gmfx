@@ -15,7 +15,10 @@
 # Optional build/steam-launch.env: KEY=VALUE lines added to the game's
 # environment (for example BG3MFX_LAB=/absolute/path); BG3MFX_RUNTIME there
 # selects another runtime library, and BG3MFX_STEAM_OVERLAY=0 leaves out
-# Steam's libraries, as the bg3mfx launcher does.
+# Steam's libraries, as the bg3mfx launcher does. Like that launcher, this
+# keeps the experimental features off unless steam-launch.env or the
+# environment sets them (BG3MFX_REDUCE_LOCKING=1,
+# BG3MFX_CHARACTER_CREATION_CRASH_FIX=1).
 set -u
 checkout="$(cd "$(dirname "$0")/../.." && pwd)"
 runtime="$checkout/build/bin/libBG3MetalFX.dylib"
@@ -31,17 +34,23 @@ fail() {
 
 extra=()
 overlay=1
+named=" "  # keys steam-launch.env sets
 if [ -f "$checkout/build/steam-launch.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac
         case "${line%%=*}" in
             BG3MFX_RUNTIME) runtime="${line#*=}" ;;
             BG3MFX_STEAM_OVERLAY) overlay="${line#*=}" ;;
-            *) extra+=(--env "$line") ;;
+            *) extra+=(--env "$line"); named="$named${line%%=*} " ;;
         esac
     done < "$checkout/build/steam-launch.env"
 fi
 [ -f "$runtime" ] || fail "The runtime $runtime is missing. Run make in $checkout."
+for key in BG3MFX_CHARACTER_CREATION_CRASH_FIX BG3MFX_REDUCE_LOCKING; do
+    case "$named" in *" $key "*) continue ;; esac
+    value="$(/usr/bin/printenv "$key" || true)"
+    extra+=(--env "$key=${value:-0}")
+done
 
 # The bundle Steam passed, if it arrived intact; otherwise the Steam libraries.
 app=""

@@ -67,8 +67,13 @@ from 23.7 W to 7.4 W at the same 95–96 fps; server ticks stayed at 30.0/s
 [`docs/dev/performance.md`](../performance.md).
 
 - CPU Thread Idling alone: about 11 W. The in-game Frame Cap now idles
-  between frames (user-confirmed lower CPU with the cap on).
-- Dynamic Worker Prioritization: 7.4 W where background costs nothing.
+  between frames (user-confirmed lower CPU with the cap on). That build also
+  blocked batch waiters (about −1 W), since removed because its single
+  completion semaphore could strand a second waiter. On October 20, uncapped
+  and CPU-bound on Low, the current defaults matched stock fps (185 vs 186)
+  at 596% CPU against 727%; worker or scheduler polls added CPU without fps.
+- Dynamic Worker Prioritization (removed October 21: with idle workers
+  asleep it saved about 0.9 W and cost CPU time): 7.4 W where background costs nothing.
   Running through Lower City crowds, trials kept the `WT/High` workers at normal
   where background would have cost 6–11% (108.7 vs 102.0, 144.0 vs 128.7 fps),
   and the user saw no stutter at the switches. An earlier version also placed
@@ -81,6 +86,18 @@ from 23.7 W to 7.4 W at the same 95–96 fps; server ticks stayed at 30.0/s
   issues.
 - Not covered: Macs with fewer or slower cores (the `CapFrame` job stealing is
   kept for them), and a GPU capture.
+
+## Reduced Locking
+
+Live on October 20 (quiet runtime, Ultra, Upscaling Off, Frame Cap 60, Lower
+City, M5 Pro; every run held 60 fps): with Dynamic Worker Prioritization off,
+BG3 used 162% CPU and 5.8 W with per-thread uniform slices against 205% and
+6.6 W without; with it on, 238% and 4.9 W against 257% and 5.6 W. Slices
+removed 98% of the lock samples in System Traces. The diagnostic runtime ran
+about 33,000 slices in play with no rendering errors; the largest frame used
+0.47 MB of the 21 MiB uniform buffer. Not covered: uncapped (CPU-bound) frame
+rate, and Macs with fewer cores. Details:
+[`docs/dev/performance.md`](../performance.md).
 
 `make test` exercises neither feature: both patch BG3's own code or threads.
 
@@ -171,7 +188,9 @@ Temporal, Spatial and FSR with Frame Generation worked; Off first did not pair
 because BG3's CAS sharpening pass broke the scene chain. With CAS followed, all
 four worked live, and the October 13 presentation pacing (minimum-duration and
 spaced presents, see [Frame Generation](frame-generation.md)) was reported
-working very well with VSync on and off. Live tests of the
+working very well with VSync on and off. Since October 19, VSync off always
+uses spaced presents so a window no longer alternates between Direct and
+Composited. Live tests of the
 first presentation design showed generated frames reaching the display at
 roughly twice the rendered rate. The user found it slower and choppier: the HUD
 did not show a higher FPS and motion did not look smoother. Presentation has

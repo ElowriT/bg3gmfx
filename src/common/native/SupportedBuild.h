@@ -44,9 +44,18 @@ inline constexpr uintptr_t WorkerBudget = 0x10655389c;
 inline constexpr uintptr_t SchedulerWindowFirst = 0x106551aec;
 inline constexpr uintptr_t SchedulerWindowSecond = 0x106551c84;
 inline constexpr uintptr_t CapIdleYield = 0x1064d1e94;
-inline constexpr uintptr_t WaitYield = 0x106551328;
-inline constexpr uintptr_t WaitResume = 0x10655132c;
-inline constexpr uintptr_t WaitBlock = 0x1065514b0;
+inline constexpr uintptr_t CapTargetSelect = 0x1064d1c54;
+}
+namespace UniformSlices {
+// The uniform allocator inlined in AppliedMaterial::BindMaterialParameters
+// (14 instructions, then `b BindResume`) and RenderableObject::
+// SetupEngineParameters (13, falling through to SetupResume), and
+// MetalRenderer::BeginFrame's reset of the offset.
+inline constexpr uintptr_t BindAlloc = 0x105d07dc0;
+inline constexpr uintptr_t BindResume = 0x105d07ffc;
+inline constexpr uintptr_t SetupAlloc = 0x1060e0174;
+inline constexpr uintptr_t SetupResume = 0x1060e01a8;
+inline constexpr uintptr_t FrameReset = 0x10645da54;
 }
 namespace Lua {
 inline constexpr uintptr_t LongjmpCall = 0x100769e8c;
@@ -124,11 +133,20 @@ inline constexpr size_t VTable = 0, FrameIndex = 8, FrameIndexOffset = 12;
 inline constexpr size_t JitterIslandStride = 64;
 }
 
-// WorkerThreadBatch: atomic flags word; the completer sets Done, then opens
-// the inline completion event if a blocking waiter set Waiter.
 namespace ThreadIdling::Layout {
-inline constexpr size_t BatchFlags = 0x4;
-inline constexpr uint32_t BatchDone = 0x10, BatchWaiter = 0x20;
+// GameClock: CapFrame measures elapsed time from ClockStart (mach ticks), valid
+// once ClockStarted is set; at its idle yield x19 is the clock and x27 the wait
+// target in us from ClockStart.
+inline constexpr size_t ClockStart = 0x8, ClockStarted = 0x10;
+}
+
+// rf::metal::MetalRenderer: an os_unfair_lock guarding the bump offset into the
+// frame's uniform buffer (BufferBytes each, four in a ring; with unified memory
+// the GPU reads it directly). SetupEngineParameters reaches the renderer at
+// SetupRenderer past the object it loads.
+namespace UniformSlices::Layout {
+inline constexpr size_t Lock = 0x8, Offset = 0x2090, SetupRenderer = 0x1f0;
+inline constexpr uint64_t BufferBytes = 0x1500000;
 }
 
 namespace ServerPacing::Layout {
@@ -143,9 +161,9 @@ namespace Islands {
 inline constexpr Island Temporal{0x000, 3 * 64};
 inline constexpr Island Lua{0x700, 32};
 inline constexpr Island ServerPacing{0x800, 4 * 24};
-inline constexpr Island ThreadWait{0x9a0, 32};
-inline constexpr Island ThreadIdle{0x9c0, 16};
-inline constexpr Island All[] = {Temporal, Lua, ServerPacing, ThreadWait, ThreadIdle};
+inline constexpr Island ThreadIdle{0x9c0, 32};
+inline constexpr Island UniformSlices{0xa00, 64};
+inline constexpr Island All[] = {Temporal, Lua, ServerPacing, ThreadIdle, UniformSlices};
 constexpr bool valid(const Island *ranges, size_t count) {
     for (size_t i=0; i<count; ++i) {
         const Island current = ranges[i];

@@ -188,6 +188,192 @@ own, from `proc_pid_rusage` (`tools/analysis/procpower.c`); per-thread CPU is fr
 a core and counts `swtch_pri` yields as waiting. It showed the scheduler thread
 4% busy (it used 88% of a core) and `ServerWorker` 99% busy in its systems.
 
+### Stock thread states (October 20, 2026)
+
+BG3 as shipped (no bg3mfx), Lower City at Balduran's statue, standing still,
+Ultra, Upscaling Off, Frame Cap 60 fps; M5 Pro. A 10 s Instruments System Trace, analyzed with
+`tools/analysis/thread_states.py`. Running, runnable, asleep and core tier are
+exact scheduler intervals. Running time is split into work, spin and lock by
+1 ms on-CPU stack samples: spin is time in a wait loop (`CapFrame`,
+`WaitForCompletion`, worker and scheduler `DoWork`, `WaitForEventAndDoWork`)
+doing nothing but yield, clock, queue-poll and event calls. Jobs a waiter runs
+count as work. Lock is time on a core inside a contended `os_unfair_lock`.
+Work, spin, lock, runnable and asleep are shares of each thread's time; Super
+and Performance are shares of its on-core time.
+
+| Thread | n | Cores | Work | Spin | Lock | Runnable | Asleep | Super | Perf |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `ServerWorker` | 1 | 0.99 | 40% | 53% | 6% | 0.8% | 0.2% | 94% | 6% |
+| `WorkerThreadScheduler` | 1 | 0.98 | 0.2% | 98% | 0% | 1.8% | 0% | 90% | 10% |
+| `GameThread` | 1 | 0.94 | 27% | 58% | 10% | 0.8% | 5% | 94% | 6% |
+| Main (render) | 1 | 0.35 | 23% | 12% | 0% | 2.7% | 62% | 86% | 14% |
+| `WT/High` | 6 | 1.15 | 9% | 2% | 8% | 0.2% | 81% | 53% | 47% |
+| Other BG3 threads | 12 | 0.26 | 2% | 0% | 0% | 0% | 98% | 99% | 1% |
+| `WT/Low` | 6 | 0.02 | 0.3% | 0% | 0% | 0.1% | 99.6% | 43% | 57% |
+
+BG3 used 4.7 cores, about 2.3 of them spinning: the scheduler's yield window
+0.96, `CapFrame` on `GameThread` (the frame cap) 0.58 and on `ServerWorker`
+(the 30 Hz tick) 0.53, batch waits on the render thread 0.12, and the workers'
+idle poll 0.14. The three spinning threads ran on the Super cores about 90% of
+their time, holding half of them, while `WT/High` job work ran 47% on the
+Performance cores. The render thread's batch waits are the smallest part.
+Lock time is the material lock in
+`AppliedMaterial::BindMaterialParameters` and
+`RenderableObject::SetupEngineParameters` during shadow and depth recording.
+
+In an uncapped run the same day (discarded: the render thread stalled for
+about 3 of its 10 s), `GameThread` spun 2% and slept about half its time in
+`WaitForEventAndDoWork`; with the cap that time moves into `CapFrame`. In the
+capped run the render thread's activity also dropped in one second (62 wakeups
+against about 200), a brief hitch.
+
+The same scene and settings with only three thread-idling parts: scheduler
+window 0, worker poll 0, and `CapFrame` sleeping straight to 200 us before its
+deadline without checking for jobs (`BG3MFX_CAPFRAME_MARGIN_US=200
+BG3MFX_CAPFRAME_POLL_US=0` in the current build). The batch-wait patch (since
+removed) and every other feature were off, so bg3mfx's Metal hooks were loaded but only forwarded.
+
+| Thread | Cores | Work | Spin | Lock | Runnable | Asleep | Super | Perf |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| `WorkerThreadScheduler` | 0.05 | 0% | 5% | 0% | 2.8% | 92% | 96% | 4% |
+| `ServerWorker` | 0.30 | 29% | 0.3% | 0.4% | 0.6% | 70% | 85% | 15% |
+| `GameThread` | 0.34 | 26% | 1% | 7% | 0.7% | 65% | 99% | 1% |
+| Main (render) | 0.41 | 30% | 10% | 0% | 3.0% | 56% | 86% | 14% |
+| `WT/High` | 1.41 | 13% | 1% | 10% | 1.4% | 75% | 68% | 32% |
+| Other BG3 threads | 0.25 | 2% | 0% | 0% | 0.3% | 98% | 98% | 2% |
+| `WT/Low` | 0.06 | 1% | 0% | 0% | 0.2% | 99% | 62% | 38% |
+
+BG3 used 2.82 cores against 4.69, and spin fell from about 2.3 cores to about
+0.12. `CapFrame` held 0.2% of `GameThread` and 2% of `ServerWorker` (60% and
+67% stock); `ServerWorker` still ran a few shadow jobs on its first queue check.
+The jobs it no longer steals moved to `WT/High` (+0.26 cores), which with the
+spinning threads gone ran 68% on the Super cores (53% stock). Every second was
+alike (render thread 400–414 ms on a core). The render thread used more than
+stock (0.41 against 0.35 cores, about 600 wakeups/s against 210); the cause is
+not yet separated between bg3mfx's forwarding Metal hooks and batch waits that
+now end on a worker wake. Frame rate was not recorded.
+
+### Poll sweep, CPU-bound (October 20, 2026)
+
+To choose the worker and scheduler polls, BG3 ran uncapped where it is
+CPU-bound: the same spot, Low, Upscaling Off, VSync, Frame Cap and Frame
+Generation off, launched at nice 0. bg3mfx runs used only thread idling, with
+`CapFrame` at its default 250 µs steps and 200 µs margin. Each row is the mean
+of two 60 s windows: `procpower` CPU and power, and fps from the Metal HUD log
+(`tools/analysis/hudfps.sh`).
+
+| Run | Worker poll | Scheduler poll | fps | CPU | Super | Perf | Power |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| Stock (BG3's own) | 500 µs | 101 µs | 186.0 | 727% | 538% | 189% | 18.6 W |
+| BG3's polls + `CapFrame` sleep | 500 µs | 101 µs | 179.9 | 939% | 565% | 374% | 25.0 W |
+| **Default** | 0 | 0 | 185.4 | **596%** | 452% | 144% | 16.7 W |
+| Short worker poll | 50 µs | 0 | 187.2 | 643% | 491% | 152% | 18.1 W |
+| BG3's scheduler window | 0 | 101 µs | 187.1 | 662% | 486% | 176% | 18.5 W |
+| Short scheduler window | 0 | 25 µs | 184.6 | 636% | 473% | 163% | 21.0 W |
+| Default, second launch | 0 | 0 | 188.6 | 585% | 445% | 140% | 17.9 W |
+
+The two scheduler-window rows are one window each: their second windows were
+disturbed (165.6 fps at 11.6 W, and a stall to 30 fps). The second default
+launch took one window. Within a run the first window read about 189 fps
+and the second about 183, so fps differences under about 2% are noise; power
+varied by up to 4.6 W between windows.
+
+- Sleeping at once costs no measurable fps even CPU-bound, and saves 18% CPU
+  against stock.
+- The `CapFrame` sleep alone, with BG3's polls, costs CPU: the jobs
+  `ServerWorker` no longer steals go to workers that spin 500 µs and spill onto
+  the Performance cores.
+- Any scheduler window keeps the scheduler awake; at 0 it sleeps most of the
+  time. Each idle worker signals its semaphore, and with a window the pending
+  signals arrive before it blocks. 15 s traces after the 60 s windows:
+
+  | Scheduler window | Scheduler cores | Spin | Asleep | Render thread waiting on jobs |
+  |---|--:|--:|--:|--:|
+  | 101 µs | 0.91 | 91% | 0.1% | 23% |
+  | 25 µs | 0.84 | 84% | 0% | – |
+  | 0 (default) | 0.15 | 15% | 79% | 20% |
+
+  The 25 µs trace caught a lighter moment (the render thread 57% asleep, 4.0
+  cores in all), but the scheduler still never slept. The 101 µs and default
+  traces were CPU-bound (the render thread on a core 92–98% of the time).
+- Not measured: burst-heavy scenes (combat, crowds), frame-time percentiles,
+  and Macs with fewer workers.
+
+### Uniform allocator lock (October 20, 2026)
+
+The lock time in the thread-state tables is one lock. `AppliedMaterial::BindMaterialParameters`
+(lock call at 0x105d07dcc) and `RenderableObject::SetupEngineParameters`
+(0x1060e0180) both run BG3's per-frame uniform allocator inline: lock
+`MetalRenderer` +0x8 (`os_unfair_lock`), round the offset at +0x2090 up to 16,
+add the size, unlock. `MetalRenderer::AllocUniformsBuffer` (0x10645ed44) is the
+same code and ignores its alignment argument; `MetalRenderer::BeginFrame`
+zeroes the offset (0x10645da54), and nothing checks it against the buffer's
+size. The sequence is inlined in about 70 functions (about 130 sites: post
+process, shadows, fog, terrain, Noesis UI). The critical section is five
+instructions; the cost is the contended handoff (`__ulock_wait`/`__ulock_wake`
+and context switches). In the thread-state traces it is about 0.65 cores at a
+60 fps cap and 0.9 cores uncapped, about a quarter of BG3's CPU once thread
+idling removes the spins.
+
+Making only the hot sites lock-free would race with the locked sites. The
+candidate fix keeps BG3's protocol: the hot sites take a per-thread slice
+(16 KB) through the same lock and bump within it without the lock, starting a
+new slice after `BeginFrame`.
+
+Synthetic model (`tools/probes/uniform_lock_sim.cpp`; not BG3): worker threads
+record draws of 0.25–1.75× a mean cost, each allocating 64–512 bytes; 10% of
+allocations stay on the locked path in slice mode. Means of 2–3 runs (repeats
+within about 1%):
+
+| Threads, mean cost | Mode | Frame (parallel part) | Worker CPU | Contended locks |
+|---|---|--:|--:|--:|
+| 6, 500 ns, uncapped | locked | 0.77 ms | 521% | 18% |
+| | slices | 0.62 ms | 512% | 0.2% |
+| | no allocator | 0.62 ms | 523% | – |
+| 12, 500 ns, uncapped | locked | 1.01 ms | 1048% | 32% |
+| | slices | 0.43 ms | 930% | 1.9% |
+| | no allocator | 0.41 ms | 949% | – |
+| 6, 500 ns, 20k draws, 60 fps cap | locked | 3.95 ms | 118% | 27% |
+| | slices | 2.59 ms | 77% | 0.4% |
+| | no allocator | 2.52 ms | 74% | – |
+
+Slices came within 2–5% of no allocator. Every run checked each allocation for
+alignment and overlap with locked and slice allocations mixed: no errors. 16 KB
+slices used 130–210 KB more per frame than the 5.7 MB of data (4 KB slices
+wasted more in partly used tails). With uniform draw costs the threads stagger
+and contention stays under 1%, so the model's gain depends on how bursty BG3's
+recording is.
+
+In the executable, each frame's uniform buffer is 21 MiB (`0x1500000`, four in
+a ring). `MetalRenderer::CommitCommandBuffer` copies new uniform bytes to a
+private GPU buffer only without unified memory; on Apple Silicon BG3 binds the
+shared buffer directly, so `BeginFrame` is the only point slices must reset.
+Reduced Locking, `src/features/reduce-locking` (experimental; the launcher
+passes `BG3MFX_REDUCE_LOCKING=0` unless the player sets `=1`), patches the two sites and that reset.
+
+Live A/B (Lower City, Ultra, Upscaling Off, Frame Cap 60, all runs at 60 fps;
+two 10–30 s `procpower` windows each, within 3 points of each other):
+
+| Dynamic Worker Prioritization | Slices | CPU | Super | CPU power |
+|---|---|--:|--:|--:|
+| on | off | 257% | 130% | 5.6 W |
+| on | on | 238% | 115% | 4.9 W |
+| off | off | 205% | 175% | 6.6 W |
+| off | on | 162% | 143% | 5.8 W |
+
+10 s System Traces of the last two (`thread_states.py` now lists lock samples
+by caller): 4,448 lock samples against 90; `BindMaterialParameters` held 50%
+and `SetupEngineParameters` 41% of them, and the rest is spread thinly
+(`IAppStage::BindViewport`, `BindAtmosphere`, `DecalObject::PrepareDraw`,
+post-process steps). `WT/High` fell from 1.02 to 0.61 cores and the render
+thread's spin waiting on jobs from 9.6% to 2.7%. Dynamic Worker Prioritization
+hides much of the CPU difference: background workers on the Performance cores
+take more CPU time (+76 points with slices) for about 0.9 W less. In play with
+the diagnostic runtime there were no rendering errors in about 33,000 slices,
+and the largest frame used 0.47 MB of the 21 MiB buffer (the diagnostic
+runtime's own logging held that session to about 27 fps). Not yet measured:
+uncapped (CPU-bound) frame rate.
+
 ### CPU Thread Idling (`src/features/thread-idling/ThreadIdling.mm`)
 
 BG3 spins wherever it waits:
@@ -204,15 +390,25 @@ BG3 spins wherever it waits:
 - `WorkerThreadBatch::WaitForCompletion` yields until another thread finishes
   the batch (the render thread's `cthread_yield` time above).
 
-The patch removes the worker and scheduler windows, makes `CapFrame` sleep
-250 µs when no job is queued (it still runs queued jobs, which matters on
-Macs with few cores, and keeps its 1 ms spin), and blocks batch waiters after
-50 µs on BG3's own completion event. Live A/B steps (same fps each): worker
-and scheduler spins 23.7 → 14.0 W; `CapFrame` 14.0 → ~11.9 W; batch waits
-≈ −1 W. Server ticks stayed at 30.0/s with a 33.4 ms worst interval; the in-game
+The patch removes the worker and scheduler windows and makes `CapFrame` sleep
+250 µs at a time when no job is queued (it still runs queued jobs, which
+matters on Macs with few workers), then sleep until 200 µs before its deadline.
+Batch waits keep BG3's yield. An earlier version blocked batch waiters after
+50 µs on the batch's completion event, about −1 W; that event holds one
+semaphore that each blocking waiter resets, so two blocking waiters could
+strand one or leak the semaphore, and it was removed. Live A/B steps (same fps
+each): worker and scheduler spins 23.7 → 14.0 W; `CapFrame` 14.0 → ~11.9 W
+(250 µs steps with BG3's 1 ms spin tail). Server ticks stayed at 30.0/s with a 33.4 ms worst interval; the in-game
 Frame Cap now idles between frames.
 
-### Dynamic Worker Prioritization (`src/features/dynamic-worker-prioritization/DynamicWorkers.mm`)
+### Dynamic Worker Prioritization (removed October 21, 2026)
+
+Removed: once thread idling let the workers sleep, it saved about 0.9 W at a
+60 fps cap (Reduced Locking A/B above) while background workers took about
+75 points more CPU time, and it could cost frame rate in CPU-bound scenes,
+likely more on Macs with few efficiency cores. The code remains in the
+repository's history (`src/features/dynamic-worker-prioritization/`). The
+original findings:
 
 BG3 sets thread priorities by hand (QoS changes fail with `EPERM`), so
 everything runs on the Super cores. Darwin background
@@ -302,5 +498,9 @@ MetalFX follows and fell back to FSR, so those rows measure nothing useful.
   (`clang -fblocks -O2 tools/analysis/socpower.c -framework CoreFoundation -o socpower`).
   Counters other than the GPU's advance about every 2 s: use 2 s samples or more.
   On an M5 Pro the idle machine draws about 1.8 W, half of it memory and fabric.
-- Dynamic worker decisions: `log stream --predicate 'subsystem == "com.bg3mfx"
-  AND category == "threads"'`.
+- `tools/analysis/thread_states.py record PID SECONDS OUT.trace` and
+  `analyze OUT.trace [--json FILE]`: per thread, work, spin, lock, runnable and
+  asleep time and Super/Performance core time, from an Instruments System Trace.
+- `tools/probes/uniform_lock_sim.cpp` (`make build/bin/uniform-lock-sim`):
+  `uniform-lock-sim locked|chunked|none THREADS DRAWS WORK_NS [FRAMES]
+  [COLD_PERCENT] [CHUNK_BYTES] [FPS_CAP]`, the synthetic uniform allocator model.
