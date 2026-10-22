@@ -477,6 +477,29 @@ at the same render size), then volumetric fog and clouds. BG3 itself used
 other applications. Skipping bloom or the outline passes broke the chain that
 MetalFX follows and fell back to FSR, so those rows measure nothing useful.
 
+### 0.3.2: Reduced Locking and Dynamic Worker Prioritization (October 22, 2026)
+
+The same save and spot, lab mode, MetalFX Spatial Quality (853×960 → 1280×1440
+per view), two-player split screen with lab virtual controllers, 30 FPS cap,
+charger, two 40 s windows per run (`socpower` for the machine, `procpower` for
+BG3's process). The game was restarted for each run. Settings had changed
+since October 20 (GPU about 4.4 W against 7.2 W then), so only these rows
+compare with each other.
+
+| Run | Total | GPU | CPU (machine) | BG3 CPU time | BG3 CPU power |
+| --- | --- | --- | --- | --- | --- |
+| 0.3.2, Reduced Locking off | 15.3–15.7 W | 4.1–4.3 | 5.8–6.0 | 75–76% | 2.19–2.29 W |
+| 0.3.2, Reduced Locking on | 16.6–16.8 W | 4.8 | 6.4 | 69% | 2.32–2.33 W |
+| Before 0.3.2 (Dynamic Worker Prioritization) | 15.7–16.3 W | 4.5–4.7 | 5.7–6.3 | 85–94% | 2.14–2.27 W |
+| 0.3.2, Reduced Locking off, repeated | (other applications busy) | | | 76–78% | 2.40–2.48 W |
+
+At this load neither change moves BG3's CPU power beyond the 0.2–0.3 W
+between runs of the same build. Reduced Locking cut BG3's CPU time by about 8%,
+and Dynamic Worker Prioritization raised it (background workers on the
+Performance cores) without saving power here; the upstream measurements of
+both (about −0.7 W and −0.9 W) are at 60 fps in a CPU-heavier scene. Machine
+totals vary by about 1 W between restarts, mostly in GPU power.
+
 ## Tools
 
 - `tools/analysis/hudfps.sh [seconds]`: mean/min fps from the Metal HUD log.
