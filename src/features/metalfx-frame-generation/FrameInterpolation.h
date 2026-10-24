@@ -56,6 +56,9 @@
 #ifndef BG3MFX_NO_TRACE
 - (NSDictionary *)takeTimingSummary;
 #endif
+// Diagnostics (lab mode): how long BG3's render thread has been waiting for a
+// free stand-in, 0 when it is not waiting.
++ (double)standInWaitSeconds;
 // True on the presenter's own thread, whose drawable requests must stay real.
 + (BOOL)isPresentationThread;
 // The presenter that owns `drawable` if it is a stand-in, otherwise nil.

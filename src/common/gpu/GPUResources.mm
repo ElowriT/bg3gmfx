@@ -1,5 +1,8 @@
 #import "common/gpu/GPUResources.h"
+#import <QuartzCore/QuartzCore.h>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -112,18 +115,49 @@ static std::recursive_mutex &orderLock() { static auto *lock=new std::recursive_
 static std::unordered_map<const void *, std::deque<id<MTLCommandBuffer>>> &orderQueues() {
     static auto *queues=new std::unordered_map<const void *, std::deque<id<MTLCommandBuffer>>>; return *queues;
 }
-static char orderStateKey, orderPendingKey;
+static char orderStateKey, orderPendingKey, orderTimeKey;
+static std::atomic<uint64_t> submittedUntracked{0}, submittedAtOnce{0}, submittedHeld{0};
+void BG3MFXMetal4SubmissionCounts(uint64_t *untracked, uint64_t *atOnce, uint64_t *held) {
+    *untracked=submittedUntracked.load(); *atOnce=submittedAtOnce.load(); *held=submittedHeld.load();
+}
 enum : int { OrderUntracked=0, OrderTracked, OrderEnqueued, OrderCommitted };
 static int orderState(id buffer) { return [objc_getAssociatedObject(buffer,&orderStateKey) intValue]; }
 static void setOrderState(id buffer, int state) {
     objc_setAssociatedObject(buffer,&orderStateKey,@(state),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
-void BG3MFXMetal4TrackBuffer(id<MTLCommandBuffer> buffer) { setOrderState(buffer,OrderTracked); }
+void BG3MFXMetal4TrackBuffer(id<MTLCommandBuffer> buffer) {
+    static const bool ordering=!(getenv("BG3MFX_METAL4_ORDER") && strcmp(getenv("BG3MFX_METAL4_ORDER"),"0")==0);
+    if (ordering) setOrderState(buffer,OrderTracked);
+}
 // Gives `buffer` its place in its queue's GPU order (order lock held).
 static void placeInOrder(id<MTLCommandBuffer> buffer) {
     if (orderState(buffer)!=OrderTracked) return;
     setOrderState(buffer,OrderEnqueued);
+    objc_setAssociatedObject(buffer,&orderTimeKey,@(CACurrentMediaTime()),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     orderQueues()[(__bridge const void *)buffer.commandQueue].push_back(buffer);
+}
+NSArray<NSDictionary *> *BG3MFXMetal4OrderStalls(double seconds) {
+    NSMutableArray *stalls=[NSMutableArray array];
+    std::lock_guard<std::recursive_mutex> lock(orderLock());
+    double now=CACurrentMediaTime();
+    for (auto &entry : orderQueues()) {
+        std::deque<id<MTLCommandBuffer>> &buffers=entry.second;
+        if (buffers.empty() || orderState(buffers.front())==OrderCommitted) continue;
+        id<MTLCommandBuffer> waiting=buffers.front();
+        double age=now-[objc_getAssociatedObject(waiting,&orderTimeKey) doubleValue];
+        if (age<seconds) continue;
+        NSUInteger heldBuffers=0, heldSubmissions=0;
+        for (id<MTLCommandBuffer> buffer : buffers) {
+            NSUInteger count=[objc_getAssociatedObject(buffer,&orderPendingKey) count];
+            if (orderState(buffer)==OrderCommitted && count) { ++heldBuffers; heldSubmissions+=count; }
+        }
+        if (!heldSubmissions) continue;
+        [stalls addObject:@{@"queue":waiting.commandQueue.label ?: @"",@"tracked":@(buffers.size()),
+            @"waiting":waiting.label ?: @"",@"waitingMs":@(age*1000),
+            @"waitingHeld":@([objc_getAssociatedObject(waiting,&orderPendingKey) count]),
+            @"heldBuffers":@(heldBuffers),@"heldSubmissions":@(heldSubmissions)}];
+    }
+    return stalls;
 }
 void BG3MFXMetal4Enqueue(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void)) {
     if (orderState(buffer)==OrderUntracked) { call(); return; }
@@ -146,9 +180,10 @@ void BG3MFXMetal4Commit(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(vo
 }
 // Holds `submit` until `buffer`'s turn; NO when it should run now.
 static BOOL deferSubmission(id<MTLCommandBuffer> buffer, void (^submit)(void)) {
-    if (orderState(buffer)==OrderUntracked) return NO;
+    if (orderState(buffer)==OrderUntracked) { ++submittedUntracked; return NO; }
     std::lock_guard<std::recursive_mutex> lock(orderLock());
-    if (orderState(buffer)==OrderCommitted) return NO;
+    if (orderState(buffer)==OrderCommitted) { ++submittedAtOnce; return NO; }
+    ++submittedHeld;
     NSMutableArray *pending=objc_getAssociatedObject(buffer,&orderPendingKey);
     if (!pending) {
         pending=[NSMutableArray array];

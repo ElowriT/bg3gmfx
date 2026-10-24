@@ -359,6 +359,11 @@ struct PresentTask {
     }
     (void)texture; return pool;
 }
+static std::atomic<double> standInWaitStart{0};
++ (double)standInWaitSeconds {
+    double start=standInWaitStart.load(std::memory_order_relaxed);
+    return start>0 ? CACurrentMediaTime()-start : 0;
+}
 - (id<CAMetalDrawable>)nextStandInForLayer:(CAMetalLayer *)layer limit:(NSUInteger)limit {
     NSUInteger w=(NSUInteger)layer.drawableSize.width, h=(NSUInteger)layer.drawableSize.height;
     if (!w || !h || layer.pixelFormat!=_pixelFormat) return nil;
@@ -367,8 +372,10 @@ struct PresentTask {
     NSUInteger maximum=_preferSingleStandIn ? 2 : std::min<NSUInteger>(preferred+1,3);
     BG3MFXFrameLogBuffering((unsigned)limit,(unsigned)maximum);
     BOOL overflowed=NO;
+    standInWaitStart.store(start,std::memory_order_relaxed);
     BOOL acquired=[_slots acquireWithPreferredLimit:preferred maximumLimit:maximum grace:0.002 timeout:1
         overflowed:&overflowed];
+    standInWaitStart.store(0,std::memory_order_relaxed);
     if (acquired && overflowed) BG3MFXFrameLogStandInOverflow();
     double waited=CACurrentMediaTime()-start;
     _standInWait=_standInWait+waited;

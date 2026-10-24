@@ -1085,6 +1085,20 @@ static void labWriteDumps(id<MTLCommandBuffer> buffer, __unsafe_unretained id en
         dump[@"state"] = @"written"; [dump removeObjectsForKeys:@[@"texture",@"buffer",@"encoder"]];
     }
 }
+// Every 250 ms, Metal 4 submissions held behind a command buffer BG3 has not
+// committed for 0.5 s or more, and how long BG3 has waited for a stand-in.
+static void labWatchMetal4Order(void) {
+    static dispatch_source_t timer;
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+    dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC/4,NSEC_PER_SEC/20);
+    dispatch_source_set_event_handler(timer,^{
+        NSArray *stalls = BG3MFXMetal4OrderStalls(0.5);
+        if (!stalls.count) return;
+        labRecord(@{@"event":@"metal4OrderStall",@"stalls":stalls,
+            @"standInWaitMs":@([BG3MFXFramePresenter standInWaitSeconds]*1000),@"frame":@(frames)});
+    });
+    dispatch_resume(timer);
+}
 // About once a second: presented frames, command buffers and GPU busy time.
 static void labPerf(void) {
     static double last; static unsigned long lastFrames; static uint64_t lastCommits, lastGPU, lastMetal4, lastPairs;
@@ -1098,7 +1112,9 @@ static void labPerf(void) {
         labWrite(@"perf.json",@{@"seconds":@(span),@"fps":@(presented/span),@"commandBuffersPerSecond":@((commits-lastCommits)/span),
             @"gpuBusy":@((gpu-lastGPU)*1e-9/span),@"gpuMsPerFrame":@(presented ? (gpu-lastGPU)*1e-6/presented : 0),
             @"metal4MsPerFrame":@(presented ? (metal4-lastMetal4)*1e-6/presented : 0),@"frame":@(frames),
-            @"metal4Reordered":@(BG3MFXMetal4Reordered()),@"generatedPerSecond":@((pairs-lastPairs)/span)});
+            @"metal4Reordered":@(BG3MFXMetal4Reordered()),@"generatedPerSecond":@((pairs-lastPairs)/span),
+            @"metal4Submissions":[&]{ uint64_t u,a,h; BG3MFXMetal4SubmissionCounts(&u,&a,&h);
+                return @{@"untracked":@(u),@"atOnce":@(a),@"held":@(h)}; }()});
     }
     last = now; lastFrames = frames; lastCommits = commits; lastGPU = gpu; lastMetal4 = metal4; lastPairs = pairs;
 }
@@ -3561,6 +3577,7 @@ __attribute__((constructor)) static void start() {
             traceConstants = YES;  // installs the draw and dispatch hooks
             fprintf(stderr,"BG3 MetalFX lab mode: %s\n",labDirectory.UTF8String);
             BG3MFXLabInputStart(labDirectory);
+            labWatchMetal4Order();
             labRecording = true;
             if (!BG3MFXGPUTimingHook) BG3MFXGPUTimingHook = labMetal4Timing;
         }

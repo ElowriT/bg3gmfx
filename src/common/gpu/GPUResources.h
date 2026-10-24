@@ -60,7 +60,7 @@ NS_ASSUME_NONNULL_BEGIN
 // For tracked buffers, submissions are recorded and submitted once the buffer
 // and every buffer enqueued before it on its queue have been committed; a
 // buffer that is never committed never submits. Untracked buffers submit
-// immediately.
+// immediately. BG3MFX_METAL4_ORDER=0 leaves every buffer untracked (diagnostics).
 void BG3MFXMetal4TrackBuffer(id<MTLCommandBuffer> buffer);
 // The runtime's -enqueue and -commit hooks: `call` is the original method.
 void BG3MFXMetal4Enqueue(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(void));
@@ -68,6 +68,14 @@ void BG3MFXMetal4Commit(id<MTLCommandBuffer> buffer, void (NS_NOESCAPE ^call)(vo
 // Submissions that reached their queue in another order than they were encoded
 // in (each would have waited on the GPU without the ordering).
 uint64_t BG3MFXMetal4Reordered(void);
+// Diagnostics (lab mode): submissions run at once on an untracked buffer, run
+// at once on a committed one, and held for their buffer's turn, since launch.
+void BG3MFXMetal4SubmissionCounts(uint64_t *untracked, uint64_t *atOnce, uint64_t *held);
+// Diagnostics (lab mode): per command queue whose oldest tracked buffer has
+// waited `seconds` or more uncommitted while later committed buffers hold
+// submissions, that buffer's label, age and own held submissions, and the
+// buffers and submissions held behind it.
+NSArray<NSDictionary *> *BG3MFXMetal4OrderStalls(double seconds);
 
 // Diagnostics and lab mode (both runtimes): when set, receives each Metal 4
 // bridge submission's GPU time.
