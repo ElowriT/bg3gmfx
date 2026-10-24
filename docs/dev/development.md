@@ -60,8 +60,8 @@ that launcher does. Optional
 `build/steam-launch.env` lines (`KEY=VALUE`) are added to the game's
 environment, for example `BG3MFX_LAB=/absolute/path` for lab mode;
 `BG3MFX_RUNTIME=` there selects another library. As in the `bg3mfx` launcher,
-the experimental features stay off unless that file or the environment sets
-`BG3MFX_REDUCE_LOCKING=1` or `BG3MFX_CHARACTER_CREATION_CRASH_FIX=1`. Clear the
+the experimental features are on unless that file or the environment sets
+`BG3MFX_REDUCE_LOCKING=0` or `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0`. Clear the
 Launch Options to play unmodded. `tests/launcher/test_steam_launch.py` checks the arguments it
 passes to `open`.
 

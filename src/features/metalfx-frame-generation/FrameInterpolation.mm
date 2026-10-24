@@ -58,8 +58,12 @@ static BG3MFXTexturePool *fgPool(id<MTLDevice> device, NSUInteger w, NSUInteger 
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)device scene:(id<MTLTexture>)scene depth:(id<MTLTexture>)depth
                         motion:(id<MTLTexture>)motion error:(NSError **)error {
+    return [self initWithDevice:device scene:scene depth:depth motion:motion dynamicContent:NO error:error];
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device scene:(id<MTLTexture>)scene depth:(id<MTLTexture>)depth
+                        motion:(id<MTLTexture>)motion dynamicContent:(BOOL)dynamicContent error:(NSError **)error {
     return [self initWithDevice:device width:depth.width height:depth.height outputWidth:scene.width outputHeight:scene.height
-                          scene:scene depth:depth motion:motion error:error];
+                          scene:scene depth:dynamicContent ? nil : depth motion:dynamicContent ? nil : motion error:error];
 }
 static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (t.usage&required)==required; }
 // Creates the effect for the given input formats. Without our own color copy
@@ -107,10 +111,14 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
     }
     _directMotion=_effect && fgUsable(motion,_effect.motionTextureUsage) && motion.width==w && motion.height==h;
     if (_effect4) _bridge=[[BG3MFXMetal4Bridge alloc] initWithDevice:device label:@"BG3 Metal 4 Frame Generation" error:error];
+    // Each copy reads the source's region (buffer 0) stretched over the whole
+    // destination, nearest sample; the full size copies pixel for pixel.
     NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
-        // `o`: the region's origin in the source (a split-screen view's).
-        "kernel void Copy(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint2 &o [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height())))d.write(s.read(p+o),p);}\n"
-        "kernel void Depth(depth2d<float> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint2 &o [[buffer(0)]],uint2 p [[thread_position_in_grid]]){if(all(p<uint2(d.get_width(),d.get_height()))){constexpr sampler q(coord::pixel,filter::nearest);d.write(s.sample(q,float2(p+o)+.5),p);}}";
+        // `r`: the region (x, y, width, height) of the source the target covers,
+        // stretched to the target: a split-screen view's rectangle, or dynamic
+        // resolution's smaller render region.
+        "kernel void Copy(texture2d<float,access::read> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint4 &r [[buffer(0)]],uint2 p [[thread_position_in_grid]]){uint2 n=uint2(d.get_width(),d.get_height());if(all(p<n))d.write(s.read(r.xy+min(uint2((float2(p)+.5)*float2(r.zw)/float2(n)),r.zw-1)),p);}\n"
+        "kernel void Depth(depth2d<float> s [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],constant uint4 &r [[buffer(0)]],uint2 p [[thread_position_in_grid]]){uint2 n=uint2(d.get_width(),d.get_height());if(all(p<n)){constexpr sampler q(coord::pixel,filter::nearest);d.write(s.sample(q,float2(r.xy)+(float2(p)+.5)*float2(r.zw)/float2(n)),p);}}";
     auto library=[device newLibraryWithSource:source options:nil error:error];
     _copy=library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"Copy"] error:error] : nil;
     _copyDepth=library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"Depth"] error:error] : nil;
@@ -159,6 +167,13 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
         (_directMotion && !fgUsable(motion,_effect.motionTextureUsage))) {
         if (error) *error=fgError(@"Frame generation inputs changed format or usage."); return nil;
     }
+    // Dynamic resolution: depth and motion hold a smaller region at the origin.
+    NSUInteger regionW=p.contentWidth && p.contentWidth<=_w ? p.contentWidth : _w;
+    NSUInteger regionH=p.contentHeight && p.contentHeight<=_h ? p.contentHeight : _h;
+    bool reduced=regionW<_w || regionH<_h;
+    if (reduced && (_directDepth || _directMotion)) {
+        if (error) *error=fgError(@"Frame generation reads depth and motion in place and cannot take a reduced region."); return nil;
+    }
     [_lock lock];
     // Direct inputs are BG3's textures; the rest are pooled converted copies.
     // A copied color also serves as the next frame's previous color, so the
@@ -177,9 +192,11 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
         for (NSUInteger i=0;i<3;++i) {
             id<MTLTexture> t=targets[i];
             if (t==sources[i]) continue;
-            MTLOrigin origin=i==0 ? sceneOrigin : inputOrigin; uint32_t o[2]={uint32_t(origin.x),uint32_t(origin.y)};
+            MTLOrigin origin=i==0 ? sceneOrigin : inputOrigin;
+            uint32_t region[4]={uint32_t(origin.x),uint32_t(origin.y),uint32_t(i ? regionW : t.width),uint32_t(i ? regionH : t.height)};
             [encoder setComputePipelineState:i==1 ? _copyDepth : _copy];
-            [encoder setTexture:sources[i] atIndex:0]; [encoder setTexture:t atIndex:1]; [encoder setBytes:o length:sizeof(o) atIndex:0];
+            [encoder setTexture:sources[i] atIndex:0]; [encoder setTexture:t atIndex:1];
+            [encoder setBytes:region length:sizeof region atIndex:0];
             [encoder dispatchThreads:MTLSizeMake(t.width,t.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         }
         [encoder endEncoding];
@@ -187,11 +204,13 @@ static BOOL fgUsable(id<MTLTexture> t, MTLTextureUsage required) { return t && (
     id<MTLTexture> previous=_directColor ? nil : (_previous ?: color);
     // Captured values: the Metal 4 bridge may encode this frame later.
     float nearPlane=c[48], farPlane=c[49], aspect=(float)_outW/_outH; BOOL reset=_reset || p.reset;
+    // Motion and jitter are in rendered pixels; stretching a reduced region scales them.
+    float stretchX=float(_w)/regionW, stretchY=float(_h)/regionH;
     void (^configure)(id<MTLFXFrameInterpolatorBase>)=^(id<MTLFXFrameInterpolatorBase> e) {
         e.colorTexture=color; e.prevColorTexture=previous; e.outputTexture=out;
         e.depthTexture=z; e.motionTexture=mv; e.depthReversed=p.depthReversed;
-        e.motionVectorScaleX=p.motionScaleX; e.motionVectorScaleY=p.motionScaleY;
-        e.jitterOffsetX=p.jitterX; e.jitterOffsetY=p.jitterY;
+        e.motionVectorScaleX=p.motionScaleX*stretchX; e.motionVectorScaleY=p.motionScaleY*stretchY;
+        e.jitterOffsetX=p.jitterX*stretchX; e.jitterOffsetY=p.jitterY*stretchY;
         e.nearPlane=nearPlane; e.farPlane=farPlane; e.fieldOfView=fov;
         e.aspectRatio=aspect; e.deltaTime=delta;
         e.shouldResetHistory=reset; e.uiTexture=nil;

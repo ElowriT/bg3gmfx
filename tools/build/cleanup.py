@@ -1,54 +1,70 @@
 #!/usr/bin/env python3
-"""Scoped cleanup for `make clean` and `make clean-evidence`.
+"""Safely remove disposable build binaries or retained evidence folders."""
 
-    cleanup.py bin|evidence BIN_DIR EVIDENCE_DIR
-
-Removes BIN_DIR (mode `bin`) or EVIDENCE_DIR (mode `evidence`) and nothing
-else: retained captures, historical files and downloaded references elsewhere
-under build/ stay. Both directories are checked before anything is deleted:
-their names must end in 'bin' and 'evidence', neither may contain the other,
-and no component of either path may be a symlink.
-"""
-
+import argparse
 import os
+from pathlib import Path
 import shutil
 import sys
 
 
-def fail(message):
-    print(f"cleanup: {message}", file=sys.stderr)
-    sys.exit(2)
+def absolute_lexical(path):
+    """Make a path absolute without following symlinks."""
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return Path(os.path.abspath(path))
 
 
-def checked(path, name):
-    if not path:
-        fail(f"no {name} directory given")
-    absolute = os.path.abspath(path)
-    if os.path.basename(absolute) != name:
-        fail(f"{path} must end in '{name}'")
-    # Every existing prefix, the directory itself included: a symlink anywhere
-    # could send the deletion outside the build tree.
-    current = os.sep
-    for part in absolute.strip(os.sep).split(os.sep):
-        current = os.path.join(current, part)
-        if os.path.islink(current):
-            fail(f"{path} contains a symlink ({current})")
-    return absolute
+def has_symlink_component(path):
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            return current
+    return None
 
 
-def main(argv):
-    if len(argv) != 4 or argv[1] not in ("bin", "evidence"):
-        fail("usage: cleanup.py bin|evidence BIN_DIR EVIDENCE_DIR")
-    binaries = checked(argv[2], "bin")
-    evidence = checked(argv[3], "evidence")
-    if os.path.commonpath([binaries, evidence]) in (binaries, evidence):
-        fail(f"{binaries} and {evidence} overlap")
-    target = binaries if argv[1] == "bin" else evidence
-    if os.path.isdir(target):
-        shutil.rmtree(target)
-    elif os.path.exists(target):
-        fail(f"{target} is not a directory")
+def validate_cleanup_paths(bin_dir, evidence_dir):
+    paths = {
+        "bin": absolute_lexical(bin_dir),
+        "evidence": absolute_lexical(evidence_dir),
+    }
+    for label, path in paths.items():
+        if path.name != label:
+            raise ValueError(f"{label} cleanup path must end in '{label}': {path}")
+        link = has_symlink_component(path)
+        if link:
+            raise ValueError(f"cleanup path contains a symlink: {link}")
+
+    binary, evidence = paths["bin"], paths["evidence"]
+    if binary == evidence or binary in evidence.parents or evidence in binary.parents:
+        raise ValueError(f"bin and evidence cleanup paths overlap: {binary} and {evidence}")
+    return paths
+
+
+def clean(path):
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise ValueError(f"cleanup target is not a directory: {path}")
+    shutil.rmtree(path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", choices=("bin", "evidence"))
+    parser.add_argument("bin_dir", type=Path)
+    parser.add_argument("evidence_dir", type=Path)
+    args = parser.parse_args()
+    try:
+        paths = validate_cleanup_paths(args.bin_dir, args.evidence_dir)
+        clean(paths[args.target])
+    except (OSError, ValueError) as error:
+        print(f"build-cleanup: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main())

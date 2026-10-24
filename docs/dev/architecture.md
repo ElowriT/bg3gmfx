@@ -408,21 +408,32 @@ fixtures keep independent layouts/expected instructions to catch drift.
   `BG3MFX_RENDER_THREAD_OPTIMIZATIONS=0` disables it): fragment texture slots and pipelines
   already bound in the encoder are not forwarded to the driver. The diagnostic
   runtime counts BG3's redundant binds with `BG3MFX_TRACE_REDUNDANT=1`.
-- `src/features/shadows/ShadowDuplicateFix.*`: removes BG3's duplicate cascaded-shadow stage
-  (on by default; `BG3MFX_SHADOW_RENDERING_OPTIMIZATIONS=0` disables it); see
-  [`docs/dev/performance.md`](performance.md).
+- `src/features/shadows/`: Shadow Rendering Optimizations (on by default;
+  `BG3MFX_SHADOW_RENDERING_OPTIMIZATIONS=0` disables both parts).
+  - `ShadowDuplicateFix.*` removes BG3's duplicate cascaded-shadow stage; see
+    [`docs/dev/performance.md`](performance.md).
+  - `ImprovedShadows.*` (improved shadows) replaces BG3's sun shadow mask
+    shaders, PCSS (Medium, High) and PCF (Low):
+    - it uses each pixel's G-buffer normal in place of BG3's per-quad derived
+      normal, and keeps the full normal offset (no grazing fade);
+    - `Trace.mm` builds the replacement pipeline when BG3 creates
+      `DirLight_Cascaded_PCSS_*` or `DirLight_Cascaded_PCF_*`, records
+      GBuffer0 at the G-buffer pass, and swaps the pipeline around the shadow
+      draw, falling back to BG3's draw.
+
+    See [validation](validation/README.md#improved-shadows-october-23-2026).
 - `src/features/thread-idling/ThreadIdling.*`: CPU Thread Idling (on by default;
   `BG3MFX_CPU_THREAD_IDLING=0` disables it). BG3's idle workers, job scheduler,
   and frame limiter (`GameClock::CapFrame`, the server tick and client frame
   cap) sleep instead of spinning; batch completion waits keep BG3's yield.
 - `src/features/reduce-locking/UniformSlices.*`: Reduced Locking
-  (experimental; the launcher passes `BG3MFX_REDUCE_LOCKING=0` unless the
-  player sets `=1`). `BindMaterialParameters` and
+  (experimental; on unless the player sets
+  `BG3MFX_REDUCE_LOCKING=0`). `BindMaterialParameters` and
   `SetupEngineParameters` take their uniform allocations from a per-thread
   slice reserved through BG3's own `MetalRenderer` lock; a hook on
   `BeginFrame`'s reset retires the slices.
 - `src/features/cluster-buffer-guard/ClusterBufferGuard.*`: Character Creation Crash Fix (experimental;
-  the launcher passes `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0` unless the player sets `=1`). `Trace.mm` binds a zero-filled,
+  on unless the player sets `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0`). `Trace.mm` binds a zero-filled,
   untracked stand-in at compute buffer indices 1 and 6 and fragment index 1 on
   each new encoder, so a clustered-lighting pass that BG3 dispatches without
   `ClusterInfoBuffer` reads no lights instead of faulting the GPU. Diagnostic
@@ -449,6 +460,23 @@ fixtures keep independent layouts/expected instructions to catch drift.
 - `src/integration/diagnostics/ServerPacingProbe.*`: opt-in measurement
   (`BG3MFX_TRACE_SERVER_PACING=1`, diagnostic runtime) of the server tick's work,
   CPU time and limiter, logged to category `pacing`.
+- `src/features/dynamic-resolution/DynamicResolution.*`: the Dynamic Upscaling
+  Quality (4: keeps the Upscaler Target Minimum FPS slider as a minimum (limited by the refresh rate and Max Frame Rate), at native resolution when it can; the Dynamic Upscaler Thermal Guard checkbox also lowers a ceiling on the area while `NSProcessInfo` reports a thermal state above nominal; MetalFX Temporal only, with or without Frame Generation; installed by
+  default, `BG3MFX_DYNAMIC_RESOLUTION=0` skips it). Before each on-screen frame
+  records it sets BG3's unused render-viewport reduction (`RenderFrame` +0x4368)
+  from a GPU-busy controller and recalculates the frame's and views' viewports,
+  so render-resolution passes draw a sub-rectangle of the same targets. The area
+  spans the device's MetalFX Temporal input content scale range. The TAA
+  capture accepts the reduced viewport, a dynamic-resolution scaler upscales
+  just that region, and `Trace.mm`'s commit hook reports BG3's command-buffer
+  GPU intervals to the controller. Diagnostic runtime: `BG3MFX_DYNAMIC_RESOLUTION_AREA=<area>`
+  or `<min>,<max>,<seconds>` overrides the controller; logged to category
+  `resolution`. It also patches the volumetric fog history's previous
+  viewport loads, the auto-exposure scene UV load, the SSR history viewport, an SSR history discard after each area change, and loads of the full view rectangle for forward lighting clamps, bloom and DOF radii and the projection jitter divisor; `Trace.mm` gives the fog composite a viewport-mapped vertex
+  shader (`viewportFogDescriptor`, whenever the feature is installed) and
+  corrects surface grid draws (`SurfaceGridDraw`) and subsurface scattering
+  widths (`SubsurfaceDraw`) while reducing. See
+  [validation](validation/README.md#dynamic-resolution-probe-october-21-2026).
 - Header-padding islands: Temporal jitter `0x000`–`0x0c0`, Lua `0x700`, server
   pacing probe `0x800`, thread idling `0x9c0`, uniform slices `0xa00` (offsets from
   `0x100004000`). Each install checks its range is still zero.

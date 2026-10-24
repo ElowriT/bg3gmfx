@@ -16,9 +16,9 @@
 # environment (for example BG3MFX_LAB=/absolute/path); BG3MFX_RUNTIME there
 # selects another runtime library, and BG3MFX_STEAM_OVERLAY=0 leaves out
 # Steam's libraries, as the bg3mfx launcher does. Like that launcher, this
-# keeps the experimental features off unless steam-launch.env or the
-# environment sets them (BG3MFX_REDUCE_LOCKING=1,
-# BG3MFX_CHARACTER_CREATION_CRASH_FIX=1).
+# turns the experimental features on unless steam-launch.env or the
+# environment sets them (BG3MFX_REDUCE_LOCKING=0,
+# BG3MFX_CHARACTER_CREATION_CRASH_FIX=0 turn one off).
 set -u
 checkout="$(cd "$(dirname "$0")/../.." && pwd)"
 runtime="$checkout/build/bin/libBG3MetalFX.dylib"
@@ -49,7 +49,7 @@ fi
 for key in BG3MFX_CHARACTER_CREATION_CRASH_FIX BG3MFX_REDUCE_LOCKING; do
     case "$named" in *" $key "*) continue ;; esac
     value="$(/usr/bin/printenv "$key" || true)"
-    extra+=(--env "$key=${value:-0}")
+    extra+=(--env "$key=${value:-1}")
 done
 
 # The bundle Steam passed, if it arrived intact; otherwise the Steam libraries.
