@@ -48,10 +48,10 @@ launcher and settings keep BG3MFX's names (`bg3mfx`, `BG3MFX_…`). To turn one 
 the changes off, add its line to `build/steam-launch.env` in that folder:
 `BG3MFX_SPLIT_SCREEN_FOG=0`, `BG3MFX_METALFX_SHARPENING=0`,
 `BG3MFX_KEEP_REBIND_CLICK=1` (keeps the game's click), or
-`BG3MFX_STEAM_OVERLAY=0` (starts without the Steam overlay). The
-[experimental features](#experimental-features) stay off with the Play button
-too; to try one, add `BG3MFX_REDUCE_LOCKING=1` or
-`BG3MFX_CHARACTER_CREATION_CRASH_FIX=1` to the same file. Developers also
+`BG3MFX_STEAM_OVERLAY=0` (starts without the Steam overlay). Reduced Locking
+and the Character Creation Crash Fix are on, as in BG3MFX; to turn one off, add
+`BG3MFX_REDUCE_LOCKING=0` or `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0` to the same
+file. Developers also
 get a lab mode for live renderer investigation, with virtual controllers and a
 GPU profiler: see [lab mode](docs/dev/lab.md).
 
