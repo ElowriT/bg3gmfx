@@ -127,6 +127,13 @@ static bool prepassTrim;
 static bool bindDedup;
 // Cluster buffer guard (features/cluster-buffer-guard).
 static bool clusterGuard;
+// MetalFX reads FSR_Tonemap's input, so with a MetalFX upscaler selected that
+// pass only feeds native FSR: skip its draw and recreate its output only on a
+// frame that falls back to native FSR (suppressFSRTonemap, restoreSkippedTonemap).
+static bool skipFSRTonemap;
+#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+static std::atomic<unsigned> fsrTonemapStoresDropped{0};
+#endif
 // Diagnostics: binds that repeat the encoder's current binding.
 static bool redundantProbe;
 static bool improvedShadows;
@@ -186,6 +193,10 @@ struct CompositionDraw {
     // Improved shadows: BG3's sun shadow mask pipeline is bound.
     bool shadowMask;
     __unsafe_unretained id<MTLBuffer> engineBuffer;
+    // FSR_Tonemap skip: this pass's store action is chosen at endEncoding
+    // (renderEncoder); DontCare only if its FSR_Tonemap draw was skipped and
+    // nothing else reached BG3's encoder.
+    bool deferredStore, tonemapSkipped, storeNeeded;
     NSUInteger engineOffset;
     // Bind dedup: fragment textures this encoder has actually forwarded.
     BG3MFXBindFilter bindFilter;
@@ -597,7 +608,8 @@ static void record(NSDictionary *event) {
         [kind isEqualToString:@"temporalValidationProgress"] || [kind isEqualToString:@"temporalScalerCreated"] || [kind hasPrefix:@"frameGeneration"] || [kind isEqualToString:@"nativeMenuOption"] ||
 [kind isEqualToString:@"prepassTrim"] || [kind hasPrefix:@"cullTiming"] || [kind isEqualToString:@"redundantBinds"] ||
         [kind hasPrefix:@"threadIdling"] || [kind hasPrefix:@"uniformSlices"] || [kind hasPrefix:@"luaJumpFix"] ||
-        [kind isEqualToString:@"metal4Residency"] || [kind isEqualToString:@"clusterBufferGuard"] ||
+        [kind isEqualToString:@"metal4Residency"] || [kind isEqualToString:@"metal4BridgeStall"] ||
+        [kind isEqualToString:@"upscalingFallback"] || [kind isEqualToString:@"clusterBufferGuard"] ||
         [kind isEqualToString:@"viewportReductionPass"] || [kind hasPrefix:@"dynamicResolution"] || [kind isEqualToString:@"surfaceDebugFragment"] ||
         [kind isEqualToString:@"surfaceGrid"] || [kind isEqualToString:@"subsurfaceScale"] ||
         [kind isEqualToString:@"stencilDump"];
@@ -1936,6 +1948,14 @@ static void dumpStencil(id<MTLCommandBuffer> buffer, id<MTLTexture> depth, NSStr
 }
 #endif
 static void endEncoder(id self, SEL cmd) {
+    if (__unsafe_unretained BG3MFXEncoderState *s = skipFSRTonemap ? encoderState(self) : nil; s && s->deferredStore) {
+        s->deferredStore = false;
+        bool drop = s->tonemapSkipped && !s->storeNeeded;
+        [(id<MTLRenderCommandEncoder>)self setColorStoreAction:drop ? MTLStoreActionDontCare : MTLStoreActionStore atIndex:0];
+#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+        if (drop) ++fsrTonemapStoresDropped;
+#endif
+    }
     id<MTLCommandBuffer> commandBuffer = encoderBuffer(self);
 #ifndef BG3MFX_NO_TRACE
     NSString *stencilRole = getenv("BG3MFX_STENCIL_DUMP_DIR") ? objc_getAssociatedObject(self, &stencilRoleKey) : nil;
@@ -2182,6 +2202,7 @@ static void pipeline(__unsafe_unretained id self, SEL cmd, __unsafe_unretained i
 #endif
     __unsafe_unretained BG3MFXPipelineInfo *info = state ? (__bridge BG3MFXPipelineInfo *)pipelineInfoPointer(state) : nil;
     NSDictionary *description = info ? info->description : nil;
+    if (s && s->deferredStore && ![description[@"fragment"] isEqualToString:@"FSR_Tonemap"]) s->storeNeeded = true;
     if (diagnostics && !description) description = @{@"label": [state label] ?: @""};
 #ifndef BG3MFX_NO_TRACE
     // Viewport reduction: where the first pipeline of each pass and the
@@ -3060,7 +3081,7 @@ static bool fastDraw(__unsafe_unretained id encoder) {
     if (diagnostics) return false;
     __unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder);
     if (s && s->kind!=PipelineOther) { s->lastDrawOther=false; return false; }
-    if (s) s->lastDrawOther=true;
+    if (s) { s->lastDrawOther=true; s->storeNeeded=true; }
     return true;
 }
 static void drawInputs(id encoder, const CompositionDraw &call) {
@@ -3127,6 +3148,103 @@ static BOOL suppressTemporalTAA(id encoder) {
     noteAssociation(encoder,AssocSuppressed);
     record(@{@"event":@"temporalNativeTAADrawSkipped",@"pipeline":state});
     return YES;
+}
+// FSR_Tonemap's rgb/(1+max(rgb)) compression, for a frame that falls back to
+// native FSR after its draw was skipped.
+static id<MTLComputePipelineState> fsrTonemapPipeline(id<MTLDevice> device) {
+    static id<MTLComputePipelineState> compress;
+    static bool failed;
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (compress && compress.device == device) return compress;
+    if (failed) return nil;
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void BG3MFXFSRTonemap(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 p [[thread_position_in_grid]]) {"
+        "if (p.x >= dst.get_width() || p.y >= dst.get_height()) return;"
+        "float3 c = src.read(p).rgb; dst.write(float4(c / (1.0 + max(c.r, max(c.g, c.b))), 1.0), p); }";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    compress = library ? [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"BG3MFXFSRTonemap"] error:&error] : nil;
+    if (!compress) { failed = true; record(@{@"event":@"fsrTonemapKernelFailed",@"error":error.localizedDescription ?: @""}); }
+    return compress;
+}
+static char skippedTonemapKey;
+// Targets of skipped FSR_Tonemap draws: render passes into them start with a
+// deferred store action (renderEncoder) so a skipped pass stores nothing.
+static NSHashTable *fsrTonemapTargets() {
+    static NSHashTable *targets = [NSHashTable hashTableWithOptions:
+        NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
+    return targets;
+}
+// The postprocess association drawInputs just made says whether this is a
+// tracked FSR_Tonemap draw whose input MetalFX will read.
+static BOOL suppressFSRTonemap(id encoder) {
+    if (!skipFSRTonemap) return NO;
+    int mode = encoderScalingMode(encoder);
+    if (!((mode == 2 && !spatialFailed) || (mode == 3 && !temporalFailed))) return NO;
+    if (!(encoderAssociations(encoderState(encoder)) & AssocPostprocess)) return NO;
+    NSDictionary *postprocess = objc_getAssociatedObject(encoder,&temporalPostprocessKey);
+    if (![postprocess[@"tonemap"] boolValue] || !postprocess[@"frame"]) return NO;
+    id<MTLTexture> source = postprocess[@"source"], target = postprocess[@"target"];
+    id<MTLCommandBuffer> buffer = encoderBuffer(encoder);
+    if (!buffer || !source || !target || !(source.usage & MTLTextureUsageShaderRead) ||
+        !(target.usage & MTLTextureUsageShaderWrite) || !fsrTonemapPipeline(buffer.device)) return NO;
+    NSMutableDictionary *skipped = objc_getAssociatedObject(buffer,&skippedTonemapKey);
+    if (!skipped) {
+        skipped = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(buffer,&skippedTonemapKey,skipped,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    skipped[[NSValue valueWithPointer:(__bridge const void *)target]] = source;
+    { std::lock_guard<std::recursive_mutex> lock(guard()); [fsrTonemapTargets() addObject:target]; }
+    if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder)) s->tonemapSkipped = true;
+    record(@{@"event":@"fsrTonemapDrawSkipped",@"source":texture(source),@"target":texture(target)});
+    return YES;
+}
+static BOOL suppressNativeDraw(id encoder) {
+    if (suppressTemporalTAA(encoder) || suppressFSRTonemap(encoder)) return YES;
+    if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder)) s->storeNeeded = true;
+    return NO;
+}
+// original() for a selector this encoder's class may not have hooked.
+static IMP originalOrCurrent(id object, SEL selector) {
+    std::lock_guard<std::recursive_mutex> lock(guard());
+    for (Class cls = object_getClass(object); cls; cls = class_getSuperclass(cls)) {
+        auto it = originals().find({cls, selector});
+        if (it != originals().end()) return it->second;
+    }
+    return class_getMethodImplementation(object_getClass(object),selector);
+}
+// Called just before a native FSR dispatch: if this frame skipped the
+// FSR_Tonemap draw that wrote FSR's input, write that input now in the same
+// encoder, then restore BG3's pipeline and texture bindings. Bypassing the
+// hooks keeps the encoder's binding cache describing BG3's state.
+static void restoreSkippedTonemap(id encoder, id<MTLCommandBuffer> buffer, NSDictionary *textures) {
+    NSMutableDictionary *skipped = objc_getAssociatedObject(buffer,&skippedTonemapKey);
+    id<MTLTexture> target = textures[@"0"];
+    if (!skipped || !target) return;
+    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)target];
+    id<MTLTexture> source = skipped[key];
+    id compress = source ? fsrTonemapPipeline(buffer.device) : nil;
+    id native = encoderPipeline(encoder);
+    if (!compress || !native) return;
+    [skipped removeObjectForKey:key];
+    SEL setPipeline = @selector(setComputePipelineState:), setTexture = @selector(setTexture:atIndex:);
+    SEL run = @selector(dispatchThreads:threadsPerThreadgroup:);
+    auto bindPipeline = (void(*)(id,SEL,id))originalOrCurrent(encoder,setPipeline);
+    auto bindTexture = (void(*)(id,SEL,id,NSUInteger))originalOrCurrent(encoder,setTexture);
+    bindPipeline(encoder,setPipeline,compress);
+    bindTexture(encoder,setTexture,source,0);
+    bindTexture(encoder,setTexture,target,1);
+    ((void(*)(id,SEL,MTLSize,MTLSize))originalOrCurrent(encoder,run))(encoder,run,
+        MTLSizeMake(target.width,target.height,1),MTLSizeMake(8,8,1));
+    // Serial encoders order the two dispatches through tracked hazards already.
+    if ([(id<MTLComputeCommandEncoder>)encoder dispatchType] == MTLDispatchTypeConcurrent) {
+        id<MTLResource> written[] = {target};
+        [(id<MTLComputeCommandEncoder>)encoder memoryBarrierWithResources:written count:1];
+    }
+    bindPipeline(encoder,setPipeline,native);
+    bindTexture(encoder,setTexture,target,0);
+    bindTexture(encoder,setTexture,textures[@"1"],1);
+    record(@{@"event":@"fsrTonemapRestored",@"source":texture(source),@"target":texture(target)});
 }
 // BG3's subsurface scattering blurs (PPSSSS_H/V) step through the kernel by
 // P00 (horizontal) or P11 (vertical) x width / (2 x view depth) in target UV,
@@ -3203,7 +3321,7 @@ static void draw(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NS
     if (shadowMaskBound(self) && shadowMaskDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); return; }
     drawInputs(self,CompositionDraw{type,start,count,1,0,0,nil,0,MTLIndexTypeUInt16});
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count);
 }
 static void drawInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances) {
@@ -3215,7 +3333,7 @@ static void drawInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType
     if (shadowMaskBound(self) && shadowMaskDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); return; }
     drawInputs(self,CompositionDraw{type,start,count,instances,0,0,nil,0,MTLIndexTypeUInt16});
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances);
 }
 static void drawBaseInstance(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances, NSUInteger base) {
@@ -3227,7 +3345,7 @@ static void drawBaseInstance(__unsafe_unretained id self, SEL cmd, MTLPrimitiveT
     if (shadowMaskBound(self) && shadowMaskDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); return; }
     drawInputs(self,CompositionDraw{type,start,count,instances,base,0,nil,0,MTLIndexTypeUInt16});
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base);
 }
 // BG3 draws its surfaces (blood, water) on a screen-space grid whose vertices
@@ -3280,7 +3398,7 @@ static void drawIndexed(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType t
 #ifndef BG3MFX_NO_TRACE
     captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@1,@"baseVertex":@0,@"baseInstance":@0});
 #endif
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset);
 }
 static void drawIndexedInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances) {
@@ -3294,7 +3412,7 @@ static void drawIndexedInstances(__unsafe_unretained id self, SEL cmd, MTLPrimit
 #ifndef BG3MFX_NO_TRACE
     captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@(instances),@"baseVertex":@0,@"baseInstance":@0});
 #endif
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances);
 }
 static void drawIndexedBase(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances, NSInteger baseVertex, NSUInteger baseInstance) {
@@ -3308,7 +3426,7 @@ static void drawIndexedBase(__unsafe_unretained id self, SEL cmd, MTLPrimitiveTy
 #ifndef BG3MFX_NO_TRACE
     captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@(instances),@"baseVertex":@(baseVertex),@"baseInstance":@(baseInstance)});
 #endif
-    if (suppressTemporalTAA(self)) return;
+    if (suppressNativeDraw(self)) return;
     ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger,NSInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances,baseVertex,baseInstance);
 }
 // Native compute with Frame Generation: carry the scene's association from
@@ -3487,6 +3605,8 @@ native:
             @"method":NSStringFromSelector(cmd)});
         return;
     }
+    // Native FSR after a skipped FSR_Tonemap draw (a fallback frame) needs that pass's output.
+    if (skipFSRTonemap && buffer && [pipelineName isEqualToString:@"FSR"]) restoreSkippedTonemap(self,buffer,textures);
     ((void(*)(id,SEL,MTLSize,MTLSize))original(self,cmd))(self,cmd,grid,threads);
 }
 // Encoder classes whose methods are already hooked. hook() would find each one
@@ -3613,17 +3733,33 @@ static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
         @"computeHookRegistered": @(computeRegistered),
         @"computeHookActive": @(computeMethod && method_getImplementation(computeMethod) == (IMP)computeEncoderType)});
     }
+    // A pass whose only attachment is a skipped FSR_Tonemap draw's target
+    // (BG3 loads nothing into it) defers its store action to endEncoding.
+    MTLRenderPassDescriptor *pass = desc;
+    bool deferStore = false;
+    if (skipFSRTonemap && desc.colorAttachments[0].storeAction == MTLStoreActionStore && !desc.colorAttachments[1].texture &&
+        !desc.depthAttachment.texture && !desc.stencilAttachment.texture) {
+        std::lock_guard<std::recursive_mutex> lock(guard());
+        if (desc.colorAttachments[0].texture && [fsrTonemapTargets() containsObject:desc.colorAttachments[0].texture]) {
+            pass = [desc copy]; pass.colorAttachments[0].storeAction = MTLStoreActionUnknown; deferStore = true;
+        }
+    }
     NSUInteger samples = labEnabled ? labProfileSamples([(id<MTLCommandBuffer>)self device]) : NSNotFound;
     if (samples != NSNotFound) {
-        MTLRenderPassDescriptor *profiled = [desc copy];
-        MTLRenderPassSampleBufferAttachmentDescriptor *attachment = profiled.sampleBufferAttachments[0];
+        if (pass == desc) pass = [desc copy];
+        MTLRenderPassSampleBufferAttachmentDescriptor *attachment = pass.sampleBufferAttachments[0];
         attachment.sampleBuffer = labCounters;
         attachment.startOfVertexSampleIndex = samples; attachment.endOfVertexSampleIndex = MTLCounterDontSample;
         attachment.startOfFragmentSampleIndex = MTLCounterDontSample; attachment.endOfFragmentSampleIndex = samples + 1;
-        desc = profiled;
     }
-    id encoder = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,desc);
+    id encoder = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,pass);
     instrumentEncoder(encoder);
+    if (deferStore && encoder) {
+        __unsafe_unretained BG3MFXEncoderState *s = encoderState(encoder);
+        // Without a state record endEncoding could not resolve the store.
+        if (s) { s->deferredStore = true; s->tonemapSkipped = s->storeNeeded = false; }
+        else [(id<MTLRenderCommandEncoder>)encoder setColorStoreAction:MTLStoreActionStore atIndex:0];
+    }
 #ifndef BG3MFX_NO_TRACE
     if (encoder && getenv("BG3MFX_STENCIL_DUMP_DIR") && desc.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
         objc_setAssociatedObject(encoder, &stencilDepthKey, desc.depthAttachment.texture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -4007,6 +4143,8 @@ __attribute__((constructor)) static void start() {
         }
         // Character Creation Crash Fix; BG3MFX_CHARACTER_CREATION_CRASH_FIX=0 leaves BG3's bindings alone for comparison.
         clusterGuard = metalFXEnabled && !(getenv("BG3MFX_CHARACTER_CREATION_CRASH_FIX") && strcmp(getenv("BG3MFX_CHARACTER_CREATION_CRASH_FIX"),"0") == 0);
+        // BG3MFX_SKIP_FSR_TONEMAP=0 keeps BG3's FSR_Tonemap draw for comparison.
+        skipFSRTonemap = metalFXEnabled && !(getenv("BG3MFX_SKIP_FSR_TONEMAP") && strcmp(getenv("BG3MFX_SKIP_FSR_TONEMAP"),"0") == 0);
         // Improved shadows, part of Shadow Rendering Optimizations (see
         // features/shadows/ImprovedShadows.h); needs the draw hooks.
         improvedShadows = metalFXEnabled && BG3MFXImprovedShadowsEnabled();
@@ -4090,6 +4228,10 @@ __attribute__((constructor)) static void start() {
 extern "C" NSDictionary *BG3MFXStandaloneGeneratedPair(id<MTLCommandBuffer> buffer) {
     if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return nil;
     return objc_getAssociatedObject(buffer,&generatedPairKey);
+}
+extern "C" NSUInteger BG3MFXStandaloneFSRTonemapStoresDropped(void) {
+    if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return 0;
+    return fsrTonemapStoresDropped.load();
 }
 extern "C" NSUInteger BG3MFXStandaloneTemporalScalersCreated(void) {
     if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.larian.bg3"]) return 0;

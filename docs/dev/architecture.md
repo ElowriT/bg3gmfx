@@ -61,6 +61,24 @@ its output) seeds the chain there. A live trace with SMAA (October 19) showed
 SMAA, bloom and color grading writing that input; before this seeding, every
 SMAA frame fell back to native FSR.
 
+While Spatial or Temporal is selected and has not failed, BG3's `FSR_Tonemap`
+draw is skipped: MetalFX reads its input, and its output feeds only FSR (it is
+FSR 1's reversible `rgb / (1 + max(rgb))` normalization, undone by RCAS). BG3
+gives that draw its own render pass, loading nothing (DontCare) and storing its
+one color target (October 21 Temporal capture). The pass itself stays, since BG3
+caches encoder state it believes it has set and only resets that cache when it
+ends a real encoder (a nil encoder would leave it stale), but a pass into a
+target a skipped draw has written starts with an Unknown store action that
+`endEncoding` resolves: DontCare when the FSR_Tonemap draw was skipped and
+nothing else drew or bound another pipeline, Store otherwise. Whether a frame
+falls back to native FSR (size settling, mismatched resources) is known only at
+the FSR dispatch, after that pass has ended, so at a fallback dispatch
+`Trace.mm` first runs its own compute kernel with the same normalization from the
+skipped draw's source into its target inside BG3's compute encoder, then
+restores BG3's FSR pipeline and textures. BG3's draw cannot run there: a render
+pass cannot open inside the active compute encoder. `BG3MFX_SKIP_FSR_TONEMAP=0`
+keeps the draw and the store.
+
 `Trace.mm` captures HDR scene color, device depth, motion, camera constants, and
 BG3's original jitter at the TAA stage. It copies current color into the skipped
 TAA output and tracks that color through native bloom, color grading, and outline
@@ -89,17 +107,26 @@ Temporal uses `MTL4FXTemporalScaler` on devices reporting `supportsMetal4FX:`;
 other devices retain `MTLFXTemporalScaler`. A dedicated Metal 4 queue waits on
 an event signaled after BG3 produces the scaler inputs, then signals another
 event that BG3's original Metal 3 buffer waits on before consuming the output.
+A queue-level wait has no per-command-buffer form, so work submitted before
+BG3 commits its buffer would hold the whole Metal 4 queue on a buffer BG3 had
+not committed yet, or never would. BG3 also encodes its command buffers on
+several threads and fixes their GPU order with `-enqueue` afterwards, so
+encoding order and GPU order can differ (seen with the frame cap off). A Metal 4
+submission is therefore recorded and submitted only when its BG3 buffer, and
+every buffer enqueued before it on its queue, has been committed (the `commit`
+and `-enqueue` hooks): the queue never waits on a buffer that runs later, and
+the temporal scaler and the Frame Generation effect see frames in GPU order
+(they link each frame to the one encoded before). A buffer that is never
+committed records nothing, so MetalFX never holds a command buffer that does not
+run (it stalls its next submission if one it encoded into never runs). Before
+this, such a frame left the Metal 4 queue and BG3 waiting on each other until
+the GPU timed out (`MTL4CommandQueueErrorDomain` error 1, then macOS refused the
+game further GPU submissions). Buffers the runtime did not create, and every
+buffer with `BG3MFX_METAL4_ORDER=0`, submit at once. Upstream 0.4.1 records at
+encoding and submits from the commit hook instead, submitting work of buffers
+committed out of encoding order without the wait; this fork keeps the ordered
+submission (`bridge-handshake-sim` compares the scenarios).
 Per-submission residency and feedback-owned resources preserve GPU lifetimes.
-BG3 encodes its command buffers on several threads and fixes their GPU order
-with `-enqueue` afterwards, so encoding order and GPU order can differ (seen
-with the frame cap off). A Metal 4 submission is therefore recorded and
-submitted only when its BG3 buffer, and every buffer enqueued before it on its
-queue, has been committed: the queue never waits on a buffer that runs later,
-and the temporal scaler and the Frame Generation effect see frames in GPU
-order (they link each frame to the one encoded before). A buffer that is never
-committed never submits. Before this, such a frame left the Metal 4 queue and
-BG3 waiting on each other until the GPU timed out (`MTL4CommandQueueErrorDomain`
-error 1, then macOS refused the game further GPU submissions).
 This does not convert BG3's renderer or presentation to Metal 4. See the
 [Metal 4 audit](validation/metal4-temporal.md) for the API/model distinction and
 validation limits.
@@ -369,9 +396,9 @@ does not alter the app bundle.
 - `build/bin/`: disposable compiled launchers, libraries, tests, and probes.
 - `build/evidence/<date>-<experiment>/`: retained captures, traces, and pixel-test
   images. New diagnostic traces and temporal quality runs use dated folders.
-- Other existing `build/` paths are retained historical artifacts and downloaded
-  references, including `build/profiling/` (formerly `perf/data/`). Cleanup never
-  removes these. Never place game assets in tracked folders.
+- `build/analysis/baseline/`: retained unmodded-game baseline evidence.
+- Other `build/` paths (`build/profiling/`, downloaded references) are local
+  only; `make clean` never removes them. Never place game assets in tracked folders.
 - `docs/dev/performance.md`: renderer and CPU performance measurements.
 
 Use source-root include paths (for example `common/gpu/GPUResources.h`) with

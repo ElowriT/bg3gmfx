@@ -1,4 +1,4 @@
-VERSION ?= 0.3.2
+VERSION ?= 0.4.1
 PREFIX ?= /usr/local
 BIN_DIR ?= build/bin
 EVIDENCE_DIR ?= build/evidence
@@ -146,6 +146,11 @@ $(BIN_DIR)/libBG3MetalFXTest.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BI
 	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -DBG3MFX_STANDALONE_TEST_HOOKS=1 -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
 	codesign --force --sign - $@
 
+# Synthetic BG3/Metal 4 bridge handshake scenarios (developer probe; several
+# deliberately stall for seconds, so it is not part of make test).
+$(BIN_DIR)/bridge-handshake-sim: tools/probes/bridge_handshake_sim.mm src/common/gpu/GPUResources.mm src/common/gpu/GPUResources.h | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $< src/common/gpu/GPUResources.mm $(FRAMEWORKS) -o $@
+
 $(BIN_DIR)/metalfx-probe: tools/probes/metalfx_probe.m | $(BIN_DIR)
 	xcrun clang -fobjc-arc -mmacosx-version-min=26.0 $< $(FRAMEWORKS) -o $@
 
@@ -186,6 +191,9 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/improved-shadows-smoke $(BIN_D
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib no-taa
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib resize
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib resize
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib tonemap
+	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib tonemap
+	BG3MFX_SKIP_FSR_TONEMAP=0 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib tonemap
 	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib bad-format
 	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib bad-format
 	$(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib

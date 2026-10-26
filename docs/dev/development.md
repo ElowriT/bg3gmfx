@@ -120,8 +120,9 @@ build/bin/bg3mfx --dry-run`.
 ## Developer notes
 
 - [Architecture and behavior contracts](architecture.md)
+- [BG3GMFX validation and measurements](fork-validation.md)
+- [Lab mode](lab.md)
 - [Current validation status and next checks](validation/README.md)
-- [Temporal image-quality plan](temporal-quality-plan.md)
 - [macOS renderer reference](reference/mac-renderer.md)
 - [Windows DLSS research](reference/windows-dlss.md)
 

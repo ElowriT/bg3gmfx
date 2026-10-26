@@ -1,5 +1,6 @@
 #import "common/gpu/MetalFXPipeline.h"
 #import "common/gpu/GPUResources.h"
+#import <QuartzCore/QuartzCore.h>
 #include <cmath>
 #include <cstdio>
 
@@ -10,10 +11,7 @@ int main() { @autoreleasepool {
     id<MTLDevice> device=MTLCreateSystemDefaultDevice();
     if (!device) return 1;
     NSError *error=nil;
-    BG3MFXPipeline *pipeline=[[BG3MFXPipeline alloc] initWithDevice:device inputWidth:256 inputHeight:128
-        outputWidth:512 outputHeight:256 colorFormat:MTLPixelFormatRGBA16Float depthFormat:MTLPixelFormatR32Float
-        motionFormat:MTLPixelFormatRG16Float outputFormat:MTLPixelFormatRGBA16Float error:&error];
-    if(!pipeline) { fprintf(stderr,"%s\n",error.description.UTF8String);return 2; }
+    BG3MFXPipeline *pipeline=nil;
     NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
         "kernel void Fill(texture2d<float,access::write> c [[texture(0)]],texture2d<float,access::write> d [[texture(1)]],"
         "texture2d<float,access::write> m [[texture(2)]],constant float &v [[buffer(0)]],uint2 p [[thread_position_in_grid]]) {"
@@ -22,8 +20,16 @@ int main() { @autoreleasepool {
     id<MTLComputePipelineState> fill=[device newComputePipelineStateWithFunction:[library newFunctionWithName:@"Fill"] error:&error];
     if(!fill) return 3;
     id<MTLCommandQueue> queue=[device newCommandQueue];
+    BOOL metal4=NO;
+    // Pass 0 submits Metal 4 work at once (an untracked buffer); pass 1 holds
+    // it until the Metal 3 buffer is committed, as the runtime does.
+    for(int deferred=0;deferred<2;++deferred) {
+    pipeline=[[BG3MFXPipeline alloc] initWithDevice:device inputWidth:256 inputHeight:128
+        outputWidth:512 outputHeight:256 colorFormat:MTLPixelFormatRGBA16Float depthFormat:MTLPixelFormatR32Float
+        motionFormat:MTLPixelFormatRG16Float outputFormat:MTLPixelFormatRGBA16Float error:&error];
+    if(!pipeline) { fprintf(stderr,"%s\n",error.description.UTF8String);return 2; }
     NSMutableArray *buffers=[NSMutableArray array], *readbacks=[NSMutableArray array];
-    BOOL metal4=pipeline.usesMetal4;
+    metal4=pipeline.usesMetal4;
     for(unsigned frame=0;frame<8;++frame) { @autoreleasepool {
         id<MTLTexture> inputs[3];
         MTLPixelFormat formats[]={MTLPixelFormatRGBA16Float,MTLPixelFormatR32Float,MTLPixelFormatRG16Float};
@@ -33,6 +39,7 @@ int main() { @autoreleasepool {
             inputs[i]=[device newTextureWithDescriptor:d];
         }
         id<MTLCommandBuffer> b=[queue commandBuffer];
+        if(deferred) BG3MFXMetal4TrackBuffer(b);
         id<MTLComputeCommandEncoder> encoder=[b computeCommandEncoder];
         float value=0.1f*(frame+1);
         [encoder setComputePipelineState:fill];
@@ -46,19 +53,24 @@ int main() { @autoreleasepool {
         id<MTLBlitCommandEncoder> blit=[b blitCommandEncoder];
         [blit copyFromTexture:result.rendered sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
             sourceSize:MTLSizeMake(512,256,1) toBuffer:pixels destinationOffset:0 destinationBytesPerRow:4096 destinationBytesPerImage:pixels.length];
-        [blit endEncoding];[buffers addObject:b];[readbacks addObject:pixels];[b commit];
+        [blit endEncoding];[buffers addObject:b];[readbacks addObject:pixels];BG3MFXMetal4Commit(b,^{[b commit];});
     }}
     pipeline=nil; // Submission ownership must outlive the backend and its cache.
     for(unsigned frame=0;frame<8;++frame) {
         id<MTLCommandBuffer> b=buffers[frame];[b waitUntilCompleted];
-        if(b.status!=MTLCommandBufferStatusCompleted) return 5;
-        const __fp16 *data=(const __fp16 *)[readbacks[frame] contents];
+        if(b.status!=MTLCommandBufferStatusCompleted) {
+            fprintf(stderr,"Frame %u: command buffer status %ld: %s\n",frame,(long)b.status,b.error.description.UTF8String);return 5;
+        }
+        const __fp16 *data=(const __fp16 *)((id<MTLBuffer>)readbacks[frame]).contents;
         for(unsigned y=32;y<224;y+=29) for(unsigned x=32;x<480;x+=31) {
             float v=data[(y*512+x)*4], expected=0.1f*(frame+1);
             if(!std::isfinite(v) || std::abs(v-expected)>0.02f) {
                 fprintf(stderr,"Frame %u: stale/invalid output %g, expected %g\n",frame,v,expected);return 6;
             }
         }
+    }
+    printf("%s bridge (%s submission): eight in-flight GPU producers, scalers and consumers passed after backend destruction.\n",
+        metal4 ? "Metal4" : "Metal3",deferred ? "deferred" : "immediate");
     }
     if(metal4) {
         // Submission order: BG3 encodes its buffers on several threads, then
@@ -116,9 +128,8 @@ int main() { @autoreleasepool {
             fprintf(stderr,"Expected one reordered submission, saw %llu\n",(unsigned long long)(BG3MFXMetal4Reordered()-before));return 10;
         }
     }
-    printf("%s bridge: eight in-flight GPU producers, scalers and consumers passed after backend destruction%s.\n",metal4 ? "Metal4" : "Metal3",
-        metal4 ? "; submissions followed enqueue order and skipped an uncommitted buffer" : "");
     if(!metal4) return 0;
+    puts("Metal4 bridge: submissions followed enqueue order and skipped an uncommitted buffer.");
     // BG3 can replace its render targets at the same size (live: save loads).
     // The Metal 4 residency set must not keep the replaced inputs allocated.
     pipeline=[[BG3MFXPipeline alloc] initWithDevice:device inputWidth:256 inputHeight:128
@@ -134,7 +145,7 @@ int main() { @autoreleasepool {
         }
     };
     auto run=[&](NSArray<id<MTLTexture>> *inputs)->BOOL{ @autoreleasepool {
-        id<MTLCommandBuffer> b=[queue commandBuffer];
+        id<MTLCommandBuffer> b=[queue commandBuffer];BG3MFXMetal4TrackBuffer(b);
         id<MTLComputeCommandEncoder> encoder=[b computeCommandEncoder];
         float value=0.5f;[encoder setComputePipelineState:fill];
         for(unsigned i=0;i<3;++i) [encoder setTexture:inputs[i] atIndex:i];
@@ -142,7 +153,7 @@ int main() { @autoreleasepool {
         [encoder dispatchThreads:MTLSizeMake(256,128,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[encoder endEncoding];
         BG3MFXFrameParameters p={};p.motionScaleX=p.motionScaleY=1;p.depthReversed=YES;
         if(![pipeline encodeColor:inputs[0] depth:inputs[1] motion:inputs[2] parameters:p commandBuffer:b error:nil]) return NO;
-        [b commit];[b waitUntilCompleted];return b.status==MTLCommandBufferStatusCompleted;
+        BG3MFXMetal4Commit(b,^{[b commit];});[b waitUntilCompleted];return b.status==MTLCommandBufferStatusCompleted;
     }};
     __weak id<MTLTexture> replaced[3];
     { NSMutableArray *first=[NSMutableArray array]; makeInputs(first);
@@ -156,5 +167,28 @@ int main() { @autoreleasepool {
         fprintf(stderr,"The Metal 4 residency set kept replaced same-size inputs alive\n");return 10;
     }
     puts("Metal4 bridge: inputs replaced at the same size were released after 40 submissions.");
+    // A buffer BG3 drops without committing never signals. Its Metal 4 work is
+    // never recorded, so later submissions neither wait on it (stalling every
+    // one for 4 s) nor find the scaler waiting for a command buffer that never
+    // ran, and the buffer's references go with it.
+    __weak id<MTLTexture> abandoned[3];
+    @autoreleasepool {
+        NSMutableArray *inputs=[NSMutableArray array]; makeInputs(inputs);
+        for(unsigned i=0;i<3;++i) abandoned[i]=inputs[i];
+        id<MTLCommandBuffer> b=[queue commandBuffer];BG3MFXMetal4TrackBuffer(b);
+        BG3MFXFrameParameters p={};p.motionScaleX=p.motionScaleY=1;p.depthReversed=YES;
+        if(![pipeline encodeColor:inputs[0] depth:inputs[1] motion:inputs[2] parameters:p commandBuffer:b error:nil]) return 11;
+    }
+    CFTimeInterval started=CACurrentMediaTime();
+    for(unsigned frame=0;frame<40;++frame) if(!run(second)) {
+        fprintf(stderr,"A submission after an uncommitted buffer failed (stalled Metal 4 queue)\n");return 12;
+    }
+    double elapsed=CACurrentMediaTime()-started;
+    for(unsigned wait=0;wait<100 && (abandoned[0] || abandoned[1] || abandoned[2]);++wait) [NSThread sleepForTimeInterval:0.01];
+    if(abandoned[0] || abandoned[1] || abandoned[2]) {
+        fprintf(stderr,"An uncommitted buffer's Metal 4 submission kept its inputs alive\n");return 13;
+    }
+    if(elapsed>2) { fprintf(stderr,"Submissions after an uncommitted buffer took %.1f s\n",elapsed);return 14; }
+    printf("Metal4 bridge: an uncommitted buffer's work was never recorded; 40 later submissions took %.2f s.\n",elapsed);
     return 0;
 }}
