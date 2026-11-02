@@ -14,7 +14,7 @@ game files on disk.
 
 BG3GMFX is [ElowriT](https://github.com/ElowriT)'s fork of
 [BG3MFX](https://github.com/AndrewTriesToCode/bg3mfx) by AndrewTriesToCode,
-based on its 0.4.1 release. It keeps every BG3MFX feature below and adds:
+based on its 0.5.0 release. It keeps every BG3MFX feature below and adds:
 
 | Change | What you get |
 | --- | --- |
@@ -46,12 +46,12 @@ Then, in Steam, open Baldur's Gate 3's **Properties > General** and set
 Press Play as usual; clear the field to play without BG3GMFX. Its runtime,
 launcher and settings keep BG3MFX's names (`bg3mfx`, `BG3MFX_…`). To turn one of
 the changes off, add its line to `build/steam-launch.env` in that folder:
-`BG3MFX_SPLIT_SCREEN_FOG=0`, `BG3MFX_METALFX_SHARPENING=0`,
-`BG3MFX_KEEP_REBIND_CLICK=1` (keeps the game's click), or
-`BG3MFX_STEAM_OVERLAY=0` (starts without the Steam overlay). Reduced Locking
-and the Character Creation Crash Fix are on, as in BG3MFX; to turn one off, add
-`BG3MFX_REDUCE_LOCKING=0` or `BG3MFX_CHARACTER_CREATION_CRASH_FIX=0` to the same
-file. Developers also
+`BG3MFX_METALFX_SHARPENING=0`,
+`BG3MFX_FEATURE_WINDOW_REBIND_CLICK=0` (keeps the game's click), or
+`BG3MFX_STEAM_OVERLAY=0` (starts without the Steam overlay). Every BG3MFX
+feature is on, as with the `bg3mfx` launcher; to turn one off, add its line
+from [Disabling features](#disabling-features) to the same file, for example
+`BG3MFX_FEATURE_REDUCE_LOCKING=0`. Developers also
 get a lab mode for live renderer investigation, with virtual controllers and a
 GPU profiler: see [lab mode](docs/dev/lab.md).
 
