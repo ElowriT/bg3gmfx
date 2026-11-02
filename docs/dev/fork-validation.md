@@ -180,3 +180,30 @@ scheduled after 4 s, so both Metal 4 waits gave up first. It did not stall in
 without the stall hook, or in three full runs with 0.3 s between scenarios.
 Nothing in the submission order explains a buffer that is not scheduled, so
 something else on the machine may have held the GPU.
+
+## Port onto 0.5.0 (November 2)
+
+0.5.0 installs every part of the runtime as a feature through root
+(`BG3MFX_FEATURE_<NAME>=1`) and splits `Trace.mm` into metal-hooks and
+metalfx's renderer (`MetalFXRenderer.mm`). This fork's changes moved with it:
+
+- Split-screen upscaling, per-view Frame Generation, the RCAS replay
+  (sharpening) and lab mode are in `MetalFXRenderer.mm`, with their helpers
+  under `src/features/metalfx/` (`split-screen/`, `sharpening/`, `lab/`). The
+  split-screen fog fix is upstream's `viewportFogDescriptor`, also applied
+  without dynamic resolution.
+- The window rebind click fix is the `window-rebind-click` feature.
+- metal-hooks keeps this fork's ordered Metal 4 submission (its commit hook
+  commits through `BG3MFXMetal4Commit`, and it hooks `-enqueue`), its lookup of
+  originals the Steam overlay exchanged, and gains renderer extension points:
+  compute constants and every texture slot recorded, each dispatch's grid,
+  blit texture copies, frame presents, compute passes with a descriptor and
+  bound setBytes data.
+- `tools/launch/steam-launch.sh` sets `BG3MFX_ENABLE=1` and the player
+  launcher's feature flags plus `BG3MFX_FEATURE_WINDOW_REBIND_CLICK=1`.
+
+Synthetic (M5 Pro, macOS 27): `make test` (every upstream regression plus
+`split-screen-upscale-smoke` with and without Frame Generation,
+`split-screen-fog-smoke`, `lab-smoke`, the sharpening-off runs and
+`runtime-smoke` with the overlay's exchanged methods) and `make test-python`
+pass. Not yet checked live.

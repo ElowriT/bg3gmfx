@@ -1,5 +1,6 @@
+#include "common/Feature.h"
 #import "features/window-rebind-click/RebindClick.h"
-#import "integration/lab/LabInput.h"
+#import "features/metalfx/lab/LabInput.h"
 #import "common/native/SupportedBuild.h"
 #import <AppKit/AppKit.h>
 #include <atomic>
@@ -42,15 +43,21 @@ static void bg3mfxPost(CGEventTapLocation tap, CGEventRef event) {
 __attribute__((used)) static struct { const void *replacement; const void *replacee; } interposeEventPost
     __attribute__((section("__DATA,__interpose"))) = { (const void *)&bg3mfxPost, (const void *)&CGEventPost };
 
-BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *)) {
-    const char *keep = getenv("BG3MFX_KEEP_REBIND_CLICK");
-    if (keep && !strcmp(keep, "1")) return NO;
+BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *), NSError **error) {
     gameSlide = slide;
     for (uintptr_t click : rebindClickSites) if (!callsStub(click, eventPostStub)) {
-        if (report) report(@{@"event":@"rebindClickFixSkipped", @"reason":@"Game call sites do not match the supported build."});
+        if (error) *error = [NSError errorWithDomain:@"BG3MFX" code:1
+            userInfo:@{NSLocalizedDescriptionKey:@"The rebind click call sites do not match the supported build."}];
         return NO;
     }
     installed = true;
     if (report) report(@{@"event":@"rebindClickFixInstalled"});
     return YES;
 }
+
+namespace {
+BOOL installRebindClick(const BG3MFXFeatureContext &context, NSError **error) {
+    return BG3MFXInstallRebindClickFix(context.slide, context.report, error);
+}
+}
+BG3MFX_FEATURE(windowRebindClick, {"window-rebind-click", nullptr, true, nullptr, installRebindClick, nullptr});

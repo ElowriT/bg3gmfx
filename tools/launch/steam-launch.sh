@@ -16,9 +16,9 @@
 # environment (for example BG3MFX_LAB=/absolute/path); BG3MFX_RUNTIME there
 # selects another runtime library, and BG3MFX_STEAM_OVERLAY=0 leaves out
 # Steam's libraries, as the bg3mfx launcher does. Like that launcher, this
-# turns the experimental features on unless steam-launch.env or the
-# environment sets them (BG3MFX_REDUCE_LOCKING=0,
-# BG3MFX_CHARACTER_CREATION_CRASH_FIX=0 turn one off).
+# turns every player-facing feature on (BG3MFX_FEATURE_<NAME>=1), and this
+# fork's window-rebind-click, unless steam-launch.env or the environment sets
+# one (BG3MFX_FEATURE_REDUCE_LOCKING=0 turns that one off).
 set -u
 checkout="$(cd "$(dirname "$0")/../.." && pwd)"
 runtime="$checkout/build/bin/libBG3MetalFX.dylib"
@@ -46,7 +46,11 @@ if [ -f "$checkout/build/steam-launch.env" ]; then
     done < "$checkout/build/steam-launch.env"
 fi
 [ -f "$runtime" ] || fail "The runtime $runtime is missing. Run make in $checkout."
-for key in BG3MFX_CHARACTER_CREATION_CRASH_FIX BG3MFX_REDUCE_LOCKING; do
+# The player launcher's features (src/launcher/main.m), then this fork's own.
+for key in BG3MFX_FEATURE_METAL_HUD BG3MFX_FEATURE_METALFX BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX \
+        BG3MFX_FEATURE_IMPROVED_SHADOWS BG3MFX_FEATURE_DEPTH_PREPASS BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS \
+        BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX BG3MFX_FEATURE_LUA_JUMP_FIX BG3MFX_FEATURE_THREAD_IDLING \
+        BG3MFX_FEATURE_REDUCE_LOCKING BG3MFX_FEATURE_SSAO_BLUR_FIX BG3MFX_FEATURE_WINDOW_REBIND_CLICK; do
     case "$named" in *" $key "*) continue ;; esac
     value="$(/usr/bin/printenv "$key" || true)"
     extra+=(--env "$key=${value:-1}")
@@ -78,7 +82,7 @@ hud=(--env MTL_HUD_ENABLED=1)
 
 exec "$opener" -n -W \
     --env "DYLD_INSERT_LIBRARIES=$inserts" \
-    --env BG3MFX_ENABLE_METALFX=1 \
+    --env BG3MFX_ENABLE=1 \
     --env SteamAppId=1086940 \
     --env SteamGameId=1086940 \
     "${hud[@]}" ${extra[@]+"${extra[@]}"} \

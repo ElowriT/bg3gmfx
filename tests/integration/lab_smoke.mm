@@ -22,6 +22,9 @@ int main(int argc, const char **argv) {
         if (!mkdtemp(path)) return 3;
         directory = [NSString stringWithUTF8String:path];
         setenv("BG3MFX_LAB",path,1);
+        // Lab mode is part of metalfx-renderer, which needs the runtime and metalfx.
+        setenv("BG3MFX_ENABLE","1",1);
+        setenv("BG3MFX_FEATURE_METALFX","1",1);
         if (!dlopen(argv[1], RTLD_NOW)) { fprintf(stderr, "%s\n", dlerror()); return 1; }
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         NSError *error = nil;

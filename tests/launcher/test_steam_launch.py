@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "tools/launch/steam-launch.sh"
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "tools/launch/steam-launch.sh"
 
 
 class SteamLaunchTests(unittest.TestCase):
@@ -44,7 +46,7 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertEqual(arguments[:2], ["-n", "-W"])
         environment = [arguments[i + 1] for i, a in enumerate(arguments) if a == "--env"]
         self.assertIn(f"DYLD_INSERT_LIBRARIES=/steam/overlay.dylib:{self.runtime}", environment)
-        for value in ("BG3MFX_ENABLE_METALFX=1", "SteamAppId=1086940", "SteamGameId=1086940",
+        for value in ("BG3MFX_ENABLE=1", "SteamAppId=1086940", "SteamGameId=1086940",
                       "MTL_HUD_ENABLED=1", "BG3MFX_LAB=/tmp/lab dir"):
             self.assertIn(value, environment)
         self.assertEqual(arguments[-4:], [str(self.app), "--args", "-NoLauncher", "1"])
@@ -65,20 +67,23 @@ class SteamLaunchTests(unittest.TestCase):
         self.assertIn(f"DYLD_INSERT_LIBRARIES={self.runtime}", arguments)
         self.assertEqual(arguments[-4], str(other))
 
-    def test_experimental_features_are_on_unless_set(self):
+    def test_features_are_on_unless_set(self):
         def values(arguments):
             return [arguments[i + 1] for i, a in enumerate(arguments) if a == "--env"]
         result, arguments = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
-        for key in ("BG3MFX_REDUCE_LOCKING", "BG3MFX_CHARACTER_CREATION_CRASH_FIX"):
+        # The player launcher's features and this fork's window-rebind-click.
+        launcher = (ROOT / "src/launcher/main.m").read_text()
+        for key in re.findall(r'@"(BG3MFX_FEATURE_[A-Z_]+)"', launcher) + ["BG3MFX_FEATURE_WINDOW_REBIND_CLICK"]:
             self.assertIn(f"{key}=1", values(arguments))
         # steam-launch.env or the environment (Steam's launch options) turns one off.
-        self.env_file.write_text("BG3MFX_REDUCE_LOCKING=0\n")
-        result, arguments = self.launch(BG3MFX_CHARACTER_CREATION_CRASH_FIX="0")
+        self.env_file.write_text("BG3MFX_FEATURE_REDUCE_LOCKING=0\n")
+        result, arguments = self.launch(BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX="0")
         self.assertEqual(result.returncode, 0, result.stderr)
         environment = values(arguments)
-        self.assertEqual([v for v in environment if v.startswith("BG3MFX_REDUCE_LOCKING=")], ["BG3MFX_REDUCE_LOCKING=0"])
-        self.assertIn("BG3MFX_CHARACTER_CREATION_CRASH_FIX=0", environment)
+        self.assertEqual([v for v in environment if v.startswith("BG3MFX_FEATURE_REDUCE_LOCKING=")],
+                         ["BG3MFX_FEATURE_REDUCE_LOCKING=0"])
+        self.assertIn("BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=0", environment)
 
     def test_missing_runtime_does_not_start_the_game(self):
         self.runtime.unlink()

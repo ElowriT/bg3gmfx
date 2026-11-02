@@ -7,9 +7,8 @@
 // at the cursor through the HID event tap to focus the new view. The click
 // switches BG3's UI from controller to mouse and keyboard and can press
 // whatever lies under the hidden cursor. While BG3 is the active app, bg3mfx
-// drops that click; the view keeps or regains first responder (the Video
-// Options focus repair in NativeMenu.mm, or here if it did not).
-// BG3MFX_KEEP_REBIND_CLICK=1 keeps BG3's click. Installed by
-// BG3MFXInstallNativeMenu after its build guard; stays off if the call sites
-// differ.
-BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *));
+// drops that click; the view keeps or regains first responder (custom-menu's
+// render view focus repair, or here if it did not). The window-rebind-click
+// feature (BG3MFX_FEATURE_WINDOW_REBIND_CLICK=1) installs it on the supported
+// build; it stays off if the call sites differ.
+BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *), NSError **error);
