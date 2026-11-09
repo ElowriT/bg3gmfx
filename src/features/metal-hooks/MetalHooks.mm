@@ -8,10 +8,10 @@
 #include <algorithm>
 #include <vector>
 #include "common/Feature.h"
-#import "common/EventLog.h"
 #import "features/metal-hooks/MetalHooks.h"
 #import "features/metal-hooks/MetalHooksInternal.h"
 #import "common/gpu/GPUResources.h"
+#import "common/Notice.h"
 #import <QuartzCore/CAMetalLayer.h>
 #include <mach/mach_time.h>
 #include <cmath>
@@ -21,7 +21,6 @@
 #include <set>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dlfcn.h>
 
 // metal-hooks: the Metal interception layer. Shared state and the renderer
 // extension's interface are in MetalHooksInternal.h; the hook points other
@@ -29,12 +28,9 @@
 // Discover concrete driver classes from instances; never depend on an AGX class name.
 using namespace metalhooks;
 namespace metalhooks {
-#ifndef BG3MFX_NO_TRACE
-bool traceCalls, traceShaderConstants;
-#endif
-BOOL runtimeEnabled, traceConstants;
+BOOL runtimeEnabled;
 thread_local HookThreadCache hookCache;
-char encoderStateKey, bindingsKey, attachmentsKey;
+char encoderStateKey;
 // Encoders are used one at a time on a thread, so remember the last lookup.
 // instrumentEncoder refreshes and endEncoder clears it on its own thread. Any
 // thread's instrumentEncoder may release a state (or follow an encoder's
@@ -44,28 +40,7 @@ char encoderStateKey, bindingsKey, attachmentsKey;
 std::atomic<unsigned> encoderGeneration{1};
 std::atomic<unsigned> originalsGeneration{1};
 }
-static unsigned long frames;
-static unsigned long resourceCounter;
-static char resourceKey, pipelineKey;
-// The diagnostic runtime records what active features report. Recording every
-// Metal call (binds, pipelines, passes, encoders, command buffers, presents) is
-// opt-in with BG3MFX_TRACE_RENDER_CALLS=1; BG3 binds about 30,000 texture
-// slots a frame, so it slows the game. BG3MFX_TRACE_CONSTANTS=1 captures
-// camera shader constants and their reflection (tools/analysis/analyze_camera_trace.py).
-#ifndef BG3MFX_NO_TRACE
-// Diagnostic settings read once.
-static bool traceTemporalChain() { static const bool value = getenv("BG3MFX_TRACE_TEMPORAL_CHAIN"); return value; }
-static const char *waterfallDirectory() { static const char *value = getenv("BG3MFX_CAPTURE_WATERFALL"); return value; }
-#endif
-static NSMutableDictionary<NSString *, NSNumber *> *constantSamples;
-static NSMutableDictionary<NSString *, NSDictionary *> *shaderBufferSizes;
-// The draw filter (MetalHooks.h), e.g. depth-prepass's. Its tags are separate
-// from PipelineKind, so scene tracking still sees those pipelines as
-// unrecognized.
-static BG3MFXDrawFilter drawFilter;
-static bool filterDraws;
-#ifndef BG3MFX_NO_TRACE
-#endif
+static char pipelineKey;
 // Bind dedup: BG3 rebinds about 27 fragment texture slots per call when about
 // two change (92% of slots repeat the current binding), and re-sets the bound
 // pipeline about 12% of the time. Bindings persist for the encoder's lifetime,
@@ -86,16 +61,12 @@ template<class Observer> BOOL Observers<Observer>::add(Observer observer) {
     return YES;
 }
 void BG3MFXMetalHooksFilterRedundantBinds(void) { if (!hooksActive) bindDedup = runtimeEnabled; }
-BOOL BG3MFXMetalHooksFilterDraws(BG3MFXDrawFilter filter) {
-    if (hooksActive || drawFilter.draw || !filter.pipelineCreated || !filter.renderPass || !filter.draw) return NO;
-    drawFilter = filter;
-    filterDraws = runtimeEnabled;
-    return YES;
-}
 static Observers<void (*)(id, BOOL)> encoderObservers;
 BOOL BG3MFXMetalHooksOnNewEncoder(void (*observer)(id, BOOL)) { return encoderObservers.add(observer); }
 static Observers<void (*)(MTLRenderPassDescriptor *)> renderPassObservers;
 BOOL BG3MFXMetalHooksOnRenderPass(void (*observer)(MTLRenderPassDescriptor *)) { return renderPassObservers.add(observer); }
+static Observers<double (*)(double)> presentDurationFilters;
+BOOL BG3MFXMetalHooksFilterPresentDuration(double (*filter)(double)) { return presentDurationFilters.add(filter); }
 static BG3MFXDrawReplacement drawReplacement;
 BOOL BG3MFXMetalHooksReplaceDraws(BG3MFXDrawReplacement replacement) {
     if (hooksActive || drawReplacement.claim || !replacement.claim || !replacement.draw) return NO;
@@ -106,12 +77,6 @@ static void notifyNewEncoder(__unsafe_unretained id encoder, BOOL compute) {
     if (!encoder) return;
     for (size_t i = 0; i < encoderObservers.count; ++i) encoderObservers.entries[i](encoder, compute);
 }
-#ifndef BG3MFX_NO_TRACE
-static Observers<void (*)(id, NSUInteger, id)> computeBindObservers;
-static Observers<void (*)(id, NSString *)> dispatchObservers;
-BOOL BG3MFXMetalHooksOnComputeBind(void (*observer)(id, NSUInteger, id)) { return computeBindObservers.add(observer); }
-BOOL BG3MFXMetalHooksOnDispatch(void (*observer)(id, NSString *)) { return dispatchObservers.add(observer); }
-#endif
 // The renderer extension (MetalHooksInternal.h); its constant slots and
 // watched vertex buffer slot are copied out for the bind hooks.
 static RendererExtension renderer;
@@ -127,11 +92,6 @@ BOOL metalhooks::extendRenderer(const RendererExtension &extension) {
     watchedVertexSlot = extension.vertexBufferSlot;
     return YES;
 }
-// Diagnostics: binds that repeat the encoder's current binding.
-static bool redundantProbe;
-enum RedundantCount { TextureCalls, TextureCallsRedundant, TextureSlots, TextureSlotsRedundant,
-    BufferBinds, BufferBindsRedundant, PipelineBinds, PipelineBindsRedundant, DepthBinds, DepthBindsRedundant, RedundantCounts };
-static std::atomic<uint64_t> redundantCounts[RedundantCounts];
 @implementation BG3MFXEncoderState
 - (instancetype)init { if ((self=[super init])) mode=-1; return self; }
 @end
@@ -157,11 +117,6 @@ static inline void *pipelineInfoPointer(__unsafe_unretained id state) {
 static void forgetEncoder(id encoder) {
     if ((__bridge const void *)encoder == hookCache.encoder) { hookCache.encoder = nullptr; hookCache.state = nullptr; }
 }
-// Diagnostics: the renderer extension's mode for the encoder, -1 if unknown.
-[[maybe_unused]] static int encoderMode(__unsafe_unretained id encoder) {
-    __unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder);
-    return s ? s->mode : -1;
-}
 NSDictionary *metalhooks::boundTextures(id encoder) {
     __unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder);
     if (!s) return nil;
@@ -169,20 +124,7 @@ NSDictionary *metalhooks::boundTextures(id encoder) {
     for (NSUInteger i=0;i<EncoderSlots;++i) if (s->textures[i]) textures[@(i).stringValue]=s->textures[i];
     return textures;
 }
-// Shaders whose constants BG3MFX_TRACE_CONSTANTS=1 snapshots at encoder end:
-// the camera constants, and PPSAO_Blur_PS's direction (its two passes bind
-// one shared buffer).
-static bool snapshotShader(NSString *name) {
-    return traceShaderConstants && ([name isEqualToString:@"PPTAA_PS"] || [name isEqualToString:@"VelocityBufferCamera_PS"] ||
-                                    [name isEqualToString:@"PPSAO_Blur_PS"] || [name isEqualToString:@"BG3MFXConstantsSmoke"]);
-}
-static bool constantsNeeded() { return traceCalls || traceShaderConstants || watchedConstants; }
-static bool constantInputNeeded(NSUInteger index) {
-    return index < 32 && (traceCalls || traceShaderConstants || (watchedConstants >> index & 1));
-}
-#ifndef BG3MFX_NO_TRACE
-static void record(NSDictionary *event);
-#endif
+static bool constantInputNeeded(NSUInteger index) { return index < 32 && (watchedConstants >> index & 1); }
 static EncoderStage bindingStage(SEL cmd) {
     static SEL vertex[]={@selector(setVertexBuffer:offset:atIndex:),@selector(setVertexBuffers:offsets:withRange:),
         @selector(setVertexBufferOffset:atIndex:),@selector(setVertexBytes:length:atIndex:)};
@@ -192,76 +134,6 @@ static EncoderStage bindingStage(SEL cmd) {
     for (SEL f:fragment) if (cmd==f) return StageFragment;
     return StageCompute;
 }
-// Dictionary view ("fragment:8" -> buffer/offset or bytes/length), diagnostics only.
-static NSMutableDictionary *constantBindings(id encoder) {
-    NSMutableDictionary *bindings=[NSMutableDictionary dictionary];
-    __unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder);
-    static NSString *const stages[]={@"vertex",@"fragment",@"compute"};
-    if (s) for (int stage=0;stage<3;++stage) for (NSUInteger i=0;i<EncoderSlots;++i) {
-        ConstantBinding &b=s->constants[stage][i];
-        NSString *slot=[NSString stringWithFormat:@"%@:%lu",stages[stage],(unsigned long)i];
-        NSData *data=b.hasBytes ? s->bytes[@(stage*EncoderSlots+i)] : nil;
-        if (data) bindings[slot]=@{@"bytes":data,@"length":@(b.length)};
-        else if (b.buffer) bindings[slot]=@{@"buffer":b.buffer,@"offset":@(b.offset)};
-    }
-    return bindings;
-}
-// Diagnostics: count binds that repeat the encoder's current binding. Called
-// before forwarding; compute bindings are not counted.
-static void countBuffers(__unsafe_unretained id self, SEL cmd, id<MTLBuffer> const *buffers, const NSUInteger *offsets, NSRange range, bool offsetOnly) {
-#ifdef BG3MFX_NO_TRACE
-    (void)self; (void)cmd; (void)buffers; (void)offsets; (void)range; (void)offsetOnly;
-#else
-    if (!diagnostics || !redundantProbe) return;
-    __unsafe_unretained BG3MFXEncoderState *s=encoderState(self);
-    EncoderStage stage=bindingStage(cmd);
-    if (!s || stage==StageCompute) return;
-    for (NSUInteger i=0; i<range.length; ++i) {
-        NSUInteger index=range.location+i;
-        if (index>=32) continue;
-        __unsafe_unretained id buffer=offsetOnly ? s->seenBuffer[stage][index] : buffers[i];
-        bool same=buffer && s->seenBuffer[stage][index]==buffer && s->seenOffset[stage][index]==offsets[i];
-        ++redundantCounts[BufferBinds];
-        if (same) ++redundantCounts[BufferBindsRedundant];
-        s->seenBuffer[stage][index]=buffer; s->seenOffset[stage][index]=offsets[i];
-    }
-#endif
-}
-static void countTextures(__unsafe_unretained id self, SEL cmd, id<MTLTexture> const *textures, NSRange range) {
-#ifdef BG3MFX_NO_TRACE
-    (void)self; (void)cmd; (void)textures; (void)range;
-#else
-    if (!diagnostics || !redundantProbe) return;
-    static SEL one=@selector(setFragmentTexture:atIndex:), many=@selector(setFragmentTextures:withRange:);
-    if (cmd!=one && cmd!=many) return;
-    __unsafe_unretained BG3MFXEncoderState *s=encoderState(self);
-    if (!s) return;
-    bool callSame=true;
-    for (NSUInteger i=0; i<range.length; ++i) {
-        NSUInteger index=range.location+i;
-        bool same=index<64 && s->seenTexture[index]==textures[i];
-        ++redundantCounts[TextureSlots];
-        if (same) ++redundantCounts[TextureSlotsRedundant]; else callSame=false;
-        if (index<64) s->seenTexture[index]=textures[i];
-    }
-    ++redundantCounts[TextureCalls];
-    if (callSame) ++redundantCounts[TextureCallsRedundant];
-#endif
-}
-static void flushRedundantCounts() {
-    static unsigned long lastFrame;
-    if (!diagnostics || !redundantProbe || frames-lastFrame<120) return;
-    [[maybe_unused]] double n=(double)(frames-lastFrame);
-    lastFrame=frames;
-    uint64_t c[RedundantCounts];
-    for (int i=0; i<RedundantCounts; ++i) c[i]=redundantCounts[i].exchange(0);
-    record(@{@"event":@"redundantBinds",@"frame":@(frames),
-        @"textureCallsPerFrame":@(c[TextureCalls]/n),@"textureCallsRedundant":@(c[TextureCallsRedundant]/n),
-        @"textureSlotsPerFrame":@(c[TextureSlots]/n),@"textureSlotsRedundant":@(c[TextureSlotsRedundant]/n),
-        @"bufferBindsPerFrame":@(c[BufferBinds]/n),@"bufferBindsRedundant":@(c[BufferBindsRedundant]/n),
-        @"pipelineBindsPerFrame":@(c[PipelineBinds]/n),@"pipelineBindsRedundant":@(c[PipelineBindsRedundant]/n),
-        @"depthBindsPerFrame":@(c[DepthBinds]/n),@"depthBindsRedundant":@(c[DepthBindsRedundant]/n)});
-}
 // The vertex buffer at the renderer extension's watched slot.
 static void noteWatchedBuffer(__unsafe_unretained id encoder, SEL cmd, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, bool offsetOnly) {
     if (bindingStage(cmd) != StageVertex) return;
@@ -270,35 +142,17 @@ static void noteWatchedBuffer(__unsafe_unretained id encoder, SEL cmd, __unsafe_
         s->watchedOffset = offset;
     }
 }
-#ifndef BG3MFX_NO_TRACE
-// Diagnostics: compute binds and dispatches for the features that observe them.
-static void noteComputeBind(__unsafe_unretained id encoder, SEL cmd, NSUInteger index, __unsafe_unretained id buffer) {
-    if (bindingStage(cmd) != StageCompute) return;
-    for (size_t i = 0; i < computeBindObservers.count; ++i) computeBindObservers.entries[i](encoder, index, buffer);
-}
-static void noteDispatch(__unsafe_unretained id encoder, NSString *name) {
-    for (size_t i = 0; i < dispatchObservers.count; ++i) dispatchObservers.entries[i](encoder, name);
-}
-#else
-static void noteComputeBind(id, SEL, NSUInteger, id) {}
-#endif
-// The same hooks serve compute encoders when the renderer extension records
-// compute constants or, in the diagnostic runtime, a feature observes compute binds.
 static void bindBuffer(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
-    if (diagnostics && redundantProbe) { id<MTLBuffer> const one[1]={buffer}; countBuffers(self,cmd,one,&offset,NSMakeRange(index,1),false); }
     ((void(*)(id,SEL,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,buffer,offset,index);
-    if (diagnostics) noteComputeBind(self,cmd,index,buffer);
     if (index == watchedVertexSlot) noteWatchedBuffer(self,cmd,buffer,offset,false);
     if (!constantInputNeeded(index)) return;
     if (ConstantBinding *b=constantSlot(self,bindingStage(cmd),index)) { b->buffer=buffer; b->offset=offset; b->hasBytes=false; b->length=0; }
 }
 static void bindBuffers(__unsafe_unretained id self, SEL cmd, id<MTLBuffer> const *buffers, const NSUInteger *offsets, NSRange range) {
-    countBuffers(self,cmd,buffers,offsets,range,false);
     ((void(*)(id,SEL,id<MTLBuffer> const *,const NSUInteger *,NSRange))original(self,cmd))(self,cmd,buffers,offsets,range);
-    if (diagnostics) for (NSUInteger i=0; i<range.length; ++i) noteComputeBind(self,cmd,range.location+i,buffers[i]);
     if (NSLocationInRange(watchedVertexSlot,range))
         noteWatchedBuffer(self,cmd,buffers[watchedVertexSlot-range.location],offsets[watchedVertexSlot-range.location],false);
-    if (!constantsNeeded()) return;
+    if (!watchedConstants) return;
     EncoderStage stage=bindingStage(cmd);
     for (NSUInteger i=0; i<range.length; ++i) {
         if (!constantInputNeeded(range.location+i)) continue;
@@ -306,7 +160,6 @@ static void bindBuffers(__unsafe_unretained id self, SEL cmd, id<MTLBuffer> cons
     }
 }
 static void bufferOffset(__unsafe_unretained id self, SEL cmd, NSUInteger offset, NSUInteger index) {
-    if (diagnostics && redundantProbe) countBuffers(self,cmd,nullptr,&offset,NSMakeRange(index,1),true);
     ((void(*)(id,SEL,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,offset,index);
     if (index == watchedVertexSlot) noteWatchedBuffer(self,cmd,nil,offset,true);
     if (!constantInputNeeded(index)) return;
@@ -314,7 +167,6 @@ static void bufferOffset(__unsafe_unretained id self, SEL cmd, NSUInteger offset
 }
 static void bindBytes(__unsafe_unretained id self, SEL cmd, const void *bytes, NSUInteger length, NSUInteger index) {
     ((void(*)(id,SEL,const void *,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,bytes,length,index);
-    if (diagnostics) noteComputeBind(self,cmd,index,bytes && length ? (id)kCFNull : nil);  // any non-nil marker: BG3 filled the slot
     if (index == watchedVertexSlot) noteWatchedBuffer(self,cmd,nil,0,false);
     if (!constantInputNeeded(index)) return;
     EncoderStage stage=bindingStage(cmd);
@@ -328,104 +180,6 @@ static void bindBytes(__unsafe_unretained id self, SEL cmd, const void *bytes, N
         }
     }
 }
-#ifndef BG3MFX_NO_TRACE
-// Features installed by root report through its log directly (all important),
-// and the renderer extension keeps its own list; these are the hooks' own events.
-static void record(NSDictionary *event) {
-    NSString *kind = event[@"event"];
-    BOOL important = [kind hasPrefix:@"waterfall"] || [kind hasPrefix:@"cullTiming"] ||
-        [kind isEqualToString:@"redundantBinds"] || [kind isEqualToString:@"metal4Residency"] || [kind isEqualToString:@"metal4BridgeStall"];
-    BG3MFXEventLogWrite(event, important);
-}
-#endif
-#ifndef BG3MFX_NO_TRACE
-static char waterfallCopiesKey;
-static NSDictionary *waterfallLayout(MTLRenderPipelineDescriptor *desc) {
-    if (![desc.vertexFunction.name containsString:@"Water_Fall_Foam_STI_"]) return nil;
-    NSMutableArray *attributes=[NSMutableArray array], *layouts=[NSMutableArray array];
-    for (NSUInteger i=0;i<31;++i) {
-        MTLVertexAttributeDescriptor *a=desc.vertexDescriptor.attributes[i];
-        if (a.format!=MTLVertexFormatInvalid) [attributes addObject:@{@"attribute":@(i),@"format":@(a.format),@"offset":@(a.offset),@"buffer":@(a.bufferIndex)}];
-        MTLVertexBufferLayoutDescriptor *l=desc.vertexDescriptor.layouts[i];
-        if (l.stride) [layouts addObject:@{@"buffer":@(i),@"stride":@(l.stride),@"stepFunction":@(l.stepFunction),@"stepRate":@(l.stepRate)}];
-    }
-    return @{@"attributes":attributes,@"layouts":layouts};
-}
-static void captureWaterfall(id encoder, NSDictionary *draw) {
-    const char *directory=waterfallDirectory();
-    if (!directory || !*directory) return;
-    NSDictionary *pipelineState=pipelineDescription(encoder);
-    NSString *vertex=pipelineState[@"vertex"];
-    if (![vertex containsString:@"Water_Fall_Foam_STI_DEP_vertexMain"] &&
-        ![vertex containsString:@"Water_Fall_Foam_STI_VEL_vertexMain"]) return;
-    std::lock_guard<std::recursive_mutex> lock(guard());
-    static NSMutableDictionary *counts=[NSMutableDictionary dictionary];
-    static NSUInteger totalBytes=0, serial=0;
-    NSString *key=[NSString stringWithFormat:@"%d:%@",encoderMode(encoder),vertex];
-    NSUInteger count=[counts[key] unsignedIntegerValue];
-    if (count>=4) return;
-    counts[key]=@(count+1);
-    NSString *root=[NSString stringWithUTF8String:directory];
-    if (![root isAbsolutePath]) return;
-    [NSFileManager.defaultManager createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *stem=[NSString stringWithFormat:@"draw-%lu-mode-%d",(unsigned long)serial++,encoderMode(encoder)];
-    NSMutableDictionary *bindings=[constantBindings(encoder) mutableCopy];
-    id<MTLBuffer> indexBuffer=draw[@"indexBuffer"];
-    if (indexBuffer) bindings[@"index"]=@{@"buffer":indexBuffer,@"offset":draw[@"indexOffset"] ?: @0};
-    NSMutableDictionary *snapshots=[NSMutableDictionary dictionary];
-    NSMutableArray *copies=objc_getAssociatedObject(encoder,&waterfallCopiesKey);
-    if (!copies) { copies=[NSMutableArray array]; objc_setAssociatedObject(encoder,&waterfallCopiesKey,copies,OBJC_ASSOCIATION_RETAIN_NONATOMIC); noteAssociation(encoder,AssocWaterfall); }
-    for (NSString *slot in bindings) {
-        BOOL index=[slot isEqualToString:@"index"];
-        NSUInteger slotIndex=[slot componentsSeparatedByString:@":"].lastObject.integerValue;
-        BOOL stream=NO;
-        for (NSDictionary *layout in pipelineState[@"vertexLayout"][@"layouts"])
-            if ([layout[@"buffer"] unsignedIntegerValue]==slotIndex) stream=YES;
-        if (!index && (![slot hasPrefix:@"vertex:"] || (!stream && slotIndex!=20 && slotIndex!=13 && slotIndex!=11 && slotIndex!=8))) continue;
-        NSDictionary *binding=bindings[slot]; id<MTLBuffer> buffer=binding[@"buffer"];
-        NSUInteger offset=[binding[@"offset"] unsignedIntegerValue];
-        NSData *bytes=binding[@"bytes"];
-        NSUInteger length=buffer ? (offset<=buffer.length ? buffer.length-offset:0) : bytes.length;
-        NSUInteger limit=index || stream ? 8*1024*1024UL : (slotIndex==20 ? 64 : (slotIndex==13 ? 32 : 224));
-        NSUInteger captured=MIN(length,limit);
-        if (totalBytes+captured>128*1024*1024UL) captured=0;
-        totalBytes+=captured;
-        NSString *file=[stem stringByAppendingFormat:@"-%@.bin",[slot stringByReplacingOccurrencesOfString:@":" withString:@"-"]];
-        snapshots[slot]=@{@"file":file,@"offset":@(offset),@"availableLength":@(length),@"capturedLength":@(captured),@"storage":buffer ? @(buffer.storageMode):@(-1)};
-        if (!captured) continue;
-        if (bytes) [[bytes subdataWithRange:NSMakeRange(0,captured)] writeToFile:[root stringByAppendingPathComponent:file] atomically:YES];
-        else if (buffer.storageMode==MTLStorageModeShared && buffer.contents)
-            [[NSData dataWithBytes:(const uint8_t *)buffer.contents+offset length:captured] writeToFile:[root stringByAppendingPathComponent:file] atomically:YES];
-        else if (buffer.storageMode==MTLStorageModePrivate)
-            [copies addObject:@{@"buffer":buffer,@"offset":@(offset),@"length":@(captured),@"path":[root stringByAppendingPathComponent:file]}];
-    }
-    NSMutableDictionary *drawInfo=[draw mutableCopy]; [drawInfo removeObjectForKey:@"indexBuffer"];
-    NSDictionary *info=@{@"pipeline":pipelineState,@"mode":@(encoderMode(encoder)),@"draw":drawInfo,@"bindings":snapshots,
-        @"limitation":@"Bounded buffer capture; noise texture is not captured. Private buffers copied after this encoder."};
-    [[NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil] writeToFile:[root stringByAppendingPathComponent:[stem stringByAppendingString:@".json"]] atomically:YES];
-    record(@{@"event":@"waterfallDrawCaptured",@"path":[root stringByAppendingPathComponent:[stem stringByAppendingString:@".json"]],@"mode":@(encoderMode(encoder))});
-}
-static void finishWaterfallCopies(id<MTLCommandBuffer> commandBuffer, NSArray *copies) {
-    if (!commandBuffer || !copies.count) return;
-    id<MTLBlitCommandEncoder> blit=[commandBuffer blitCommandEncoder];
-    NSMutableArray *results=[NSMutableArray array];
-    for (NSDictionary *copy in copies) {
-        NSUInteger length=[copy[@"length"] unsignedIntegerValue];
-        id<MTLBuffer> readback=[commandBuffer.device newBufferWithLength:length options:MTLResourceStorageModeShared];
-        if (!readback) continue;
-        [blit copyFromBuffer:copy[@"buffer"] sourceOffset:[copy[@"offset"] unsignedIntegerValue] toBuffer:readback destinationOffset:0 size:length];
-        [results addObject:@{@"buffer":readback,@"path":copy[@"path"]}];
-    }
-    [blit endEncoding];
-    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-        if (completed.status!=MTLCommandBufferStatusCompleted) return;
-        for (NSDictionary *result in results) {
-            id<MTLBuffer> readback=result[@"buffer"];
-            [[NSData dataWithBytes:readback.contents length:readback.length] writeToFile:result[@"path"] atomically:YES];
-        }
-    }];
-}
-#endif
 // The replacement each hooked method received, to recognize it under another name.
 static std::map<std::pair<Class, SEL>, IMP> &replacements() {
     static auto *value = new std::map<std::pair<Class, SEL>, IMP>;
@@ -442,10 +196,10 @@ IMP metalhooks::originalSlow(Class concrete, SEL selector, unsigned generation, 
     // Another library exchanged a hooked method with one of its own, so a
     // replacement runs under that library's selector: the Steam overlay
     // exchanges -commit and every present variant with steamoverlay_<name>.
-    // Find the hooked method by the replacement it carries. One replacement
-    // can serve several selectors (presentTimed takes both timed presents),
-    // and the overlay exchanges both: prefer the hooked selector that ends the
-    // running one's name, then the one no longer running its replacement.
+    // Find the hooked method by the replacement it carries. If one replacement
+    // serves several selectors and the overlay exchanged them all, prefer the
+    // hooked selector that ends the running one's name, then the one no
+    // longer running its replacement.
     if (Method method = class_getInstanceMethod(concrete, selector)) {
         IMP running = method_getImplementation(method), named = nullptr, exchanged = nullptr, any = nullptr;
         bool exchangedAmbiguous = false, anyAmbiguous = false;
@@ -470,7 +224,8 @@ IMP metalhooks::originalSlow(Class concrete, SEL selector, unsigned generation, 
         IMP found = named ? named : exchanged && !exchangedAmbiguous ? exchanged : any && !anyAmbiguous ? any : nullptr;
         if (found) { entry = {concrete, selector, found, generation}; return found; }
     }
-    fprintf(stderr, "BG3MFX: no original method for -[%s %s]\n", class_getName(concrete), sel_getName(selector));
+    BG3MFXFail([NSString stringWithFormat:@"BG3MFX found no original method for -[%s %s]",
+        class_getName(concrete), sel_getName(selector)], nil, nil);
     abort();
 }
 void metalhooks::hook(id object, const char *name, IMP replacement) {
@@ -490,165 +245,36 @@ void metalhooks::hook(id object, const char *name, IMP replacement) {
     originalsGeneration.fetch_add(1, std::memory_order_release);
     class_replaceMethod(cls, selector, replacement, method_getTypeEncoding(method));
 }
-static void tagPipeline(id pipeline, uint8_t tag) {
-    if (__unsafe_unretained BG3MFXPipelineInfo *info = objc_getAssociatedObject(pipeline, &pipelineKey)) info->drawTag = tag;
-}
-static void setFilteredDepth(__unsafe_unretained id encoder, __unsafe_unretained id state) {
-    SEL set = @selector(setDepthStencilState:);
-    ((void(*)(id,SEL,id))original(encoder,set))(encoder,set,state);
-}
-// One draw through the draw filter: skipped, or drawn with the filter's
-// depth-stencil state and BG3's restored after. The states are borrowed, so
-// no draw retains anything.
-struct DrawFilterScope {
-    __unsafe_unretained id encoder = nil, restore = nil;
-    bool skip = false;
-    explicit DrawFilterScope(__unsafe_unretained id self) {
-        if (!filterDraws) return;
-        __unsafe_unretained BG3MFXEncoderState *s = encoderState(self);
-        if (!s || !s->drawTag) return;
-        const BG3MFXDrawFilterAction action = drawFilter.draw(s->drawTag, s->passTag, s->depthState);
-        if (action.skip) { skip = true; return; }
-        if (!action.depthState) return;
-        setFilteredDepth(self, action.depthState);
-        encoder = self; restore = s->depthState;
-    }
-    ~DrawFilterScope() { if (encoder) setFilteredDepth(encoder, restore); }
-    DrawFilterScope(const DrawFilterScope &) = delete;
-    DrawFilterScope &operator=(const DrawFilterScope &) = delete;
-};
-static id depthStencilStateHook(id self, SEL cmd, MTLDepthStencilDescriptor *desc) {
-    id state = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,desc);
-    if (filterDraws) drawFilter.depthStateCreated(self,cmd,desc,state,(BG3MFXCreateDepthState)original(self,cmd));
-    return state;
-}
-static void setDepthStencilHook(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id state) {
-    ((void(*)(id,SEL,id))original(self,cmd))(self,cmd,state);
-    if (__unsafe_unretained BG3MFXEncoderState *s = encoderState(self)) {
-#ifndef BG3MFX_NO_TRACE
-        if (redundantProbe) {
-            ++redundantCounts[DepthBinds];
-            if (s->seenDepth==state) ++redundantCounts[DepthBindsRedundant];
-            s->seenDepth=state;
-        }
-#endif
-        s->depthState = state;
-    }
-}
-NSDictionary *metalhooks::texture(id<MTLTexture> t) {
-    if (!t) return @{};
-    std::lock_guard<std::recursive_mutex> lock(guard());
-    NSNumber *identifier = objc_getAssociatedObject(t, &resourceKey);
-    if (!identifier) {
-        identifier = @(++resourceCounter);
-        objc_setAssociatedObject(t, &resourceKey, identifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    return @{@"id": identifier, @"label": t.label ?: @"", @"width": @(t.width), @"height": @(t.height),
-             @"format": @(t.pixelFormat), @"usage": @(t.usage), @"storage": @(t.storageMode),
-             @"hazardTracking": @(t.hazardTrackingMode), @"textureType": @(t.textureType),
-             @"arrayLength": @(t.arrayLength), @"sampleCount": @(t.sampleCount)};
-}
-static void label(id self, SEL cmd, NSString *value) {
-    ((void(*)(id,SEL,id))original(self,cmd))(self,cmd,value);
-    if (value.length) record(@{@"event": @"label", @"class": NSStringFromClass(object_getClass(self)), @"value": value});
-}
-static void group(id self, SEL cmd, NSString *value) {
-    ((void(*)(id,SEL,id))original(self,cmd))(self,cmd,value);
-    if (value.length) record(@{@"event": @"group", @"value": value});
-}
-static void rememberTexture(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLTexture> t, NSUInteger index) {
-    (void)cmd; // Only diagnostic builds include the selector in event records.
-    if (!traceCalls) {
-        // Metal permits textures to be bound before pipeline state. Retain the
-        // three required slots independently of shader identification. The
-        // index test comes first: BG3 binds about 30,000 slots per frame.
-        if ((index > 2 && !allTextureSlots) || !runtimeEnabled) return;
-    }
-    if (runtimeEnabled && index < EncoderSlots)
-        if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(self)) s->textures[index]=t;
-    if (traceCalls) {
-        std::lock_guard<std::recursive_mutex> lock(guard());
-        NSString *slot = [NSString stringWithFormat:@"%lu", (unsigned long)index];
-        NSMutableDictionary *bindings = objc_getAssociatedObject(self, &bindingsKey);
-        if (!bindings) {
-            bindings = [NSMutableDictionary dictionary];
-            objc_setAssociatedObject(self, &bindingsKey, bindings, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            noteAssociation(self,AssocBindings);
-        }
-        if (t) bindings[slot] = texture(t); else [bindings removeObjectForKey:slot];
-        if (t) record(@{@"event": NSStringFromSelector(cmd), @"encoder": [self label] ?: @"", @"pipeline": pipelineDescription(self) ?: @{}, @"index": @(index), @"texture": texture(t)});
-    }
+static void rememberTexture(__unsafe_unretained id self, __unsafe_unretained id<MTLTexture> t, NSUInteger index) {
+    // Metal permits textures to be bound before pipeline state. Retain the
+    // three required slots independently of shader identification. The
+    // index test comes first: BG3 binds about 30,000 slots per frame.
+    if ((index > 2 && !allTextureSlots) || !runtimeEnabled || index >= EncoderSlots) return;
+    if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(self)) s->textures[index]=t;
 }
 static void bindTexture(__unsafe_unretained id self, SEL cmd, __unsafe_unretained id<MTLTexture> t, NSUInteger index) {
-    if (diagnostics && redundantProbe) { id<MTLTexture> const one[1]={t}; countTextures(self,cmd,one,NSMakeRange(index,1)); }
     if (bindDedup && cmd==@selector(setFragmentTexture:atIndex:))
         if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(self))
-            if (!s->bindFilter.forwardTexture(t,index)) { rememberTexture(self,cmd,t,index); return; }
+            if (!s->bindFilter.forwardTexture(t,index)) { rememberTexture(self,t,index); return; }
     ((void(*)(id,SEL,id,NSUInteger))original(self,cmd))(self,cmd,t,index);
-    rememberTexture(self,cmd,t,index);
+    rememberTexture(self,t,index);
 }
 static void bindTextures(__unsafe_unretained id self, SEL cmd, id<MTLTexture> const *textures, NSRange range) {
-    countTextures(self,cmd,textures,range);
     __unsafe_unretained BG3MFXEncoderState *s=bindDedup && cmd==@selector(setFragmentTextures:withRange:) ? encoderState(self) : nil;
     auto forward=((void(*)(id,SEL,id<MTLTexture> const *,NSRange))original(self,cmd));
     if (s) s->bindFilter.forwardTextures(textures,range,[&](id<MTLTexture> const *run, NSRange slots) {
         forward(self,cmd,run,slots);
     });
     else forward(self,cmd,textures,range);
-    for (NSUInteger i=0; i<range.length; ++i) rememberTexture(self,cmd,textures[i],range.location+i);
+    for (NSUInteger i=0; i<range.length; ++i) rememberTexture(self,textures[i],range.location+i);
 }
 // Ends the encoder in Metal; the renderer extension's endEncoding wraps it.
-static void finishEncoder(id self, SEL cmd, BG3MFXEncoderState *encoderRecord, id<MTLCommandBuffer> commandBuffer) {
-#ifndef BG3MFX_NO_TRACE
-    NSArray *waterfallCopies=nil;
-    if (encoderAssociations(encoderRecord) & AssocWaterfall) {
-        waterfallCopies=[objc_getAssociatedObject(self,&waterfallCopiesKey) copy];
-        objc_setAssociatedObject(self,&waterfallCopiesKey,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-#else
-    (void)commandBuffer;
-#endif
-    if (encoderRecord) encoderRecord->buffer = nil;
-    if (traceCalls) record(@{@"event": @"encoderEnd", @"pipeline": pipelineDescription(self) ?: @{},
-             @"bindings": objc_getAssociatedObject(self, &bindingsKey) ?: @{},
-             @"attachments": objc_getAssociatedObject(self, &attachmentsKey) ?: @{}});
-    if (traceConstants) {
-        std::lock_guard<std::recursive_mutex> lock(guard());
-        NSDictionary *state = pipelineDescription(self);
-        NSString *fragment = state[@"fragment"] ?: @"";
-        if (snapshotShader(fragment) && [constantSamples[fragment] unsignedIntegerValue] < 8) {
-            NSUInteger sample = [constantSamples[fragment] unsignedIntegerValue];
-            constantSamples[fragment] = @(sample+1);
-            NSMutableDictionary *snapshots = [NSMutableDictionary dictionary];
-            [constantBindings(self) enumerateKeysAndObjectsUsingBlock:^(NSString *slot, NSDictionary *binding, BOOL *) {
-                NSDictionary *sizes = shaderBufferSizes[fragment];
-                NSNumber *declaredSize = sizes[slot];
-                if (sizes && !declaredSize) return;
-                NSUInteger limit = declaredSize ? MIN(declaredSize.unsignedIntegerValue,4096) : 4096;
-                NSData *data = binding[@"bytes"];
-                id<MTLBuffer> buffer = binding[@"buffer"];
-                NSUInteger offset = [binding[@"offset"] unsignedIntegerValue];
-                NSUInteger length = [binding[@"length"] unsignedIntegerValue];
-                if (buffer) {
-                    length = offset <= buffer.length ? buffer.length-offset : 0;
-                    if (buffer.storageMode == MTLStorageModeShared && length && buffer.contents)
-                        data = [NSData dataWithBytes:(const uint8_t *)buffer.contents+offset length:MIN(length,limit)];
-                }
-                if (data.length > limit) data = [data subdataWithRange:NSMakeRange(0,limit)];
-                snapshots[slot] = @{@"offset": @(offset), @"availableLength": @(length),
-                    @"capturedLength": @(data.length), @"base64": [data base64EncodedStringWithOptions:0] ?: @"",
-                    @"storage": buffer ? @(buffer.storageMode) : @(-1),
-                    @"buffer": buffer ? [NSString stringWithFormat:@"%p",(__bridge void *)buffer] : @""};
-            }];
-            record(@{@"event": @"shaderConstants", @"pipeline": state, @"sample": @(sample), @"bindings": snapshots});
-        }
-        // Release buffer references as soon as this encoder ends.
-        if (encoderRecord) { for (auto &stage:encoderRecord->constants) for (auto &binding:stage) binding={}; encoderRecord->bytes=nil; }
-    }
+static void finishEncoder(id self, SEL cmd, BG3MFXEncoderState *encoderRecord, id<MTLCommandBuffer>) {
+    // Free setBytes copies now; the state itself lasts until the driver recycles
+    // this encoder. An ended encoder takes no more calls, so nothing reads its
+    // binding table again.
+    if (encoderRecord) { encoderRecord->buffer=nil; encoderRecord->bytes=nil; }
     ((void(*)(id,SEL))original(self,cmd))(self,cmd);
-#ifndef BG3MFX_NO_TRACE
-    finishWaterfallCopies(commandBuffer,waterfallCopies);
-#endif
 }
 static void endEncoder(id self, SEL cmd) {
     __unsafe_unretained BG3MFXEncoderState *encoderRecord = encoderState(self);
@@ -662,16 +288,8 @@ static void pipeline(__unsafe_unretained id self, SEL cmd, __unsafe_unretained i
     __unsafe_unretained BG3MFXEncoderState *s=encoderState(self);
     if (!(bindDedup && s && !BG3MFXBindFilter::forwardPipeline(s->pipeline,state)))
         ((void(*)(id,SEL,id))original(self,cmd))(self,cmd,state);
-#ifndef BG3MFX_NO_TRACE
-    if (redundantProbe && s) {
-        ++redundantCounts[PipelineBinds];
-        if (s->seenPipeline==state) ++redundantCounts[PipelineBindsRedundant];
-        s->seenPipeline=state;
-    }
-#endif
     __unsafe_unretained BG3MFXPipelineInfo *info = state ? (__bridge BG3MFXPipelineInfo *)pipelineInfoPointer(state) : nil;
     NSDictionary *description = info ? info->description : nil;
-    if (traceCalls && !description) description = @{@"label": [state label] ?: @""};
     if (s) {
         bool slow = info && info->kind;
         if (renderer.pipelineBound && renderer.pipelineBound(self,s,info,description)) slow = true;
@@ -679,68 +297,20 @@ static void pipeline(__unsafe_unretained id self, SEL cmd, __unsafe_unretained i
         s->pipeline=state; s->description=description;
         s->kind=info ? info->kind : 0;
         s->slowDraw=slow;
-        s->drawTag=info && filterDraws ? info->drawTag : 0;
     }
-    if (traceCalls) record(@{@"event": NSStringFromSelector(cmd), @"encoder": [self label] ?: @"", @"pipeline": description});
 }
-// Camera shader constants and their reflection (BG3MFX_TRACE_CONSTANTS=1),
-// and whatever the renderer extension reflects.
 static BOOL reflectedShader(MTLRenderPipelineDescriptor *desc) {
-    NSString *name = desc.fragmentFunction.name;
-    if (renderer.wantsReflection && renderer.wantsReflection(desc)) return YES;
-    return snapshotShader(name);
-}
-static NSArray *structMembers(MTLStructType *type, NSUInteger depth) {
-    NSMutableArray *members = [NSMutableArray array];
-    if (depth > 3) return members;
-    for (MTLStructMember *member in type.members) {
-        NSMutableDictionary *entry = [@{@"name": member.name ?: @"", @"offset": @(member.offset), @"type": @(member.dataType)} mutableCopy];
-        if (member.dataType == MTLDataTypeStruct) entry[@"members"] = structMembers(member.structType,depth+1);
-        [members addObject:entry];
-    }
-    return members;
-}
-static void recordReflection(MTLRenderPipelineDescriptor *desc, MTLRenderPipelineReflection *reflection) {
-    if (!reflection) return;
-    NSMutableArray *buffers = [NSMutableArray array];
-    NSMutableArray *textures = [NSMutableArray array];
-    NSMutableDictionary *sizes = [NSMutableDictionary dictionary];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    for (MTLArgument *arg in reflection.fragmentArguments) {
-        if (arg.type == MTLArgumentTypeBuffer) {
-            sizes[[NSString stringWithFormat:@"fragment:%lu", (unsigned long)arg.index]] = @(arg.bufferDataSize);
-            [buffers addObject:@{@"name": arg.name ?: @"", @"index": @(arg.index), @"size": @(arg.bufferDataSize),
-                                 @"active": @(arg.active), @"members": structMembers(arg.bufferStructType,0)}];
-        }
-        if (arg.type == MTLArgumentTypeTexture)
-            [textures addObject:@{@"name": arg.name ?: @"", @"index": @(arg.index), @"active": @(arg.active)}];
-    }
-#pragma clang diagnostic pop
-    { std::lock_guard<std::recursive_mutex> lock(guard());
-      shaderBufferSizes[desc.fragmentFunction.name ?: @""] = sizes; }
-    record(@{@"event": @"shaderReflection", @"fragment": desc.fragmentFunction.name ?: @"", @"buffers": buffers, @"textures": textures});
+    return renderer.wantsReflection && renderer.wantsReflection(desc);
 }
 // Classifies a render pipeline once, at creation (see BG3MFXPipelineInfo).
 static void renderPipelineCreated(id self, MTLRenderPipelineDescriptor *desc, id state, MTLRenderPipelineReflection *reflection) {
-    NSString *fragment = desc.fragmentFunction.name;
-    NSDictionary *description = traceCalls || snapshotShader(fragment) ? @{@"vertex": desc.vertexFunction.name ?: @"", @"fragment": fragment ?: @"", @"label": desc.label ?: @""} : nil;
-#ifndef BG3MFX_NO_TRACE
-    NSDictionary *waterfall=waterfallLayout(desc);
-    if (waterfall) { NSMutableDictionary *expanded=[description mutableCopy]; expanded[@"vertexLayout"]=waterfall; description=expanded; }
-#endif
-    if (state) {
-        BG3MFXPipelineInfo *info = [BG3MFXPipelineInfo new];
-        info->description = description;
-        if (renderer.renderPipelineCreated) renderer.renderPipelineCreated(desc, state, reflection, info);
-        description = info->description;
-        static SEL create = @selector(newRenderPipelineStateWithDescriptor:error:);
-        info->replaceDraws = drawReplacement.claim && drawReplacement.claim(self, desc, state, (BG3MFXCreateRenderPipeline)original(self,create));
-        objc_setAssociatedObject(state, &pipelineKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        pipelineGeneration.fetch_add(1, std::memory_order_release);
-        if (filterDraws) drawFilter.pipelineCreated(desc,state,tagPipeline);
-    }
-    if (traceCalls) record(@{@"event": @"renderPipeline", @"pipeline": description, @"success": @(state != nil)});
+    if (!state) return;
+    BG3MFXPipelineInfo *info = [BG3MFXPipelineInfo new];
+    if (renderer.renderPipelineCreated) renderer.renderPipelineCreated(desc, state, reflection, info);
+    static SEL create = @selector(newRenderPipelineStateWithDescriptor:error:);
+    info->replaceDraws = drawReplacement.claim && drawReplacement.claim(self, desc, state, (BG3MFXCreateRenderPipeline)original(self,create));
+    objc_setAssociatedObject(state, &pipelineKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    pipelineGeneration.fetch_add(1, std::memory_order_release);
 }
 static id renderPipeline(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, NSError **error) {
     if (renderer.prepareRenderPipeline) desc = renderer.prepareRenderPipeline(self, desc);
@@ -748,11 +318,8 @@ static id renderPipeline(id self, SEL cmd, MTLRenderPipelineDescriptor *desc, NS
     MTLRenderPipelineReflection *reflection = nil;
     if (reflectedShader(desc)) {
         SEL optionsSelector = sel_registerName("newRenderPipelineStateWithDescriptor:options:reflection:error:");
-        NSError *reflectionError = nil;
         state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,optionsSelector))
-            (self,optionsSelector,desc,MTLPipelineOptionBindingInfo|MTLPipelineOptionBufferTypeInfo,&reflection,&reflectionError);
-        if (state) recordReflection(desc,reflection);
-        else record(@{@"event": @"shaderReflectionFailed", @"fragment": desc.fragmentFunction.name ?: @"", @"error": reflectionError.description ?: @""});
+            (self,optionsSelector,desc,MTLPipelineOptionBindingInfo|MTLPipelineOptionBufferTypeInfo,&reflection,nullptr);
         if (!state) state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,desc,error);
     } else state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,desc,error);
     renderPipelineCreated(self, desc, state, reflection);
@@ -763,12 +330,10 @@ static id renderPipelineOptions(id self, SEL cmd, MTLRenderPipelineDescriptor *d
     MTLRenderPipelineReflection *extraReflection = nil;
     id state;
     if (reflectedShader(desc)) {
-        NSError *reflectionError = nil;
         state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,cmd))
-            (self,cmd,desc,options|MTLPipelineOptionBindingInfo|MTLPipelineOptionBufferTypeInfo,&extraReflection,&reflectionError);
+            (self,cmd,desc,options|MTLPipelineOptionBindingInfo|MTLPipelineOptionBufferTypeInfo,&extraReflection,nullptr);
         if (state) {
             if (reflection) *reflection = extraReflection;
-            recordReflection(desc,extraReflection);
         } else state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,cmd))(self,cmd,desc,options,reflection,error);
     } else state = ((id(*)(id,SEL,id,MTLPipelineOption,MTLRenderPipelineReflection **,NSError **))original(self,cmd))(self,cmd,desc,options,reflection,error);
     renderPipelineCreated(self, desc, state, extraReflection);
@@ -776,16 +341,13 @@ static id renderPipelineOptions(id self, SEL cmd, MTLRenderPipelineDescriptor *d
 }
 static id computePipeline(id self, SEL cmd, id<MTLFunction> function, NSError **error) {
     id state = ((id(*)(id,SEL,id,NSError **))original(self,cmd))(self,cmd,function,error);
-    NSString *name = function.name;
-    NSDictionary *description = (traceCalls || (renderer.recognizedCompute && renderer.recognizedCompute(name))) ?
-        @{@"compute": name ?: @""} : nil;
     if (state) {
+        NSString *name = function.name;
         BG3MFXPipelineInfo *info = [BG3MFXPipelineInfo new];
-        info->description = description;
+        if (renderer.recognizedCompute && renderer.recognizedCompute(name)) info->description = @{@"compute": name ?: @""};
         objc_setAssociatedObject(state, &pipelineKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         pipelineGeneration.fetch_add(1, std::memory_order_release);
     }
-    if (traceCalls) record(@{@"event": @"computePipeline", @"pipeline": description, @"success": @(state != nil)});
     return state;
 }
 NSData *metalhooks::constantBytes(id encoder, EncoderStage stage, NSUInteger index, NSUInteger count) {
@@ -817,10 +379,9 @@ static void samplers(__unsafe_unretained id self, SEL cmd, id<MTLSamplerState> c
     ((void(*)(id,SEL,id<MTLSamplerState> const *,NSRange))original(self,cmd))(self,cmd,states,range);
     if(range.location==0 && range.length) if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(self)) s->sampler0=states[0];
 }
-// Draws with pipelines nothing inspects skip all inspection (call tracing
-// excepted); the renderer extension reads lastDrawOther and anyDrawOther.
+// Draws with pipelines nothing inspects skip all inspection; the renderer
+// extension reads lastDrawOther and anyDrawOther.
 static bool fastDraw(__unsafe_unretained id encoder) {
-    if (traceCalls) return false;
     __unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder);
     if (s && s->slowDraw) return false;
     if (s) { s->lastDrawOther=true; s->anyDrawOther=true; }
@@ -862,90 +423,57 @@ static bool replacedDraw(__unsafe_unretained id encoder, void (^call)(void)) {
     return drawReplacement.draw(encoder,s->pipeline,s->textures[0],s->textures[1],calls,call);
 }
 static void draw(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (replacedDrawBound(self) && replacedDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); return; }
     slowDraw(self,DrawCall{type,start,count,1,0,0,nil,0,MTLIndexTypeUInt16,false},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count); });
 }
 static void drawInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (replacedDrawBound(self) && replacedDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); return; }
     slowDraw(self,DrawCall{type,start,count,instances,0,0,nil,0,MTLIndexTypeUInt16,false},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances); });
 }
 static void drawBaseInstance(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger start, NSUInteger count, NSUInteger instances, NSUInteger base) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (replacedDrawBound(self) && replacedDraw(self,^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); })) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); return; }
     slowDraw(self,DrawCall{type,start,count,instances,base,0,nil,0,MTLIndexTypeUInt16,false},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,NSUInteger,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,start,count,instances,base); });
 }
 static void drawIndexed(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset); return; }
-#ifndef BG3MFX_NO_TRACE
-    captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@1,@"baseVertex":@0,@"baseInstance":@0});
-#endif
     slowDraw(self,DrawCall{type,0,count,1,0,0,buffer,offset,indexType,true},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset); });
 }
 static void drawIndexedInstances(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances); return; }
-#ifndef BG3MFX_NO_TRACE
-    captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@(instances),@"baseVertex":@0,@"baseInstance":@0});
-#endif
     slowDraw(self,DrawCall{type,0,count,instances,0,0,buffer,offset,indexType,true},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances); });
 }
 static void drawIndexedBase(__unsafe_unretained id self, SEL cmd, MTLPrimitiveType type, NSUInteger count, MTLIndexType indexType, __unsafe_unretained id<MTLBuffer> buffer, NSUInteger offset, NSUInteger instances, NSInteger baseVertex, NSUInteger baseInstance) {
-    DrawFilterScope filtered(self);
-    if (filtered.skip) return;
     if (fastDraw(self)) { ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger,NSInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances,baseVertex,baseInstance); return; }
-#ifndef BG3MFX_NO_TRACE
-    captureWaterfall(self,@{@"indexCount":@(count),@"indexType":@(indexType),@"indexBuffer":buffer,@"indexOffset":@(offset),@"instances":@(instances),@"baseVertex":@(baseVertex),@"baseInstance":@(baseInstance)});
-#endif
     slowDraw(self,DrawCall{type,0,count,instances,baseInstance,baseVertex,buffer,offset,indexType,true},^{ ((void(*)(id,SEL,MTLPrimitiveType,NSUInteger,MTLIndexType,id,NSUInteger,NSUInteger,NSInteger,NSUInteger))original(self,cmd))(self,cmd,type,count,indexType,buffer,offset,instances,baseVertex,baseInstance); });
 }
 static void dispatch(id self, SEL cmd, MTLSize grid, MTLSize threads) {
     NSString *pipelineName = pipelineDescription(self)[@"compute"];
     DispatchAction action = renderer.dispatch ? renderer.dispatch(self,cmd,pipelineName,grid,threads) : DispatchNative;
     if (action == DispatchDropped) return;
-#ifndef BG3MFX_NO_TRACE
-    if (diagnostics) noteDispatch(self,pipelineName);
-#endif
-    if (traceCalls) {
-        NSDictionary *state = pipelineDescription(self);
-        NSString *name = state[@"compute"] ?: @"";
-        if ([name isEqualToString:@"FSR"] || [name isEqualToString:@"FSR_RCAS"] ||
-            [name isEqualToString:@"BG3MFXDispatchSmoke"]) {
-            record(@{@"event": @"dispatchInputs", @"method": NSStringFromSelector(cmd), @"pipeline": state,
-                @"grid": @[@(grid.width),@(grid.height),@(grid.depth)],
-                @"threadsPerGroup": @[@(threads.width),@(threads.height),@(threads.depth)],
-                @"bindings": objc_getAssociatedObject(self, &bindingsKey) ?: @{}});
-        }
-    }
     if (action == DispatchSuppressed) return;
     ((void(*)(id,SEL,MTLSize,MTLSize))original(self,cmd))(self,cmd,grid,threads);
 }
-// Encoder classes whose methods are already hooked. hook() would find each one
-// installed, but only after taking the global lock about 25 times per encoder.
-// Classes are never deallocated, so their addresses are stable keys.
-static std::atomic<uintptr_t> instrumentedEncoderClasses[16];
-static bool encoderClassInstrumented(Class cls) {
+// Concrete driver classes already hooked, read without a lock on every encoder
+// and command buffer. hook() would find each one installed, but only after
+// taking the global lock about 25 times per encoder. Classes are never
+// deallocated, so their addresses are stable keys.
+using ClassTable = std::atomic<uintptr_t>[16];
+static ClassTable instrumentedEncoderClasses, instrumentedBufferClasses;
+static bool classInstrumented(ClassTable &table, Class cls) {
     uintptr_t key = (uintptr_t)(__bridge void *)cls;
-    for (auto &known : instrumentedEncoderClasses) {
+    for (auto &known : table) {
         uintptr_t value = known.load(std::memory_order_acquire);
         if (value == key) return true;
         if (!value) return false;
     }
     return false;
 }
-static void markEncoderClassInstrumented(Class cls) {
+static void markClassInstrumented(ClassTable &table, Class cls) {
     uintptr_t key = (uintptr_t)(__bridge void *)cls;
-    for (auto &known : instrumentedEncoderClasses) {
+    for (auto &known : table) {
         uintptr_t empty = 0;
         if (known.load(std::memory_order_acquire) == key ||
             known.compare_exchange_strong(empty, key, std::memory_order_acq_rel)) return;
@@ -968,10 +496,8 @@ static void instrumentEncoder(id encoder) {
         hookCache.encoder = (__bridge const void *)encoder; hookCache.state = (__bridge void *)state;
         hookCache.encoderGeneration = generation;
     }
-    if (stale & AssocBindings) objc_setAssociatedObject(encoder, &bindingsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (stale & AssocAttachments) objc_setAssociatedObject(encoder, &attachmentsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (!encoder || encoderClassInstrumented(object_getClass(encoder))) return;
-    if (traceConstants) {
+    if (!encoder || classInstrumented(instrumentedEncoderClasses,object_getClass(encoder))) return;
+    if (runtimeEnabled) {
         hook(encoder,"setFragmentBuffer:offset:atIndex:",(IMP)bindBuffer);
         hook(encoder,"setVertexBuffer:offset:atIndex:",(IMP)bindBuffer);
         hook(encoder,"setFragmentBuffers:offsets:withRange:",(IMP)bindBuffers);
@@ -986,20 +512,7 @@ static void instrumentEncoder(id encoder) {
         hook(encoder,"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",(IMP)drawIndexed);
         hook(encoder,"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:",(IMP)drawIndexedInstances);
         hook(encoder,"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",(IMP)drawIndexedBase);
-        if (filterDraws) hook(encoder,"setDepthStencilState:",(IMP)setDepthStencilHook);
     }
-    if (traceCalls) hook(encoder,"setLabel:",(IMP)label);
-    bool observeCompute = false;
-#ifndef BG3MFX_NO_TRACE
-    observeCompute = diagnostics && (computeBindObservers.count || dispatchObservers.count);
-#endif
-    if ((traceConstants && computeConstants) || observeCompute) {
-        hook(encoder,"setBuffer:offset:atIndex:",(IMP)bindBuffer);
-        hook(encoder,"setBuffers:offsets:withRange:",(IMP)bindBuffers);
-        hook(encoder,"setBufferOffset:atIndex:",(IMP)bufferOffset);
-        hook(encoder,"setBytes:length:atIndex:",(IMP)bindBytes);
-    }
-    if (traceCalls) hook(encoder,"pushDebugGroup:",(IMP)group);
     hook(encoder,"setViewport:",(IMP)bindViewport);
     hook(encoder,"setScissorRect:",(IMP)bindScissor);
     hook(encoder,"setFragmentSamplerState:atIndex:",(IMP)sampler);
@@ -1011,19 +524,29 @@ static void instrumentEncoder(id encoder) {
     hook(encoder,"endEncoding",(IMP)endEncoder);
     hook(encoder,"setRenderPipelineState:",(IMP)pipeline);
     hook(encoder,"setComputePipelineState:",(IMP)pipeline);
-    if (traceConstants) {
+    if (runtimeEnabled) {
         hook(encoder,"dispatchThreads:threadsPerThreadgroup:",(IMP)dispatch);
         hook(encoder,"dispatchThreadgroups:threadsPerThreadgroup:",(IMP)dispatch);
     }
-    markEncoderClassInstrumented(object_getClass(encoder));
+    // Compute constants for the renderer extension (BG3's RCAS constants,
+    // replayed by this fork's sharpening): the same hooks as the render stages.
+    if (runtimeEnabled && computeConstants) {
+        hook(encoder,"setBuffer:offset:atIndex:",(IMP)bindBuffer);
+        hook(encoder,"setBuffers:offsets:withRange:",(IMP)bindBuffers);
+        hook(encoder,"setBufferOffset:atIndex:",(IMP)bufferOffset);
+        hook(encoder,"setBytes:length:atIndex:",(IMP)bindBytes);
+    }
+    markClassInstrumented(instrumentedEncoderClasses,object_getClass(encoder));
 }
 static id computeEncoderType(id self, SEL cmd, MTLDispatchType type);
 static std::map<Class, IMP> &priorComputeMethods() { static auto *value = new std::map<Class, IMP>; return *value; }
 static void refreshComputeHook(id buffer) {
-    if (!traceConstants) return;
-    std::lock_guard<std::recursive_mutex> lock(guard());
+    if (!runtimeEnabled) return;
     Class cls = object_getClass(buffer);
-    SEL selector = sel_registerName("computeCommandEncoderWithDispatchType:");
+    static SEL selector = sel_registerName("computeCommandEncoderWithDispatchType:");
+    // Every render encoder comes through here: the usual case takes no lock.
+    if (class_getMethodImplementation(cls,selector) == (IMP)computeEncoderType) return;
+    std::lock_guard<std::recursive_mutex> lock(guard());
     auto found = originals().find({cls,selector});
     Method method = class_getInstanceMethod(cls,selector);
     if (found == originals().end() || !method || method_getImplementation(method) == (IMP)computeEncoderType) return;
@@ -1033,39 +556,15 @@ static void refreshComputeHook(id buffer) {
     found->second = method_getImplementation(method);
     originalsGeneration.fetch_add(1, std::memory_order_release);
     class_replaceMethod(cls,selector,(IMP)computeEncoderType,method_getTypeEncoding(method));
-    if (traceCalls) record(@{@"event": @"computeHookRefreshed", @"class": NSStringFromClass(cls)});
 }
 static id renderEncoder(id self, SEL cmd, MTLRenderPassDescriptor *desc) {
     refreshComputeHook(self);
-    if (traceCalls) {
-    [[maybe_unused]] BOOL computeRegistered;
-    { std::lock_guard<std::recursive_mutex> lock(guard());
-      computeRegistered = originals().count({object_getClass(self), sel_registerName("computeCommandEncoderWithDispatchType:")}); }
-    Method computeMethod = class_getInstanceMethod(object_getClass(self),sel_registerName("computeCommandEncoderWithDispatchType:"));
-    Dl_info computeImage = {};
-    if (computeMethod) dladdr((const void *)method_getImplementation(computeMethod), &computeImage);
-    record(@{@"event": @"commandBufferHooks", @"class": NSStringFromClass(object_getClass(self)),
-        @"computeImplementationImage": computeImage.dli_fname ? [NSString stringWithUTF8String:computeImage.dli_fname] : @"",
-        @"computeHookRegistered": @(computeRegistered),
-        @"computeHookActive": @(computeMethod && method_getImplementation(computeMethod) == (IMP)computeEncoderType)});
-    }
     bool passChanged = false;
     MTLRenderPassDescriptor *pass = renderer.prepareRenderPass ? renderer.prepareRenderPass(desc,&passChanged) : desc;
     id encoder = ((id(*)(id,SEL,id))original(self,cmd))(self,cmd,pass);
     instrumentEncoder(encoder);
     notifyNewEncoder(encoder,NO);
     for (size_t i = 0; i < renderPassObservers.count; ++i) renderPassObservers.entries[i](desc);
-    flushRedundantCounts();
-    if (filterDraws && encoder) if (__unsafe_unretained BG3MFXEncoderState *s=encoderState(encoder)) s->passTag=drawFilter.renderPass(desc);
-    if (traceCalls) {
-    NSMutableArray *colors = [NSMutableArray array];
-    for (NSUInteger i=0; i<8; ++i) if (desc.colorAttachments[i].texture)
-        [colors addObject:texture(desc.colorAttachments[i].texture)];
-    NSDictionary *attachments = @{@"color": colors, @"depth": texture(desc.depthAttachment.texture)};
-    if (encoder) objc_setAssociatedObject(encoder, &attachmentsKey, attachments, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    noteAssociation(encoder,AssocAttachments);
-        record(@{@"event": @"renderPass", @"color": colors, @"depth": attachments[@"depth"]});
-    }
     if (runtimeEnabled && encoder) {
         if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) { state->buffer=self; state->colorTarget=desc.colorAttachments[0].texture; }
     }
@@ -1086,7 +585,6 @@ static id computeEncoder(id self, SEL cmd) {
     if (creatingDescribedCompute) return ((id(*)(id,SEL))original(self,cmd))(self,cmd);
     MTLComputePassDescriptor *pass = renderer.prepareComputePass ? renderer.prepareComputePass(self,MTLDispatchTypeSerial) : nil;
     id encoder = pass ? describedComputeEncoder(self,pass) : ((id(*)(id,SEL))original(self,cmd))(self,cmd);
-    if (traceCalls) record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     notifyNewEncoder(encoder,YES);
     if (runtimeEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
@@ -1109,31 +607,29 @@ static id computeEncoderType(id self, SEL cmd, MTLDispatchType type) {
     activeBuffer = (__bridge void *)self;
     id encoder = pass ? describedComputeEncoder(self,pass) : ((id(*)(id,SEL,MTLDispatchType))forward)(self,cmd,type);
     activeBuffer = previous;
-    if (traceCalls) record(@{@"event": @"computeEncoderCreated", @"method": NSStringFromSelector(cmd), @"dispatchType": @(type), @"class": NSStringFromClass([encoder class])});
     instrumentEncoder(encoder);
     notifyNewEncoder(encoder,YES);
     if (runtimeEnabled) if (__unsafe_unretained BG3MFXEncoderState *state=encoderState(encoder)) state->buffer=self;
     if (renderer.encoderCreated) renderer.encoderCreated(encoder,self,nil,false);
     return encoder;
 }
-void metalhooks::countPresent(id drawable, SEL cmd) {
-    (void)drawable; (void)cmd;
-    if (renderer.framePresented) renderer.framePresented();
-    std::lock_guard<std::recursive_mutex> lock(guard()); ++frames;
-    if (frames == 1 || frames == 120 || frames % 3600 == 0)
-        if (traceCalls) record(@{@"event": @"present", @"method": NSStringFromSelector(cmd), @"frames": @(frames), @"texture": texture([drawable texture])});
-}
 static void present(id self, SEL cmd, id drawable) {
-    PresentAction action = renderer.present ? renderer.present(self,cmd,drawable) : PresentCounted;
-    if (action == PresentHandled) return;
-    if (action == PresentCounted) countPresent(drawable,cmd);
+    if (renderer.present && renderer.present(self,cmd,drawable,-1) == PresentHandled) return;
     ((void(*)(id,SEL,id))original(self,cmd))(self,cmd,drawable);
 }
 static void presentTimed(id self, SEL cmd, id drawable, double time) {
-    PresentAction action = renderer.present ? renderer.present(self,cmd,drawable) : PresentCounted;
-    if (action == PresentHandled) return;
-    if (action == PresentCounted) countPresent(drawable,cmd);
+    if (renderer.present && renderer.present(self,cmd,drawable,-1) == PresentHandled) return;
     ((void(*)(id,SEL,id,double))original(self,cmd))(self,cmd,drawable,time);
+}
+static void presentAfter(id self, SEL cmd, id drawable, double duration) {
+    // Filtered first: a handled present (Frame Generation) paces by it too.
+    // The extension's own presents keep their duration.
+    double filtered = duration;
+    for (size_t i = 0; i < presentDurationFilters.count; ++i) filtered = presentDurationFilters.entries[i](filtered);
+    PresentAction action = renderer.present ? renderer.present(self,cmd,drawable,filtered) : PresentForward;
+    if (action == PresentHandled) return;
+    if (action != PresentOwn) duration = filtered;
+    ((void(*)(id,SEL,id,double))original(self,cmd))(self,cmd,drawable,duration);
 }
 static void commit(id self, SEL cmd) {
     if (renderer.commit) renderer.commit(self,cmd);
@@ -1190,16 +686,15 @@ static id commandBuffer(id self, SEL cmd) {
     // Encoder state does not retain what is bound (ConstantBinding): with
     // BG3MFX_ENABLE every buffer retains its references.
     SEL actual = cmd;
-    if (runtimeEnabled && cmd == sel_registerName("commandBufferWithUnretainedReferences")) actual = sel_registerName("commandBuffer");
+    if (runtimeEnabled && cmd == @selector(commandBufferWithUnretainedReferences)) actual = @selector(commandBuffer);
     id buffer = ((id(*)(id,SEL))original(self,actual))(self,actual);
     if (renderer.commandBufferCreated) renderer.commandBufferCreated(buffer);
-    if (traceCalls) record(@{@"event": @"commandBuffer", @"method": NSStringFromSelector(cmd), @"actualMethod": NSStringFromSelector(actual),
-             @"retainedReferences": @([buffer retainedReferences])});
+    if (!buffer || classInstrumented(instrumentedBufferClasses,object_getClass(buffer))) return buffer;
     hook(buffer,"renderCommandEncoderWithDescriptor:",(IMP)renderEncoder);
     hook(buffer,"computeCommandEncoder",(IMP)computeEncoder);
     hook(buffer,"computeCommandEncoderWithDispatchType:",(IMP)computeEncoderType);
     hook(buffer,"presentDrawable:",(IMP)present);
-    hook(buffer,"presentDrawable:afterMinimumDuration:",(IMP)presentTimed);
+    hook(buffer,"presentDrawable:afterMinimumDuration:",(IMP)presentAfter);
     hook(buffer,"presentDrawable:atTime:",(IMP)presentTimed);
     hook(buffer,"commit",(IMP)commit);
     hook(buffer,"enqueue",(IMP)enqueueBuffer);
@@ -1207,7 +702,7 @@ static id commandBuffer(id self, SEL cmd) {
         hook(buffer,"blitCommandEncoder",(IMP)blitEncoder);
         hook(buffer,"blitCommandEncoderWithDescriptor:",(IMP)blitEncoderDescriptor);
     }
-    if (traceCalls) hook(buffer,"pushDebugGroup:",(IMP)group);
+    markClassInstrumented(instrumentedBufferClasses,object_getClass(buffer));
     return buffer;
 }
 static void instrumentQueue(id queue) {
@@ -1224,27 +719,9 @@ static id newQueueLimit(id self, SEL cmd, NSUInteger count) {
     instrumentQueue(queue);
     return queue;
 }
-// Root installs metal-hooks in every process, before the features that
-// require it.
+// Root installs metal-hooks before the features that require it.
 static BOOL installMetalHooks(const BG3MFXFeatureContext &context, NSError **) {
-    @autoreleasepool {
-        runtimeEnabled = context.runtimeEnabled;
-#ifndef BG3MFX_NO_TRACE
-        // The temporal-chain and waterfall captures read the recorded bindings
-        // and full pipeline descriptions, so they trace calls too.
-        traceCalls = (getenv("BG3MFX_TRACE_RENDER_CALLS") && strcmp(getenv("BG3MFX_TRACE_RENDER_CALLS"),"1") == 0) ||
-            traceTemporalChain() || (waterfallDirectory() && *waterfallDirectory());
-        traceShaderConstants = getenv("BG3MFX_TRACE_CONSTANTS") && strcmp(getenv("BG3MFX_TRACE_CONSTANTS"),"1") == 0;
-#endif
-        // The draw, buffer and dispatch hooks.
-        traceConstants = runtimeEnabled || traceShaderConstants;
-        // Each feature is opt-in (common/Feature.h); the player launcher enables them all.
-        redundantProbe = diagnostics && runtimeEnabled && getenv("BG3MFX_TRACE_REDUNDANT") && strcmp(getenv("BG3MFX_TRACE_REDUNDANT"),"1") == 0;
-        if (diagnostics) {
-            constantSamples = [NSMutableDictionary dictionary];
-            shaderBufferSizes = [NSMutableDictionary dictionary];
-        }
-    }
+    runtimeEnabled = context.runtimeEnabled;
     return YES;
 }
 // After every feature has installed, so the Metal hooks still come after the
@@ -1254,42 +731,11 @@ static BOOL activateMetalHooks(const BG3MFXFeatureContext &, NSError **) {
     hooksActive = true;
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-#ifndef BG3MFX_NO_TRACE
-        // Growth at a steady size means a set still holds textures BG3 replaced.
-        BG3MFXResidencyHook = [](NSString *label, NSUInteger allocations, uint64_t bytes, NSUInteger added, BOOL replaced) {
-            record(@{@"event":@"metal4Residency",@"label":label ?: @"",@"allocations":@(allocations),
-                @"megabytes":@(bytes/1048576.0),@"added":@(added),@"replaced":@(replaced)});
-        };
-        // Which texture enters or leaves a set: a BG3 target or a bg3mfx stand-in.
-        BG3MFXResidencyDetailHook = [](NSString *label, NSArray<NSDictionary *> *added, NSArray<id<MTLAllocation>> *dropped) {
-            auto describe=[](id<MTLAllocation> allocation) -> NSDictionary * {
-                NSMutableDictionary *d=[@{@"object":@((uintptr_t)(__bridge const void *)allocation)} mutableCopy];
-                if ([(id)allocation conformsToProtocol:@protocol(MTLTexture)]) [d addEntriesFromDictionary:texture((id<MTLTexture>)allocation)];
-                return d;
-            };
-            NSMutableArray *a=[NSMutableArray array], *r=[NSMutableArray array];
-            for (NSDictionary *entry in added) {
-                NSMutableDictionary *d=[describe(entry[@"allocation"]) mutableCopy]; d[@"index"]=entry[@"index"]; [a addObject:d];
-            }
-            for (id<MTLAllocation> allocation in dropped) [r addObject:describe(allocation)];
-            record(@{@"event":@"metal4ResidencyDetail",@"label":label ?: @"",@"added":a,@"dropped":r});
-        };
-        // A Metal 4 queue abandons an event wait after 4 s; show which side waited.
-        BG3MFXBridgeStallHook = [](NSString *label, NSDictionary *stalled, NSArray<NSDictionary *> *recent) {
-            record(@{@"event":@"metal4BridgeStall",@"label":label ?: @"",@"now":@(CACurrentMediaTime()),
-                @"stalled":stalled,@"recent":recent});
-        };
-        NSMutableDictionary *startup = [@{@"event": @"start", @"mode": runtimeEnabled ? @"metalfx-menu" : @"diagnostic", @"device": device.name ?: @"unavailable",
-                 @"spatial": @([MTLFXSpatialScalerDescriptor supportsDevice:device]),
-                 @"temporal": @([MTLFXTemporalScalerDescriptor supportsDevice:device])} mutableCopy];
-        record(startup);
-#endif
         hook(device,"newCommandQueue",(IMP)newQueue);
         hook(device,"newCommandQueueWithMaxCommandBufferCount:",(IMP)newQueueLimit);
         hook(device,"newRenderPipelineStateWithDescriptor:error:",(IMP)renderPipeline);
         hook(device,"newRenderPipelineStateWithDescriptor:options:reflection:error:",(IMP)renderPipelineOptions);
         hook(device,"newComputePipelineStateWithFunction:error:",(IMP)computePipeline);
-        if (filterDraws && drawFilter.depthStateCreated) hook(device,"newDepthStencilStateWithDescriptor:",(IMP)depthStencilStateHook);
         // Multiple GPUs may use different concrete driver classes.
         for (id<MTLDevice> other in MTLCopyAllDevices()) {
             hook(other,"newCommandQueue",(IMP)newQueue);
@@ -1297,10 +743,8 @@ static BOOL activateMetalHooks(const BG3MFXFeatureContext &, NSError **) {
             hook(other,"newRenderPipelineStateWithDescriptor:error:",(IMP)renderPipeline);
             hook(other,"newRenderPipelineStateWithDescriptor:options:reflection:error:",(IMP)renderPipelineOptions);
             hook(other,"newComputePipelineStateWithFunction:error:",(IMP)computePipeline);
-            if (filterDraws && drawFilter.depthStateCreated) hook(other,"newDepthStencilStateWithDescriptor:",(IMP)depthStencilStateHook);
         }
     }
     return YES;
 }
-static bool metalHooksWanted(const BG3MFXFeatureContext &) { return true; }
-BG3MFX_FEATURE(metalHooks, {"metal-hooks", nullptr, false, metalHooksWanted, installMetalHooks, activateMetalHooks});
+BG3MFX_FEATURE(metalHooks, {"metal-hooks", nullptr, false, installMetalHooks, activateMetalHooks});

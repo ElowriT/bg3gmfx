@@ -16,13 +16,12 @@
 // M-series GPUs), and stays at 1 until the Temporal integration reports it.
 // Reduces only with MetalFX Temporal and BG3's FSR stage on; otherwise the
 // reduction returns to 1. Frame Generation stretches the reduced region. Requires the UUID-checked ARM64
-// executable. The dynamic-resolution feature, wanted with metalfx; if it
-// cannot install, root reports it skipped and MetalFX does not offer Dynamic. Diagnostic runtime only: BG3MFX_DYNAMIC_RESOLUTION_AREA is a
-// fixed area fraction ("0.5") or "min,max,seconds" for a triangle wave, used
-// with any Temporal quality instead of the controller.
+// executable. Part of the metalfx feature, which installs it; if it cannot
+// install, metalfx reports it and does not offer Dynamic.
+BOOL BG3MFXInstallDynamicResolution(intptr_t slide, NSError **error);
 BOOL BG3MFXDynamicResolutionInstalled(void);
-// BG3's settings select a Dynamic quality (or the diagnostic area override is
-// set), so Temporal scalers need dynamic input content.
+// BG3's settings select a Dynamic quality, so Temporal scalers need dynamic
+// input content.
 BOOL BG3MFXDynamicResolutionSelected(void);
 // The area most recently applied to a render frame; 1 when not reducing.
 float BG3MFXDynamicResolutionArea(void);

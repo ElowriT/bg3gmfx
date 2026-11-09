@@ -14,6 +14,10 @@
 BOOL BG3MFXMetalHooksOnNewEncoder(void (*observer)(id encoder, BOOL compute));
 // Each render pass BG3 begins, after its encoder is created.
 BOOL BG3MFXMetalHooksOnRenderPass(void (*observer)(MTLRenderPassDescriptor *pass));
+// The minimum duration of each presentDrawable:afterMinimumDuration: BG3 makes:
+// each filter receives the duration so far (seconds, BG3's for the first) and
+// returns the one to use, in registration order. Called on the render thread.
+BOOL BG3MFXMetalHooksFilterPresentDuration(double (*filter)(double duration));
 
 // Draw replacement: one feature may take the non-indexed draws of the render
 // pipelines it claims. Other draws only check a per-pipeline flag.
@@ -36,48 +40,9 @@ struct BG3MFXDrawReplacement {
                  __unsafe_unretained id<MTLTexture> fragment1, const BG3MFXEncoderCalls &calls, void (^draw)(void));
 };
 BOOL BG3MFXMetalHooksReplaceDraws(BG3MFXDrawReplacement replacement);
-#ifndef BG3MFX_NO_TRACE
-// Diagnostic runtime only. Each compute buffer bind (`buffer` is nil for an
-// explicit nil, and kCFNull for setBytes), and each compute dispatch with its
-// pipeline's function name. metal-hooks keeps that name only with
-// BG3MFX_TRACE_RENDER_CALLS=1 (and for the renderer extension's: with metalfx,
-// FSR, FSR_RCAS and CAS); otherwise it is nil. Registering either hooks compute binds.
-BOOL BG3MFXMetalHooksOnComputeBind(void (*observer)(id encoder, NSUInteger index, id buffer));
-BOOL BG3MFXMetalHooksOnDispatch(void (*observer)(id encoder, NSString *pipeline));
-#endif
 // Redundant bind filtering: drop fragment texture and pipeline binds that
 // repeat the encoder's current ones (BindFilter.h). It is inline in the
 // hottest hooks, where a call per bind would cost more than it saves;
 // render-thread-optimizations turns it on.
 void BG3MFXMetalHooksFilterRedundantBinds(void);
-
-// Draw filter: one feature may skip draws, or draw them with another
-// depth-stencil state, for the render pipelines it tags. Other draws only
-// check a per-encoder tag; registering also hooks depth-stencil state binds.
-//
-// Sets a render pipeline's tag (0, the default: not filtered), from any
-// thread; a bound pipeline takes its new tag at its next bind.
-using BG3MFXTagPipeline = void (*)(id pipeline, uint8_t tag);
-// The original newDepthStencilStateWithDescriptor:, which returns +1. Typed as
-// void * so ARC does not retain it again; take it with __bridge_transfer.
-using BG3MFXCreateDepthState = void *(*)(id, SEL, id);
-// What a filtered draw does: nothing (`skip`), or draw with `depthState`
-// (metal-hooks restores BG3's after the draw), or, with neither, as BG3 asked.
-struct BG3MFXDrawFilterAction {
-    bool skip;
-    __unsafe_unretained id depthState;
-};
-struct BG3MFXDrawFilter {
-    // Each render pipeline BG3 creates, to tag.
-    void (*pipelineCreated)(MTLRenderPipelineDescriptor *desc, id state, BG3MFXTagPipeline tag);
-    // Each render pass BG3 begins: the pass tag its filtered draws see.
-    uint8_t (*renderPass)(MTLRenderPassDescriptor *desc);
-    // Optional: each depth-stencil state BG3 creates; `create` makes others
-    // through the original method. Setting it hooks state creation.
-    void (*depthStateCreated)(id device, SEL selector, MTLDepthStencilDescriptor *desc, id state, BG3MFXCreateDepthState create);
-    // A draw with a tagged pipeline bound, in a pass with `passTag`, under
-    // BG3's current depth-stencil state.
-    BG3MFXDrawFilterAction (*draw)(uint8_t pipelineTag, uint8_t passTag, __unsafe_unretained id depthState);
-};
-BOOL BG3MFXMetalHooksFilterDraws(BG3MFXDrawFilter filter);
 

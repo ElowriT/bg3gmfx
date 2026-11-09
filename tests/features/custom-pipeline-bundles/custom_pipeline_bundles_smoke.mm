@@ -79,8 +79,8 @@ const void *stubCreateRasterizerState(uint32_t cull, uint32_t fill, bool scissor
     rasterizers.push_back(state);
     return state;
 }
-std::vector<NSDictionary *> events;
-void report(NSDictionary *event) { events.push_back(event); }
+}
+namespace {
 
 // Index `index` with `salt`, and a type in the top bits as BG3 sets them.
 uint64_t handleFor(uint32_t index, uint32_t salt) { return (uint64_t(7) << 54) | (uint64_t(salt) << 32) | index; }
@@ -112,7 +112,7 @@ void testPrograms(id<MTLDevice> metal, id<MTLLibrary> library) {
     void *devicePointer = device;
     memcpy(reinterpret_cast<char *>(data) + Layout::DataDevice, &devicePointer, sizeof devicePointer);
     makePath = stubMakePath; destroyPath = stubDestroyPath; createShader = stubCreateShader;
-    rendererData = &dataPointer; defaultShaderPath = &prefixPointer; reportEvent = report;
+    rendererData = &dataPointer; defaultShaderPath = &prefixPointer;
 
     // No device yet: s_Data is still null.
     check(!create("Base.bshd", nil, cloneFS).valid(), "no device");
@@ -142,8 +142,6 @@ void testPrograms(id<MTLDevice> metal, id<MTLLibrary> library) {
     check(stageOf(index, Layout::Fragment) == (__bridge void *)cloneFS, "fragment replaced");
     check(stageOf(index, Layout::Vertex) == (__bridge void *)baseVS, "vertex kept");
     check(CFGetRetainCount((__bridge CFTypeRef)baseFS) == baseRetains - 1, "replaced function released");
-    check(events.size() == 1 && [events[0][@"event"] isEqual:@"programCreated"] && [events[0][@"fragment"] isEqual:@"cloneFS"],
-        "creation reported");
     BG3MFXProgramDesc desc;
     check(BG3MFXDescribeProgram(program, &desc) && [desc.path isEqual:@"prefix/DeferredDecal_ExtractNormal.bshd"],
         "a long (heap) path is described");
@@ -197,7 +195,6 @@ void testDepthStates() {
           desc.stencil && desc.readMask == 0x0f && desc.writeMask == 0x30 && desc.front.pass == 2 &&
           desc.back.compare == MTLCompareFunctionGreater, "described as BG3 made it");
     check(!BG3MFXDescribeDepthState({handleFor(3, 3)}, &desc), "an unknown state isn't described");
-    check(BG3MFXDescribedDepthStates() == 1, "one described");
 
     // A copy writing with GreaterEqual: made on BG3's device, the rest kept.
     BG3MFXDescribeDepthState({equal}, &desc);

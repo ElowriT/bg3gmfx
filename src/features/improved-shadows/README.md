@@ -79,9 +79,8 @@ from the sun then partly shadow themselves.
     quality rows × 1-4 cascades). At the first Load, bg3mfx compiles the
     shader source on BG3's device, specializes it for each row and cascade
     count, and makes 12 clones of BG3's programs with it
-    ([custom-pipeline-bundles](../custom-pipeline-bundles/README.md)). It logs
-    `improved shadows: ready` to os_log category `shadow`, or why BG3's
-    shaders were kept.
+    ([custom-pipeline-bundles](../custom-pipeline-bundles/README.md)). If that
+    fails, it reports why through `BG3MFXFail` and keeps BG3's shaders.
   - **Load, Unload and StartRecording overrides**
     ([custom-render-stages](../custom-render-stages/README.md)). Load puts the
     clones in each stage's table, in place of BG3's. BG3's Load takes its
@@ -123,7 +122,7 @@ from the sun then partly shadow themselves.
 
 ## Live check of the native path
 
-November 1, 2026 (quiet runtime, displayed, M5 Pro, BG3 4.1.1.7631656, with
+November 1, 2026 (displayed, M5 Pro, BG3 4.1.1.7631656, with
 metalfx and duplicate-shadow-fix): `improved shadows: ready` was logged at
 startup, and the user saw correct sun shadows, with no flashing, dotted
 lines, diamond patches or dark slopes, at High and Low Shadow Quality,

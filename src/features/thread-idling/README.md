@@ -11,19 +11,16 @@ waits keep BG3's yield: their completion event holds one semaphore that each
 blocking waiter resets, so sending more waiters to block could strand one or
 leak the semaphore.
 
-For measurement, each part can be tuned at launch:
+The values are constants in [`ThreadIdling.mm`](ThreadIdling.mm):
 
-- `BG3MFX_WORKER_POLL_US` (default 0, BG3's own is 500): how long an idle
-  worker polls the job queues before it sleeps.
-- `BG3MFX_SCHEDULER_POLL_US` (default 0, BG3's own is 101, at most 1000): the
-  scheduler's yield window after each wake.
-- `BG3MFX_CAPFRAME_POLL_US` (default 250, at most 1000): `CapFrame`'s sleep
-  between its checks for queued jobs to run.
-- `BG3MFX_CAPFRAME_MARGIN_US` (default 200): `CapFrame` keeps its poll steps
-  until the next one would land in BG3's final 1 ms, then sleeps until this
-  margin before its deadline, so its tail spins only the margin. With a poll of
-  0 it sleeps there at once and no longer runs jobs while it waits. The
-  diagnostic runtime reports how late those sleeps wake (`capFrameWakeLateness`).
+- Worker poll, 0 us (BG3's own is 500): how long an idle worker polls the job
+  queues before it sleeps.
+- Scheduler poll, 0 us (BG3's own is 101): the scheduler's yield window after
+  each wake.
+- `CapFrame` poll, 250 us: its sleep between its checks for queued jobs to run.
+- `CapFrame` margin, 200 us: `CapFrame` keeps its poll steps until the next one
+  would land in BG3's final 1 ms, then sleeps until this margin before its
+  deadline, so its tail spins only the margin.
 
 The implementation is in
 [`ThreadIdling.mm`](../../../src/features/thread-idling/ThreadIdling.mm),
@@ -41,5 +38,4 @@ other features off), the current defaults used 596% CPU against stock's 727%
 at the same frame rate. A 50 µs worker poll (643%) or BG3's 101 µs scheduler
 window (662%, the scheduler then never sleeps) added CPU without measurable
 fps; BG3's own polls with the `CapFrame` sleep used 939%, as `CapFrame` no longer
-spins and its work moves to spinning workers. See [performance analysis](../../../docs/dev/performance.md)
-and [current validation](../../../docs/dev/validation/README.md).
+spins and its work moves to spinning workers.

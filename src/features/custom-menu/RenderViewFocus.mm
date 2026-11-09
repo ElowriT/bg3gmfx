@@ -14,7 +14,6 @@ namespace {
 IMP originalSetContentView;
 NSWindow *pendingFocusWindow;
 NSView *pendingFocusView;
-void (*reportEvent)(NSDictionary *);
 
 bool isGameRenderView(NSView *view) {
     Class renderViewClass = NSClassFromString(@"LSMTLView");
@@ -50,14 +49,7 @@ void setContentViewWithFocusRepair(NSWindow *window, SEL selector, NSView *view)
     bool eligible = NSThread.isMainThread && NSApp.isActive && window.isKeyWindow &&
         !window.attachedSheet && !modalWindow &&
         (window.firstResponder == window || window.firstResponder == nil);
-    bool restored = eligible && [window makeFirstResponder:restoreView];
-#ifndef BG3MFX_NO_TRACE
-    if (reportEvent) reportEvent(@{@"event":@"renderViewFocusRepair", @"attempted":@(eligible),
-        @"restored":@(restored), @"keyWindow":@(window.isKeyWindow),
-        @"active":@(NSApp.isActive)});
-#else
-    (void)restored;
-#endif
+    if (eligible) [window makeFirstResponder:restoreView];
 }
 bool installRepair() {
     Class windowClass = NSClassFromString(@"LSWindow");
@@ -83,7 +75,6 @@ bool installRepair() {
 }
 }
 
-bool BG3MFXInstallRenderViewFocus(void (*report)(NSDictionary *)) {
-    reportEvent = report;
+bool BG3MFXInstallRenderViewFocus() {
     return installRepair();
 }

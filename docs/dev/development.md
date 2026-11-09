@@ -8,16 +8,17 @@ game tests. Project rules for contributors and coding agents are in
 ## Build and test
 
 ```sh
-make                # quiet runtime + bg3mfx launcher in build/bin/
+make                # runtime + bg3mfx launcher in build/bin/
 make test           # Metal pixel and renderer-hook regressions
 make test-python    # launcher and development-helper checks
 make install PREFIX=/some/prefix   # what the Homebrew formula runs
 ```
 
 `make test` checks synthetic Spatial/Temporal output, frame generation hooks
-and renderer-hook behavior on Metal, for both the quiet runtime and the
-diagnostic runtime (`build/bin/libBG3MetalFXTrace.dylib`). Synthetic results do not
-establish gameplay image quality or performance.
+and renderer-hook behavior on Metal, using the runtime's test build
+(`build/bin/libBG3MetalFXTest.dylib`, the same runtime plus exports for the
+standalone tests). Synthetic results do not establish gameplay image quality or
+performance.
 
 ## Development launches
 
@@ -27,43 +28,20 @@ Keep Steam running, quit BG3, and run:
 python3 tools/launch/bg3mfx.py launch
 ```
 
-This injects the quiet library from `build/bin/`, skips the Larian launcher with
+This injects the runtime library from `build/bin/`, skips the Larian launcher with
 `-NoLauncher 1`, enables the Metal HUD, and leaves the app bundle unchanged.
 It enables no features unless you name them, so a live test exercises one at a
-time: `--feature depth-prepass`, repeatable, with any of `metal-hud`,
-`metalfx`, `duplicate-shadow-fix`,
-`improved-shadows`, `depth-prepass`,
+time: `--feature thread-idling`, repeatable, with any of `metal-hud`,
+`metalfx`, `duplicate-shadow-fix`, `improved-shadows`,
 `render-thread-optimizations`, `new-character-crash-fix`, `lua-jump-fix`,
-`thread-idling`, `reduce-locking` and `ssao-blur-fix`. A feature brings the features it
+`thread-idling`, `reduce-locking`, `ssao-blur-fix` and `animation-optimizations`. A feature brings the features it
 requires (custom-menu for the menu options, custom-render-stages for the shadow
 features). Shell `BG3MFX_FEATURE_*` variables are ignored. Run
 it from your own Terminal: a process without access to `~/Documents` starts BG3
 with a blank profile. To A/B a variant, build it to another path and set
 `BG3MFX_RUNTIME=/path/to/libBG3MetalFX.dylib`; read frame rates from
 `MTL_HUD_LOG_ENABLED=1` output rather than during `sample`, which itself costs
-about a third of the frame rate. For a diagnostic session, use a new trace path:
-
-```sh
-make build/bin/libBG3MetalFXTrace.dylib
-python3 tools/launch/bg3mfx.py launch-trace
-# Or pass --output /absolute/path/to/new-trace.jsonl
-```
-
-A diagnostic session records only what the enabled features report, plus any
-opt-in probes. Set these before the launch command to add more:
-
-- `BG3MFX_TRACE_RENDER_CALLS=1`: every Metal call (texture binds, pipelines,
-  render passes, encoder ends, command buffers, presents, labels). BG3 binds
-  about 30,000 texture slots a frame, so this makes the game slow, and the
-  trace stops adding call events at 20,000 lines. `BG3MFX_TRACE_TEMPORAL_CHAIN`
-  and `BG3MFX_CAPTURE_WATERFALL` turn it on too.
-- `BG3MFX_TRACE_CONSTANTS=1`: camera shader constants and their reflection,
-  for `tools/analysis/analyze_camera_trace.py`, and the SSAO blur's
-  constants (`PPSAO_Blur_PS`), each snapshotted when its encoder ends.
-
-With `BG3MFX_TRACE_STAGE_LIST=1` set, a diagnostic session records each pack
-`BaseApp::InitFrameStages` passes (`stageListCall`: view, kind, pack, and
-whether it was forwarded, replaced or skipped).
+about a third of the frame rate.
 
 To start the development runtime with Steam's Play button instead, set
 Baldur's Gate 3's Launch Options (Properties > General) to:
@@ -76,7 +54,7 @@ Steam needs `%command%` to run a wrapper and replaces it with the quoted app
 bundle; the `#` keeps that path, whose name has an apostrophe, out of the
 command, and the script finds the bundle in the Steam libraries. It starts the
 game through LaunchServices (`open -n -W`), so the game keeps its own access to
-`~/Documents` and Steam tracks it until it quits, with the quiet runtime from
+`~/Documents` and Steam tracks it until it quits, with the runtime from
 `build/bin/` injected after Steam's own libraries (the overlay), `-NoLauncher 1`,
 and the Metal HUD loadable as the `bg3mfx` launcher does.
 `BG3MFX_STEAM_OVERLAY=0` in the file below leaves Steam's libraries out, as
@@ -89,6 +67,25 @@ fork's `window-rebind-click`, unless that file or the environment sets one to
 `0` (for example `BG3MFX_FEATURE_REDUCE_LOCKING=0`). Clear the
 Launch Options to play unmodded. `tests/launcher/test_steam_launch.py` checks the arguments it
 passes to `open`.
+
+## Diagnostics and failures
+
+The runtime has no diagnostics. While developing a feature, add whatever
+temporary logging, counters or probes it needs, and remove them before
+committing it. First check whether a GPU capture, Metal logging, the Metal HUD or
+CPU sampling already has the data.
+
+BG3GMFX keeps one exception, lab mode ([lab.md](lab.md)): it stays off unless
+`BG3MFX_LAB` names a directory for its files, and no feature depends on it.
+
+Failures go through `BG3MFXFail` in `src/common/Notice.h`: the system log
+(`com.bg3mfx`, category `failure`) and, with a title, the player's dialog; in the
+test build with `BG3MFX_TEST_ERRORS_STDERR=1`, stderr and no dialog. An enabled feature that is
+skipped reports why the same way. To read them:
+
+```sh
+/usr/bin/log show --last 1h --predicate 'subsystem == "com.bg3mfx"'
+```
 
 The unmodded Steam app bundle is at
 `/Users/acw/Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/Baldur's Gate 3.app`.
@@ -107,20 +104,10 @@ open --env MTL_HUD_ENABLED=1 \
 
 This launches the Steam-installed bundle without injecting the bg3mfx runtime.
 Keep live scene navigation under user control.
-See the [baseline capture procedure](baseline-captures.md) for collecting
-GPU traces, CPU samples, Metal HUD logs, and power estimates.
 
-Add `BG3MFX_FRAME_LOG=1` to the diagnostic runtime to log BG3's actual
-rendered rate, the real and generated images that reached the display, drops,
-the presentation method, the gaps between shown images, and Frame Generation's
-sampled refresh rate, source interval, scheduled minimum durations, app active
-state, screen maximum refresh rate, stand-in wait/work time, and overflow-slot
-use every 2 s:
-`log stream --predicate 'subsystem == "com.bg3mfx"'`. With Frame Generation on,
-the Metal HUD's "rendered" figure is unreliable (a trace showed about 19
-rendered fps while the HUD showed about 10); use this log instead. The real and
-generated cadence fields report the measured interval between successive
-presented images of each type.
+With Frame Generation on, the Metal HUD's "rendered" figure is unreliable (a
+trace showed about 19 rendered fps while the HUD showed about 10), so count
+BG3's presents with a temporary diagnostic when that number matters.
 
 Add `MTL_HUD_LOG_ENABLED=1` to record the Metal HUD's per-second frame counts in
 the unified log (`/usr/bin/log show --predicate 'category == "Logging"'`). Do
@@ -147,16 +134,12 @@ build/bin/bg3mfx --dry-run`.
 - [Architecture and behavior contracts](architecture.md)
 - [BG3GMFX validation and measurements](fork-validation.md)
 - [Lab mode](lab.md)
-- [Current validation status and next checks](validation/README.md)
-- [macOS renderer reference](reference/mac-renderer.md)
-- [Windows DLSS research](reference/windows-dlss.md)
+- [BG3's default renderer](baseline/README.md)
 
 ## Build files and retained evidence
 
 Compiled launchers, libraries, probes, and smoke executables live in
-`build/bin/`. Diagnostic launches without `--output` write a fresh trace under
-`build/evidence/<date>-diagnostic/`; the temporal quality regression also writes
-under a dated `build/evidence/` folder. Existing files elsewhere under `build/`
+`build/bin/`. The temporal quality regression writes under a dated `build/evidence/` folder. Existing files elsewhere under `build/`
 are treated as retained or historical data. Review them individually before any
 manual move; `make clean` removes only `build/bin/`, and the explicit
 `make clean-evidence` permanently deletes only `build/evidence/`. Neither command migrates or

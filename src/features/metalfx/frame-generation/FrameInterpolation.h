@@ -43,27 +43,14 @@
 // uses a shared event signalled at the end of BG3's presenting command buffer.
 @interface BG3MFXFramePresenter : NSObject
 // Pairs whose generated and real images were both submitted for presentation.
-#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_STANDALONE_TEST_HOOKS)
+#ifdef BG3MFX_STANDALONE_TEST_HOOKS
 @property(atomic, readonly) NSUInteger presentedPairs;
 #endif
 @property(nonatomic, readonly) MTLPixelFormat pixelFormat;
-// Diagnostics: called when each worker drawable is shown (presentedTime > 0),
-// dropped (0), or skipped because no drawable was available (-1). `target` is
-// the requested display time (0 for as soon as possible).
-#ifndef BG3MFX_NO_TRACE
-@property(atomic, copy) void (^presentedHandler)(BOOL generated, CFTimeInterval presentedTime,
-                                                  CFTimeInterval target, double interval);
-#endif
 @property(atomic, copy) void (^failureHandler)(NSError *);
 - (instancetype)initWithDevice:(id<MTLDevice>)device format:(MTLPixelFormat)format error:(NSError **)error;
-// Diagnostics: average milliseconds per frame the worker spent idle, waiting
-// for drawables, waiting for GPU copies, and sleeping for pacing, and how long
-// BG3 waited for a free stand-in, since the previous call.
-#ifndef BG3MFX_NO_TRACE
-- (NSDictionary *)takeTimingSummary;
-#endif
-// Diagnostics (lab mode): how long BG3's render thread has been waiting for a
-// free stand-in, 0 when it is not waiting.
+// Lab mode: how long BG3's render thread has been waiting for a free
+// stand-in, 0 when it is not waiting.
 + (double)standInWaitSeconds;
 // True on the presenter's own thread, whose drawable requests must stay real.
 + (BOOL)isPresentationThread;
@@ -80,6 +67,8 @@
 - (void)discardGeneratedTarget:(id<MTLTexture>)texture afterCommandBuffer:(id<MTLCommandBuffer>)buffer;
 // Call before BG3 commits the buffer that presents `standIn`. `generated` is
 // shown first when present. A nil buffer presents without GPU ordering.
+// `minimum` is BG3's (filtered) presentDrawable:afterMinimumDuration: duration,
+// negative for other presents: with vsync on, a pair takes at least that long.
 - (void)submitStandIn:(id<CAMetalDrawable>)standIn generated:(id<MTLTexture>)generated
-          afterBuffer:(id<MTLCommandBuffer>)buffer interval:(double)interval;
+          afterBuffer:(id<MTLCommandBuffer>)buffer interval:(double)interval minimum:(double)minimum;
 @end

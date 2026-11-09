@@ -3,47 +3,46 @@
 Technical name: `metal-hooks`.
 
 The Metal interception layer the other renderer features build on. It has no
-player-visible effect itself and no flag: it is wanted in every process, also
-outside BG3 so the hook regressions can run it.
+player-visible effect itself. It is enabled by the features that require it
+(or `BG3MFX_FEATURE_METAL_HOOKS=1`, as the hook regressions outside BG3 set);
+with none of them requested, Metal is not hooked.
 
 ## Behavior
 
 At activation, after every feature has installed, it swizzles the Metal
 device, command queue, command buffer and encoder methods BG3 uses, keeps the
-originals, and tracks each encoder's bound pipeline, textures and
-depth-stencil state. Features that require it register from their install
+originals, and tracks each encoder's bound pipeline and textures. Features that require it register from their install
 ([`MetalHooks.h`](MetalHooks.h)); the registrations are read without locks
 afterwards:
 
 - new-encoder and render-pass observers (up to four each);
+- present-duration filters (up to four), which in turn adjust the minimum
+  duration of each `presentDrawable:afterMinimumDuration:` BG3 makes (run
+  before the renderer extension, which receives the filtered duration for
+  presents it handles, such as Frame Generation's; the extension's own
+  presents, `PresentOwn`, keep their duration);
 - one draw replacement, which takes the non-indexed draws of the render
   pipelines it claims (metalfx's renderer);
-- one draw filter, which tags render pipelines and passes and, for tagged
-  pipelines' draws only, skips them or swaps the depth-stencil state for the
-  draw (depth-prepass);
 - redundant bind filtering ([`BindFilter.h`](BindFilter.h)), metal-hooks' own
-  rules inline in its bind hooks, switched on by render-thread-optimizations;
-- in the diagnostic runtime, compute bind and dispatch observers.
+  rules inline in its bind hooks, switched on by render-thread-optimizations.
 
-metalfx-renderer extends it through the private
+metalfx's renderer extends it through the private
 [`MetalHooksInternal.h`](MetalHooksInternal.h). metal-hooks includes no
 feature's header.
 
 ## Implementation
 
-[`MetalHooks.mm`](MetalHooks.mm) holds the hooks and, in the diagnostic
-runtime, the render-call trace, constant and redundant-bind probes and the
-waterfall capture.
+[`MetalHooks.mm`](MetalHooks.mm) holds the hooks.
 
 ## Improvement
 
 None by itself. An observer point with nothing registered costs one count
-check; an untagged draw one tag check.
+check.
 
 ## Tests
 
 [`bind_filter_smoke.mm`](../../../tests/features/metal-hooks/bind_filter_smoke.mm)
 covers the bind filter's rules. The hook regressions (`spatial-hook-smoke`,
-`temporal-hook-smoke`, `frame-generation-hook-smoke`, `prepass-trim-smoke`,
+`temporal-hook-smoke`, `frame-generation-hook-smoke`,
 `new-character-crash-fix-smoke`) run metal-hooks through both runtimes on
 synthetic offscreen draws.

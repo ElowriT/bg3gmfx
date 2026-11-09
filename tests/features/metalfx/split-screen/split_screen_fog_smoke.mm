@@ -10,7 +10,8 @@
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc != 2) return 2;
-        // The fix is metalfx-renderer's (viewportFogDescriptor), which needs the runtime and metalfx.
+        // The fix is metalfx's renderer's (viewportFogDescriptor), which only the
+        // test runtime installs outside BG3; it needs the runtime and metalfx.
         setenv("BG3MFX_ENABLE","1",1);
         setenv("BG3MFX_FEATURE_METALFX","1",1);
         if (!dlopen(argv[1], RTLD_NOW)) { fprintf(stderr, "%s\n", dlerror()); return 1; }

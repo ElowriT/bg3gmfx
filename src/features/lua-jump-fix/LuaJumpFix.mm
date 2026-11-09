@@ -26,7 +26,7 @@ const uint32_t longjmpBefore[] = {0x91002100, 0x52800021}, setjmpBefore = 0x9100
 const size_t islandOffset = BG3MFXBuild::Islands::Lua.offset, islandBytes = BG3MFXBuild::Islands::Lua.bytes;
 }
 
-BOOL BG3MFXInstallLuaJumpFix(intptr_t slide, void (*report)(NSDictionary *), NSError **error) {
+BOOL BG3MFXInstallLuaJumpFix(intptr_t slide, NSError **error) {
     auto fail = [&](NSString *message) {
         if (error) *error = [NSError errorWithDomain:@"BG3MFXLuaJumpFix" code:1 userInfo:@{NSLocalizedDescriptionKey:message}];
         return NO;
@@ -61,14 +61,13 @@ BOOL BG3MFXInstallLuaJumpFix(intptr_t slide, void (*report)(NSDictionary *), NSE
         memcpy(reinterpret_cast<void *>(protectCall), &call, 4);
     });
     if (result == BG3MFXCodePatchResult::NotWritable) return fail(@"Could not make Lua error handling writable.");
-    // Written but not executable again: report it as installed, not skipped.
-    if (report) report(@{@"event": @"luaJumpFixInstalled", @"protectionRestored": @(result == BG3MFXCodePatchResult::Patched)});
+    // Written but not executable again still counts as installed, not skipped.
     return YES;
 }
 
 namespace {
 BOOL installLuaJumpFix(const BG3MFXFeatureContext &context, NSError **error) {
-    return BG3MFXInstallLuaJumpFix(context.slide, context.report, error);
+    return BG3MFXInstallLuaJumpFix(context.slide, error);
 }
 }
-BG3MFX_FEATURE(luaJumpFixFeature, {"lua-jump-fix", nullptr, true, nullptr, installLuaJumpFix, nullptr});
+BG3MFX_FEATURE(luaJumpFixFeature, {"lua-jump-fix", nullptr, true, installLuaJumpFix, nullptr});

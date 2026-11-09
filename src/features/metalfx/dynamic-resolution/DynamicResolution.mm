@@ -1,4 +1,3 @@
-#include "common/Feature.h"
 #include "common/native/SupportedBuild.h"
 #import "features/metalfx/dynamic-resolution/DynamicResolution.h"
 #import "features/metalfx/MetalFX.h"
@@ -6,8 +5,6 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #include <libkern/OSCacheControl.h>
-#include <mach/mach_time.h>
-#include <os/log.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -45,23 +42,6 @@ std::atomic<float> minimumScale{0}, maximumScale{0};
 // Read by the SSR valid island as a byte: nonzero makes SSR discard its history.
 std::atomic<uint8_t> ssrDiscard{0};
 static_assert(sizeof ssrDiscard == 1, "the SSR island loads one byte");
-// One line per controller window (category `controller`): the diagnostic
-// runtime, and a quiet-runtime developer build (BG3MFX_RESOLUTION_LOG) for
-// measuring without the diagnostic runtime's CPU cost.
-#if !defined(BG3MFX_NO_TRACE) || defined(BG3MFX_RESOLUTION_LOG)
-#define BG3MFX_CONTROLLER_LOG 1
-os_log_t controllerLog;
-#endif
-#ifndef BG3MFX_NO_TRACE
-void (*reportEvent)(NSDictionary *);
-os_log_t resolutionLog;
-// BG3MFX_DYNAMIC_RESOLUTION_AREA: a fixed area, or a triangle wave between two.
-bool overrideArea;
-float minimumArea = 1, maximumArea = 1, periodSeconds = 0;
-double ticksToSeconds;
-uint64_t startTicks;
-float logged = -1;
-#endif
 
 // GPU execution intervals of BG3's command buffers and our Metal 4
 // submissions. Completions from different queues and handler threads arrive
@@ -71,23 +51,12 @@ std::vector<std::pair<double, double>> gpuIntervals, takenIntervals;
 // Render thread only: the end of the time already counted, so an interval
 // spanning two windows is not counted twice.
 double gpuCounted;
-#ifndef BG3MFX_NO_TRACE
-// Diagnostics: the window's intervals before merging.
-struct GPUStats { unsigned count; double raw, first, last; } takenStats;
-#endif
 double takeGPUBusy() {
     takenIntervals.clear();
     { std::lock_guard<std::mutex> hold(gpuLock); gpuIntervals.swap(takenIntervals); }
     std::sort(takenIntervals.begin(), takenIntervals.end());
     double busy = 0;
-#ifndef BG3MFX_NO_TRACE
-    takenStats = {unsigned(takenIntervals.size()), 0, takenIntervals.empty() ? 0 : takenIntervals.front().first, 0};
-#endif
     for (const auto &interval : takenIntervals) {
-#ifndef BG3MFX_NO_TRACE
-        takenStats.raw += interval.second - interval.first;
-        takenStats.last = std::max(takenStats.last, interval.second);
-#endif
         double from = std::max(interval.first, gpuCounted);
         if (interval.second > from) { busy += interval.second - from; gpuCounted = interval.second; }
     }
@@ -175,9 +144,6 @@ float thermalLimit(float area, float lowest) {
         ceiling = std::min(1.0f, float(ceiling * ThermalRecovery));
         thermalSteppedAt = now;
     }
-#ifdef BG3MFX_CONTROLLER_LOG
-    if (ceiling != thermalCeiling) os_log(controllerLog, "thermal %ld ceiling %.3f", long(state), ceiling);
-#endif
     thermalCeiling = ceiling;
     return std::min(area, ceiling);
 }
@@ -208,17 +174,6 @@ float controllerArea(double target) {
         step = std::min(step, std::max(1.0, MissedMargin * missedArea / controlledArea));
     }
     controlledArea = std::min(1.0f, float(controlledArea * step));
-#ifdef BG3MFX_CONTROLLER_LOG
-    os_log(controllerLog, "busy %.3f smoothed %.3f fps %.1f smoothed %.1f target fps %.1f area %.3f",
-        measured, utilization, fps, smoothedFPS, target, controlledArea);
-#endif
-#ifndef BG3MFX_NO_TRACE
-    if (reportEvent)
-        reportEvent(@{@"event":@"dynamicResolutionStep",@"utilization":@(utilization),@"measured":@(measured),@"frames":@(frames),
-            @"seconds":@(elapsed),@"targetFrameRate":@(target),@"area":@(controlledArea),@"intervals":@(takenStats.count),
-            @"raw":@(takenStats.raw),@"span":@(takenStats.last - takenStats.first),
-            @"lag":@(windowStart - takenStats.last)});
-#endif
     return controlledArea;
 }
 
@@ -236,12 +191,6 @@ float targetArea(uint8_t *frame) {
     // A quality, mode or window change resizes targets over several frames;
     // stay at full size until it has settled.
     if (eligible != settledEligible || memcmp(sizes, settledSizes, sizeof sizes)) {
-#ifdef BG3MFX_CONTROLLER_LOG
-        os_log(controllerLog, "eligible %d: quality %d limits %.2f-%.2f mode %d temporalFailed %d frameGeneration %d upscaling %d render %dx%d output %dx%d",
-            eligible, settings ? read<uint8_t>(settings, BG3MFXBuild::Temporal::Layout::SettingsQuality) : -1, smallest, largest,
-            BG3MFXSelectedScalingMode(), BG3MFXTemporalFailed(), BG3MFXFrameGenerationEnabled(),
-            settings ? read<uint8_t>(settings, Layout::SettingsUpscaling) : -1, render[0], render[1], output[0], output[1]);
-#endif
         settledEligible = eligible;
         memcpy(settledSizes, sizes, sizeof sizes);
         settledFrames = 0;
@@ -256,16 +205,6 @@ float targetArea(uint8_t *frame) {
     float axis = std::max((output[0] / largest + 1) / render[0], (output[1] / largest + 1) / render[1]);
     float top = std::min({1.0f, output[0] / (smallest * render[0]), output[1] / (smallest * render[1])});
     float highest = top * top, lowest = std::min(highest, axis * axis);
-#ifndef BG3MFX_NO_TRACE
-    if (overrideArea) {
-        float area = minimumArea;
-        if (periodSeconds > 0) {
-            double phase = std::fmod((mach_absolute_time() - startTicks) * ticksToSeconds, periodSeconds) / periodSeconds;
-            area = minimumArea + (maximumArea - minimumArea) * float(1 - std::abs(2 * phase - 1));
-        }
-        return std::min(highest, std::max(area, lowest));
-    }
-#endif
     controlledArea = std::min(highest, std::max(controllerArea(targetFrameRate(settings)), lowest));
     if (BG3MFXDynamicThermalGuard())
         controlledArea = thermalLimit(controlledArea, lowest);
@@ -286,19 +225,6 @@ void startRecordingHook(uint8_t *frame) {
             uint32_t count = read<uint32_t>(frame, Layout::ViewCount);
             for (uint32_t i = 0; views && i < count && i < 64; ++i)
                 if (views[i]) recalculateViewports(views[i]);
-#ifndef BG3MFX_NO_TRACE
-            if (std::abs(area - logged) >= 0.05f || (area == 1) != (logged == 1)) {
-                logged = area;
-                int32_t render[2], viewport[2], viewSize[2] = {}, viewRect[2] = {};
-                memcpy(render, frame + Layout::RenderSize, 8); memcpy(viewport, frame + Layout::RenderViewport, 8);
-                if (views && count && views[0]) {
-                    memcpy(viewSize, static_cast<uint8_t *>(views[0]) + BG3MFXBuild::Temporal::Layout::ViewSize, 8);
-                    memcpy(viewRect, static_cast<uint8_t *>(views[0]) + Layout::ViewRenderRect, 8);
-                }
-                os_log(resolutionLog, "bg3mfx resolution: area %.3f | render %dx%d viewport %dx%d | views %u, first view size %dx%d render rect %dx%d",
-                    area, render[0], render[1], viewport[0], viewport[1], count, viewSize[0], viewSize[1], viewRect[0], viewRect[1]);
-            }
-#endif
         }
     }
     // SSR maps its history through the current viewport; after a change that
@@ -313,32 +239,11 @@ uintptr_t branchTarget(uintptr_t site, uint32_t word) {
     return site + (intptr_t)imm * 4;
 }
 
-#ifndef BG3MFX_NO_TRACE
-bool parse(const char *value) {
-    char *end = nullptr;
-    float first = strtof(value, &end);
-    if (end == value || !(first > 0) || first > 1) return false;
-    minimumArea = maximumArea = first;
-    if (!*end) return true;
-    if (*end != ',') return false;
-    const char *rest = end + 1;
-    float second = strtof(rest, &end);
-    if (end == rest || !(second > 0) || second > 1 || *end != ',') return false;
-    rest = end + 1;
-    float seconds = strtof(rest, &end);
-    if (end == rest || *end || !(seconds > 0)) return false;
-    minimumArea = std::min(first, second); maximumArea = std::max(first, second); periodSeconds = seconds;
-    return true;
-}
-#endif
 }
 
 BOOL BG3MFXDynamicResolutionInstalled(void) { return installed.load(); }
 BOOL BG3MFXDynamicResolutionSelected(void) {
     if (!installed.load()) return NO;
-#ifndef BG3MFX_NO_TRACE
-    if (overrideArea) return YES;
-#endif
     void *settings = *reinterpret_cast<void **>(settingsGlobal);
     return settings && BG3MFXDynamicQualityValue(read<uint8_t>(settings, BG3MFXBuild::Temporal::Layout::SettingsQuality));
 }
@@ -354,20 +259,11 @@ void BG3MFXDynamicResolutionGPUWork(double start, double end) {
     if (gpuIntervals.size() < 4096) gpuIntervals.emplace_back(start, end);
 }
 
-static BOOL installDynamic(intptr_t slide, void (*report)(NSDictionary *), NSError **error) {
+static BOOL installDynamic(intptr_t slide, NSError **error) {
     auto fail = [&](NSString *message) {
         if (error) *error = [NSError errorWithDomain:@"BG3MFXDynamicResolution" code:1 userInfo:@{NSLocalizedDescriptionKey:message}];
         return NO;
     };
-#ifndef BG3MFX_NO_TRACE
-    if (const char *value = getenv("BG3MFX_DYNAMIC_RESOLUTION_AREA")) {
-        if (!parse(value)) return fail(@"BG3MFX_DYNAMIC_RESOLUTION_AREA must be an area fraction, or min,max,seconds.");
-        overrideArea = true;
-    }
-    reportEvent = report;
-#else
-    (void)report;
-#endif
     for (unsigned i = 0; i < Sites; ++i) {
         uintptr_t site = sites[i] + slide;
         uint32_t word = *reinterpret_cast<const uint32_t *>(site);
@@ -418,16 +314,6 @@ static BOOL installDynamic(intptr_t slide, void (*report)(NSDictionary *), NSErr
     ranges.push_back({ssrValidIsland, BG3MFXBuild::Islands::SSRValid.bytes});
     ranges.push_back({ssrValid, 4});
     for (const auto &load : Native::RenderRectLoads) ranges.push_back({load.address + slide, 4});
-#ifndef BG3MFX_NO_TRACE
-    mach_timebase_info_data_t timebase;
-    mach_timebase_info(&timebase);
-    ticksToSeconds = (double)timebase.numer / timebase.denom / 1e9;
-    startTicks = mach_absolute_time();
-    resolutionLog = os_log_create("com.bg3mfx", "resolution");
-#endif
-#ifdef BG3MFX_CONTROLLER_LOG
-    controllerLog = os_log_create("com.bg3mfx", "controller");
-#endif
     originalStartRecording = reinterpret_cast<void (*)(void *)>(Native::StartRecording + slide);
     calculateViewports = reinterpret_cast<void (*)(void *)>(Native::CalculateViewports + slide);
     recalculateViewports = reinterpret_cast<void (*)(void *)>(Native::RecalculateViewports + slide);
@@ -478,24 +364,7 @@ static BOOL installDynamic(intptr_t slide, void (*report)(NSDictionary *), NSErr
     });
     if (result != BG3MFXCodePatchResult::Patched) return fail(@"Could not install dynamic resolution.");
     installed = true;
-#ifndef BG3MFX_NO_TRACE
-    if (overrideArea)
-        os_log(resolutionLog, "bg3mfx resolution: area override %.3f-%.3f, period %.1f s", minimumArea, maximumArea, periodSeconds);
-#endif
-    if (report) report(@{@"event":@"dynamicResolutionInstalled"});
     return YES;
 }
 
-// The dynamic-resolution feature. Wanted with metalfx rather than required by
-// it, so MetalFX still starts, without the Dynamic quality, when this cannot
-// install. Installed before BG3 creates its device, so renderer pipelines see
-// the installed state.
-namespace {
-bool dynamicResolutionWanted(const BG3MFXFeatureContext &context) {
-    return context.runtimeEnabled && BG3MFXFeatureEnabled("BG3MFX_FEATURE_METALFX");
-}
-BOOL installDynamicResolution(const BG3MFXFeatureContext &context, NSError **error) {
-    return installDynamic(context.slide, context.report, error);
-}
-}
-BG3MFX_FEATURE(dynamicResolution, {"dynamic-resolution", nullptr, true, dynamicResolutionWanted, installDynamicResolution, nullptr});
+BOOL BG3MFXInstallDynamicResolution(intptr_t slide, NSError **error) { return installDynamic(slide, error); }

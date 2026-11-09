@@ -1,5 +1,5 @@
 #!/bin/bash
-# Starts Baldur's Gate 3 from Steam with this checkout's quiet runtime.
+# Starts Baldur's Gate 3 from Steam with this checkout's runtime.
 #
 # In Steam: Baldur's Gate 3 > Properties > General > Launch Options:
 #   "/path/to/checkout/tools/launch/steam-launch.sh" #%command%
@@ -48,9 +48,10 @@ fi
 [ -f "$runtime" ] || fail "The runtime $runtime is missing. Run make in $checkout."
 # The player launcher's features (src/launcher/main.m), then this fork's own.
 for key in BG3MFX_FEATURE_METAL_HUD BG3MFX_FEATURE_METALFX BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX \
-        BG3MFX_FEATURE_IMPROVED_SHADOWS BG3MFX_FEATURE_DEPTH_PREPASS BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS \
+        BG3MFX_FEATURE_IMPROVED_SHADOWS BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS \
         BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX BG3MFX_FEATURE_LUA_JUMP_FIX BG3MFX_FEATURE_THREAD_IDLING \
-        BG3MFX_FEATURE_REDUCE_LOCKING BG3MFX_FEATURE_SSAO_BLUR_FIX BG3MFX_FEATURE_WINDOW_REBIND_CLICK; do
+        BG3MFX_FEATURE_REDUCE_LOCKING BG3MFX_FEATURE_SSAO_BLUR_FIX BG3MFX_FEATURE_ANIMATION_OPTIMIZATIONS \
+        BG3MFX_FEATURE_MAX_FRAME_RATE BG3MFX_FEATURE_WINDOW_REBIND_CLICK; do
     case "$named" in *" $key "*) continue ;; esac
     value="$(/usr/bin/printenv "$key" || true)"
     extra+=(--env "$key=${value:-1}")

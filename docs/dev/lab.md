@@ -3,11 +3,17 @@
 Lab mode is an investigation aid for live BG3 rendering work: finding which
 shader draws a visible effect, what it reads, what each pass costs, and why a
 renderer integration does or does not engage. It is off unless `BG3MFX_LAB`
-names a directory, and it works in both the quiet and the diagnostic runtime.
+names a directory, and it is part of the metalfx feature's renderer, so it
+needs that feature on. It is this fork's exception to the runtime having no
+diagnostics ([development](development.md#diagnostics-and-failures)).
 
 ```sh
-BG3MFX_LAB="$PWD/build/evidence/lab" python3 tools/launch/bg3mfx.py launch
+BG3MFX_LAB="$PWD/build/evidence/lab" python3 tools/launch/bg3mfx.py launch --feature metalfx
 ```
+
+With Steam's Play button ([development](development.md)), which turns every
+player-facing feature on, add a `BG3MFX_LAB=/absolute/path` line to
+`build/steam-launch.env` instead.
 
 Do not rebuild `build/bin/libBG3MetalFX.dylib` while a game started from it runs;
 check `pgrep -f "MacOS/Baldur"` first.
@@ -91,4 +97,4 @@ Skipping or poking pipelines that the MetalFX integration recognizes (TAA, the
 color passes it follows, FSR, RCAS, CombineUI) changes what the upscalers
 receive. Lab mode never alters any game file. `make test` covers the control
 file, census, dumps, pokes, serialization, the profiler and two virtual
-controllers with `lab-smoke` on both runtimes (synthetic only).
+controllers with `lab-smoke` on the test runtime (synthetic only).

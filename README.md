@@ -90,7 +90,6 @@ GPU profiler: see [lab mode](docs/dev/lab.md).
 | **MetalFX Temporal Upscaling** | Builds an upscaled image from current and earlier frames; better quality than spatial. |
 | **Dynamic Upscaling** | Changes MetalFX Temporal Upscaling factor in real time to maintain a minimum target FPS. |
 | **Dynamic Upscaling Thermal Guard** | Changes MetalFX Temporal Upscaling factor in real time to reduce GPU usage and heat. |
-| **Depth Prepass Optimization** | Skips some repeated work when drawing scene depth. |
 | **Duplicate Shadow Fix** | Draws the sun's shadows once per frame instead of twice. |
 | **Improved Shadows** | Replaces the sun shadow filter to fix dotted lines, diamond patches and dark slopes in shadows. |
 | **Ambient Occlusion Blur Fix** | Fixes the game's ambient occlusion blur, which on Macs smooths only vertically, so it smooths horizontally too. |
@@ -109,7 +108,10 @@ GPU profiler: see [lab mode](docs/dev/lab.md).
 | Feature | Description |
 | --- | --- |
 | **Metal HUD** | Shows Apple's on-screen performance overlay. |
+| **Snap to Native FPS** | Keeps Max Frame Rate on rates your display shows evenly, such as 120, 80, 60, 48, 40 and 30 on ProMotion, and paces frames to it. |
 | **Video Options Menu Fix** | Fixes a base game bug that can make the video menu unresponsive in fullscreen. |
+| **Borderless Refresh Rate Fix** | Fixes a base game bug that limits a borderless window to the refresh rate chosen for fullscreen. |
+| **Borderless Notch Fix** | Fixes a base game bug that starts borderless mode on a MacBook with a notch with the bottom of the picture off screen until the resolution is changed. |
 | **Character Creation Crash Fix** | Fixes a base game bug that can freeze or crash the game when entering character creation at certain screen resolutions. |
 
 ## How it works
@@ -165,7 +167,9 @@ Baldur's Gate 3 starts with features available. In the game, go to
   MacBook Pro's 120 Hz ProMotion screen, with **VSync on**. Set the game's
   FPS limiter to half the frame rate you want to see (for example, 60 on a
   120 Hz display).
-- The frame limiter will significantly reduce cpu and gpu usage.
+- The frame limiter will significantly reduce cpu and gpu usage. Tick
+  **Snap to Native FPS** (under Max Frame Rate) so the limit is one your
+  display shows evenly; other limits fall to the next rate it can show.
 - After you untick **Frame Generation**, the Metal HUD keeps showing its frame
   interpolation panel until the game restarts. That is the HUD, not Frame
   Generation: when the HUD's FPS matches its rendered FPS, it is off.
@@ -210,7 +214,6 @@ the environment used to launch `bg3mfx`:
 | **MetalFX upscaling and Frame Generation** | `BG3MFX_FEATURE_METALFX=0` removes the MetalFX options from Options → Video, and Dynamic Resolution with them. |
 | **Duplicate Shadow Fix** | `BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=0` |
 | **Improved Shadows** | `BG3MFX_FEATURE_IMPROVED_SHADOWS=0` |
-| **Depth Prepass Optimization** | `BG3MFX_FEATURE_DEPTH_PREPASS=0` |
 | **Render Thread Optimizations** | `BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=0` |
 | **CPU Thread Idling** | `BG3MFX_FEATURE_THREAD_IDLING=0` |
 | **Lua System Call Elimination** | `BG3MFX_FEATURE_LUA_JUMP_FIX=0` |
@@ -218,6 +221,7 @@ the environment used to launch `bg3mfx`:
 | **Character Creation Crash Fix** | `BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=0` |
 | **Ambient Occlusion Blur Fix** | `BG3MFX_FEATURE_SSAO_BLUR_FIX=0` |
 | **Metal HUD** | `BG3MFX_FEATURE_METAL_HUD=0` removes the Show Metal HUD option. |
+| **Snap to Native FPS** | `BG3MFX_FEATURE_MAX_FRAME_RATE=0` removes the option. |
 
 ## Uninstall
 

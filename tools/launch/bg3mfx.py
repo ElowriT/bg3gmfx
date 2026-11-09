@@ -33,16 +33,17 @@ SUPPORTED_EXECUTABLE_SHA256 = supported_build_value("BG3MFX_SUPPORTED_SHA256")
 # player launcher enables all of them.
 FEATURES = (
     "metal-hud",
+    "max-frame-rate",
     "metalfx",
     "duplicate-shadow-fix",
     "improved-shadows",
-    "depth-prepass",
     "render-thread-optimizations",
     "new-character-crash-fix",
     "lua-jump-fix",
     "thread-idling",
     "reduce-locking",
     "ssao-blur-fix",
+    "animation-optimizations",
 )
 
 
@@ -123,41 +124,22 @@ def run_streaming(command, **kwargs):
 
 
 
-def default_trace_output():
-    """Return a fresh trace path in today's retained diagnostic evidence folder."""
-    project = Path(__file__).resolve().parents[2]
-    now = datetime.now()
-    stamp = now.strftime("%H%M%S-%f")
-    folder = now.strftime("%Y-%m-%d") + "-diagnostic"
-    return project / "build" / "evidence" / folder / f"trace-{stamp}.jsonl"
-
-
-def launch(app_arg, diagnostic_output=None, features=()):
+def launch(app_arg, features=()):
     app, _, executable = bundle(app_arg)
     require_stopped(executable)
     if digest(executable) != SUPPORTED_EXECUTABLE_SHA256:
         raise ValueError(f"MetalFX menu integration is validated only on BG3 {SUPPORTED_VERSION}")
 
     project = Path(__file__).resolve().parents[2]
-    runtime_name = "libBG3MetalFXTrace.dylib" if diagnostic_output else "libBG3MetalFX.dylib"
-    runtime = project / "build" / "bin" / runtime_name
+    runtime = project / "build" / "bin" / "libBG3MetalFX.dylib"
     if os.environ.get("BG3MFX_RUNTIME"):
         runtime = Path(os.environ["BG3MFX_RUNTIME"]).expanduser().resolve()
     if not runtime.is_file():
         raise ValueError("Runtime is missing; run make first")
 
-    output = diagnostic_output.expanduser().resolve() if diagnostic_output else None
     env = os.environ.copy()
     if env.get("DYLD_INSERT_LIBRARIES"):
         raise ValueError("An injected library is already configured; use a clean launch environment")
-    if output:
-        if output.exists():
-            raise ValueError("Trace file already exists; choose a new output path")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        env["BG3MFX_TRACE"] = str(output)
-    else:
-        for key in ("BG3MFX_TRACE", "BG3MFX_TRACE_CONSTANTS", "BG3MFX_SCENE_PROBE"):
-            env.pop(key, None)
     env.update(
         DYLD_INSERT_LIBRARIES=str(runtime),
         SteamAppId="1086940",
@@ -180,20 +162,14 @@ def launch(app_arg, diagnostic_output=None, features=()):
 
     shown = "shown" if hud else "hidden until enabled in Options"
     print("Features: " + (", ".join(features) if features else "none"), flush=True)
-    if output:
-        print(f"Launching MetalFX with diagnostics; Metal HUD {shown}.", flush=True)
-    else:
-        print(f"Launching the quiet runtime; Metal HUD {shown}.", flush=True)
+    print(f"Launching the runtime; Metal HUD {shown}.", flush=True)
     print("Skipping the Larian launcher with -NoLauncher 1; app bundle remains unchanged.", flush=True)
     result = run_streaming(
         [str(executable), "-NoLauncher", "1"], cwd=executable.parent, env=env
     )
 
-    if output and not output.exists():
-        raise ValueError("Diagnostic runtime did not create the trace file")
     if result.returncode == 78:
-        detail = f"; trace: {output}" if output else ""
-        raise ValueError("MetalFX stopped after displaying an error" + detail)
+        raise ValueError("MetalFX stopped after displaying an error")
     if result.returncode:
         raise ValueError(f"Game exited with code {result.returncode}")
 
@@ -203,24 +179,17 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("inspect", help="Report the installed game build")
     check.add_argument("--app", type=Path, default=DEFAULT_APP)
-    quiet = commands.add_parser("launch", help="Run the quiet development runtime")
-    quiet.add_argument("--app", type=Path, default=DEFAULT_APP)
-    trace = commands.add_parser("launch-trace", help="Run with diagnostic tracing enabled")
-    trace.add_argument("--app", type=Path, default=DEFAULT_APP)
-    trace.add_argument("--output", type=Path, help="Trace file path (defaults to build/evidence/<date>-diagnostic/)")
-    for command in (quiet, trace):
-        command.add_argument("--feature", action="append", default=[], choices=FEATURES,
-                             help="Enable a feature (repeatable); none are enabled otherwise")
+    start = commands.add_parser("launch", help="Run the development runtime")
+    start.add_argument("--app", type=Path, default=DEFAULT_APP)
+    start.add_argument("--feature", action="append", default=[], choices=FEATURES,
+                       help="Enable a feature (repeatable); none are enabled otherwise")
     args = parser.parse_args()
 
     try:
         if args.command == "inspect":
             inspect(args.app)
-        elif args.command == "launch":
-            launch(args.app, features=args.feature)
         else:
-            output = args.output or default_trace_output()
-            launch(args.app, output, features=args.feature)
+            launch(args.app, features=args.feature)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         print("bg3mfx: " + str(error), file=sys.stderr)
         if isinstance(error, subprocess.CalledProcessError) and error.stderr:

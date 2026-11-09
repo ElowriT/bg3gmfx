@@ -42,7 +42,7 @@ control is disabled while Temporal is selected.
 ## Renderer flow
 
 `MetalHooks.mm` (metal-hooks) contains the Metal interception layer used by both
-runtime builds; `MetalFXRenderer.mm` (metalfx-renderer) does the MetalFX work
+runtime builds; `MetalFXRenderer.mm` (metalfx's renderer) does the MetalFX work
 from its extension points. It
 tracks each command buffer's selected mode and associates exact BG3 textures
 through TAA, post-processing, and the native FSR stage. Unknown or mismatched
@@ -78,8 +78,7 @@ the FSR dispatch, after that pass has ended, so at a fallback dispatch
 `MetalFXRenderer.mm` first runs its own compute kernel with the same normalization from the
 skipped draw's source into its target inside BG3's compute encoder, then
 restores BG3's FSR pipeline and textures. BG3's draw cannot run there: a render
-pass cannot open inside the active compute encoder. `BG3MFX_SKIP_FSR_TONEMAP=0`
-keeps the draw and the store.
+pass cannot open inside the active compute encoder.
 
 `MetalFXRenderer.mm` captures HDR scene color, device depth, motion, camera constants, and
 BG3's original jitter at the TAA stage. It copies current color into the skipped
@@ -102,8 +101,7 @@ the shared eight-sample table is unchanged for other views and modes.
 image displacement: X is negated and Y retains the native Y-up sign. The old
 adapter supplied the opposite displacement in both framebuffer axes, preventing
 correct temporal reconstruction. The analytic reconstruction test and captured
-depth registration establish this conversion; see the
-[quality diagnosis](validation/temporal-jitter-diagnosis.md).
+depth registration establish this conversion.
 
 Temporal uses `MTL4FXTemporalScaler` on devices reporting `supportsMetal4FX:`;
 other devices retain `MTLFXTemporalScaler`. A dedicated Metal 4 queue waits on
@@ -129,9 +127,7 @@ encoding and submits from the commit hook instead, submitting work of buffers
 committed out of encoding order without the wait; this fork keeps the ordered
 submission (`bridge-handshake-sim` compares the scenarios).
 Per-submission residency and feedback-owned resources preserve GPU lifetimes.
-This does not convert BG3's renderer or presentation to Metal 4. See the
-[Metal 4 audit](validation/metal4-temporal.md) for the API/model distinction and
-validation limits.
+This does not convert BG3's renderer or presentation to Metal 4.
 
 `MetalFXPipeline.mm` owns only the MetalFX Spatial/Temporal scaler objects,
 resource checks, output allocation, scaler encoding, and its cross-API GPU event bridge. It has no BG3 menu,
@@ -184,8 +180,7 @@ last view's. Each view is then interpolated on its own, with an interpolator
 are copied into the interpolator's inputs (the copies an unsplit frame needs
 only for formats MetalFX cannot read), and the results are placed into one
 full scene that `CombineUI` composes as usual. A frame whose views do not tile
-it exactly is presented unpaired. With `BG3MFX_TRACE_TEMPORAL_CHAIN=1`, the diagnostic
-runtime records the recent pass chain in each `frameGenerationNoScene` event.
+it exactly is presented unpaired.
 A live trace (October 13) showed Off + Frame Generation losing the scene at
 CAS, which reads the tone-mapped RGB10A2 scene and writes the one `CombineUI`
 composes; with the CAS forward, Off + Frame Generation works live.
@@ -211,32 +206,30 @@ and real images about half of BG3's smoothed frame interval apart:
 
 | Case | Presentation |
 | --- | --- |
-| VSync on | `presentDrawable:afterMinimumDuration:`, the frame's whole refreshes (at least two) split between the images |
+| VSync on | `presentDrawable:afterMinimumDuration:`, the frame's whole screen steps (refreshes, or ProMotion's update granularity; at least two refreshes, and at least BG3's filtered minimum duration rounded up) split between the images |
 | VSync off, a frame spans at least two refreshes | The same |
 | VSync off, faster | Generated image when its copy finishes, a half-interval wait on the worker, then the real image; uncapped and tearing |
 
-`afterMinimumDuration:` rounds up to whole refreshes, so each minimum is set
-just under its count of refreshes: half the interval rounded up past the frame
+`afterMinimumDuration:` rounds up to whole screen steps, so each minimum is set
+half a step under its count of steps: half the interval rounded up past the frame
 time and let the presenter fall behind. It would also cap the vsync-off fast
 case. On the paced paths (the first two rows) BG3 prefers one stand-in, then can
 borrow one overflow slot after a short grace wait; this lets a nearly-finished
 copy release the low-latency slot while avoiding a long render-thread stall.
 The fast vsync-off path keeps BG3's own buffering and allows at most one
-additional stand-in up to a total of three. The frame log records BG3's
-requested buffering, the stand-in limit, wait time, and overflow use. The
+additional stand-in up to a total of three. The
 refresh interval is read on the main thread from the
 layer's window. The stand-in is released when the real copy completes, before
 any wait, and the worker skips the wait when BG3's next frame is already
 queued. Frames without a generated image are presented at once. Only the generated scene goes through an extra
 `CombineUI` pass. The worker never blocks BG3's or Metal's threads. Devices
 without Metal 4 FX use the Metal 3 effect. This implementation still needs
-displayed/pacing validation and does not establish HDR support. See the
-[frame-generation record](validation/frame-generation.md).
+displayed/pacing validation and does not establish HDR support.
 
 ## Hook overhead
 
 Every intercepted Metal call runs on BG3's render thread, which issues about
-12,000 draws per frame. A `sample` of the quiet runtime showed about half of
+12,000 draws per frame. A `sample` of the runtime showed about half of
 that thread inside the hooks, in Temporal and in Frame Generation alike, when
 binds built strings and dictionaries and every call took a global lock to find
 the original method. Hooks now keep one `BG3MFXEncoderState` per encoder with
@@ -252,7 +245,7 @@ running selector's name is preferred, then the one no longer running its
 replacement. The lookup used to give up there and abort, which closed BG3 as
 soon as VSync was turned on with the overlay (BG3 then presents with
 `presentDrawable:afterMinimumDuration:`). `runtime-smoke` exchanges these
-methods as the overlay does, in the quiet and diagnostic runtimes. An unrecognized draw's only effect, dropping a scene association for
+methods as the overlay does. An unrecognized draw's only effect, dropping a scene association for
 the encoder's target, is applied once at `endEncoding`. A synthetic run of
 20,000 draws and 80,000 binds took 5.5 ms without hooks, 50.2 ms with the
 original hooks, and 7.2 ms after the first rewrite. In the live game the hooks'
@@ -269,11 +262,10 @@ also keeps `setBytes` data in a lazy side table, so each encoder's state owns
 nothing in its binding table and is free to destroy. Synthetic overhead for 150
 encoders and about 20,000 draws went from about 1.9 ms (round 2) to about
 0.9 ms. Measured live on
-the quiet runtime before round 3, with the game in the foreground (samples
+the runtime before round 3, with the game in the foreground (samples
 taken while BG3 is in the background measure its background frame throttle,
-`GameClock::CapFrame`, instead): about 16-17% of the render thread. Diagnostic builds still inspect every draw,
-so use the quiet runtime (with `MTL_HUD_LOG_ENABLED=1` and `sample`) for
-performance comparisons.
+`GameClock::CapFrame`, instead): about 16-17% of the render thread. Use
+`MTL_HUD_LOG_ENABLED=1` and `sample` for performance comparisons.
 
 ## GPU resource reuse
 
@@ -319,7 +311,7 @@ the submission that last used each member of its residency set and rebuilds the
 set without members idle for 16 submissions; pooled textures rotate well within
 that. `metal4-bridge-smoke` replaces its inputs at the same size and checks that
 the old ones are freed (the earlier set kept them until it reached 64
-allocations). The diagnostic runtime logs each set change as `metal4Residency`.
+allocations).
 
 The Metal 4 queue waits on an event that BG3's command buffer signals before
 the FX work. If that buffer fails before signaling, the queue would wait
@@ -349,11 +341,11 @@ retained copy can serve as the previous color. Inputs that do not qualify are
 converted into pooled copies. Live, the saving is within HUD noise (about 1 fps
 at 4K); it is kept because it removes passes and memory, not for frame rate.
 
-## Failure and diagnostics
+## Failure
 
 No failure closes BG3: the player may have unsaved progress. Each turns off
-what failed and shows one notice on the main run loop (`BG3MFXShowNotice` in
-`common/Notice.mm`); with `BG3MFX_TEST_ERRORS_STDERR=1` the message goes only to stderr.
+what failed and shows one notice on the main run loop (`BG3MFXFail` in
+`common/Notice.mm`); in the test build, `BG3MFX_TEST_ERRORS_STDERR=1` sends the message to stderr instead of a dialog.
 
 - A MetalFX Spatial or Temporal initialization, resource, sequencing,
   encoding, or GPU-completion failure turns that upscaler off. BG3's TAA and
@@ -370,11 +362,10 @@ what failed and shows one notice on the main run loop (`BG3MFXShowNotice` in
   If the native integration cannot be installed at startup, BG3 runs without
   MetalFX or the other optimizations.
 
-`libBG3MetalFX.dylib` is the quiet development runtime. `libBG3MetalFXTrace.dylib`
-adds JSONL traces, shader reflection, and opt-in captures. Diagnostics are not
-part of the rendering feature contract and are compiled out of the quiet build.
-Both builds retain the interception and lifetime work required to integrate with
-BG3. `tools/launch/bg3mfx.py` supports only inspection and launch-time injection; it
+`libBG3MetalFX.dylib` is the one runtime, with no diagnostics; `libBG3MetalFXTest.dylib`
+adds exports for the standalone tests. Temporary diagnostics may be added while
+developing a feature and are removed before it is committed.
+`tools/launch/bg3mfx.py` supports only inspection and launch-time injection; it
 does not alter the app bundle.
 
 ## Repository layout
@@ -382,17 +373,16 @@ does not alter the app bundle.
 - `src/features/<feature>/`: feature implementations and a README describing
   behavior, integration, measured results, and validation limits.
   `src/features/root/` installs the others.
-- `src/common/`: the feature interface (`Feature.h`), the diagnostic event log
-  and player notices.
+- `src/common/`: the feature interface (`Feature.h`) and failure reporting
+  (`Notice.h`).
 - `src/common/gpu/`: reusable MetalFX encoding and GPU resource ownership.
 - `src/common/native/`: shared guarded code patching and the canonical supported-build manifest.
 - `src/features/metal-hooks/`: the metal-hooks feature (Metal interception).
   It owns hook installation, shared encoder state and original-method
   dispatch; `MetalHooks.h` is its interface for features and
   `MetalHooksInternal.h` the private one for metalfx's renderer. It includes
-  no feature's header: depth-prepass's rules reach it through the draw filter,
-  and the bind filter (`BindFilter.h`) is its own, switched on by
-  render-thread-optimizations.
+  no feature's header: the bind filter (`BindFilter.h`) is its own, switched
+  on by render-thread-optimizations.
 - Standalone probes and analysis programs live under `tools/probes/` and
   `tools/analysis/`.
 - `src/launcher/` and `packaging/homebrew/`: the player launcher and formula.
@@ -402,15 +392,14 @@ does not alter the app bundle.
   launch, licensed-reference downloads, release maintenance, and scoped cleanup.
 - `build/bin/`: disposable compiled launchers, libraries, tests, and probes.
 - `build/evidence/<date>-<experiment>/`: retained captures, traces, and pixel-test
-  images. New diagnostic traces and temporal quality runs use dated folders.
+  images. Temporal quality runs use dated folders.
 - `build/analysis/baseline/`: retained unmodded-game baseline evidence.
 - Other `build/` paths (`build/profiling/`, downloaded references) are local
   only; `make clean` never removes them. Never place game assets in tracked folders.
-- `docs/dev/performance.md`: renderer and CPU performance measurements.
 
 Use source-root include paths (for example `common/gpu/GPUResources.h`) with
 `-Isrc`. Both runtime variants share the Makefile's source and header lists;
-`make install` still installs only the player launcher and quiet runtime.
+`make install` still installs only the player launcher and runtime.
 
 ## Supported native build
 
@@ -440,12 +429,12 @@ installs them in dependency order. Every feature installs before any
 activates, so a provider (custom-render-stages) patches BG3 only once its
 dependents have registered with it. A feature that patches the executable
 installs only on the supported build, and a skipped feature skips its
-dependents (`featureSkipped`, then a `features` summary in the diagnostic
-trace). The player launcher sets every player-facing feature; a player
+dependents, each reporting why through `BG3MFXFail`. The player launcher sets every player-facing feature; a player
 can set one to 0 to turn it off. `tools/launch/bg3mfx.py` sets only the
 features named with `--feature`, so a live test exercises one at a time.
 `BG3MFX_FEATURE_METALFX` covers MetalFX Spatial, Temporal (with its jitter
-hooks and Dynamic resolution), Frame Generation and the FSR_Tonemap skip. The Video menu is patched
+hooks and Dynamic resolution), Frame Generation and the FSR_Tonemap skip. No
+feature enables itself. The Video menu is patched
 only for a feature that adds options to it (metal-hud, metalfx).
 
 - `src/features/root/Root.mm`: the root feature. Its constructor runs last in
@@ -456,22 +445,35 @@ only for a feature that adds options to it (metal-hud, metalfx).
   callbacks, an ApplyCombo wrapper chain, and item calls on BG3's ABI. It
   patches the Video options manager's Init and ApplyCombo at activation,
   after those features have installed.
+- `src/features/custom-menu/RefreshRepair.*`: part of custom-menu (which
+  requires metal-hooks for it): a present-duration filter that replaces BG3's
+  1/(settings refresh + 1), the fullscreen mode's rate kept in a borderless
+  window, with 1/(screen rate + 1).
+- `src/features/custom-menu/FullscreenFit.*`: part of custom-menu: after
+  macOS's full-screen transition, moves BG3's Borderless window, left as tall
+  as the whole screen with its bottom off screen on a notched display, to the
+  frame below the notch.
+- `src/common/ScreenTiming.*`: the game window's screen timing from
+  `NSScreen` (shortest and longest intervals, step), read on the main thread
+  and copied for any thread; used by custom-menu and max-frame-rate.
 - `src/features/custom-menu/RenderViewFocus.*`: part of custom-menu. It keeps
   BG3's render view first responder across `BindSurface`, so the Video options
   respond to the first click after a fullscreen settings change.
-- `src/features/metalfx/MetalFX.mm`: the metalfx feature (requires
-  custom-menu, metal-hooks, metalfx-renderer and temporal-upscaling). Its
-  install registers the options; its activation restores the saved choices.
-- `src/features/metalfx/temporal-upscaling/TemporalJitter.*`: the
-  temporal-upscaling feature (native): Temporal's jitter, guarded sample
-  selection and ARM64 preservation. If it cannot install it shows "MetalFX
-  could not start" and root skips metalfx.
-- `src/features/metalfx/dynamic-resolution/DynamicResolution.*`: the
-  dynamic-resolution feature (native; wanted with `BG3MFX_FEATURE_METALFX=1`,
-  not required, so MetalFX starts without Dynamic when it is skipped).
-- `src/features/metalfx/MetalFXRenderer.mm`: the metalfx-renderer feature
-  (requires metal-hooks; wanted with `BG3MFX_FEATURE_METALFX=1`, and not
-  native, so the hook regressions run it outside BG3). It is metal-hooks'
+- `src/features/metalfx/MetalFX.mm`: the metalfx feature (native; requires
+  custom-menu and metal-hooks), the only feature under `metalfx/`. Its
+  install puts in Temporal's jitter, Dynamic resolution (optional), the
+  renderer and the options; its activation hooks `CAMetalLayer` for the
+  renderer and restores the saved choices. In the test runtime
+  (`BG3MFX_STANDALONE_TEST_HOOKS`) it is not native, requires only
+  metal-hooks and installs only the renderer, so the hook regressions run it
+  outside BG3.
+- `src/features/metalfx/temporal-upscaling/TemporalJitter.*`: part of
+  metalfx: Temporal's jitter, guarded sample selection and ARM64
+  preservation. If it cannot install it shows "MetalFX could not start" and
+  metalfx's install fails.
+- `src/features/metalfx/dynamic-resolution/DynamicResolution.*`: part of
+  metalfx, optional: when it cannot install, MetalFX starts without Dynamic.
+- `src/features/metalfx/renderer/MetalFXRenderer.mm`: part of metalfx. It is metal-hooks'
   renderer extension (`MetalHooksInternal.h`): scene tracking, the Spatial and
   Temporal dispatch that replaces FSR, the FSR_Tonemap skip, Frame
   Generation's composition, presentation and stand-in drawables, and Dynamic
@@ -484,14 +486,19 @@ only for a feature that adds options to it (metal-hud, metalfx).
   `BG3MFXMetalFXSelectionChanged`.
 - `src/features/metal-hud/MetalHUD.mm`: the metal-hud feature (requires
   custom-menu): adds the Show Metal HUD checkbox.
-- `src/features/metal-hooks/MetalHooks.mm`: the metal-hooks feature, installed in
-  every process (also outside BG3, for the hook regressions); it hooks Metal
+- `src/features/max-frame-rate/MaxFrameRate.mm`: the max-frame-rate feature (requires
+  custom-menu and metal-hooks): a Snap to Native FPS checkbox between Max
+  Frame Rate's tick box (0x53) and slider (0x54), following the tick box.
+  Ticked, it wraps the slider's callback to keep the cap on rates the screen
+  shows natively (divisors of its native refresh rates, down to 30), and, as a `BG3MFXMetalHooksFilterPresentDuration` filter
+  after custom-menu's refresh repair, makes BG3's
+  `presentDrawable:afterMinimumDuration:` use 0 at the screen's highest
+  rate and 1/rate - half a screen update step below it while the cap is on.
+- `src/features/metal-hooks/MetalHooks.mm`: the metal-hooks feature, enabled by the
+  features that require it (the hook regressions set its flag); it hooks Metal
   at activation, after the menu and the native patches. Features that require
   it register with its hook points (`MetalHooks.h`) from their install: a
-  new-encoder observer, a render-pass observer, one draw replacement, one
-  draw filter (pipeline and pass tags, then skip or a depth-stencil swap for
-  tagged draws only), and in the diagnostic runtime compute bind and
-  dispatch observers. Each point holds up to four observers in a fixed array,
+  new-encoder observer, a render-pass observer, a present-duration filter and one draw replacement. Each point holds up to four observers in a fixed array,
   read without locks; with none registered the cost is one count check.
 - `src/common/native/CodePatch.*`: shared in-memory code patching (header-padding branch
   islands, branch range checks, all-or-nothing page protection) and read-only
@@ -507,8 +514,7 @@ only for a feature that adds options to it (metal-hud, metalfx).
   a stage its construction looks up, and Game or Player lists without the
   stages `App::InitFrameStages` inserts around. Enabled by the features that
   require it; dependents register from their install, and it patches App's
-  vtable at activation only once a list is registered, or with
-  `BG3MFX_TRACE_STAGE_LIST=1` in the diagnostic runtime, which records each pack call (`stageListCall`). See
+  vtable at activation only once a list is registered. See
   [views and their stage lists](baseline/README.md#views-and-their-stage-lists).
   It also lets features override a stage class's `Load`, `Unload`, `Submit` or
   `StartRecording` (`BG3MFXOverrideStageMethod`) by replacing the entry in that
@@ -526,19 +532,12 @@ only for a feature that adds options to it (metal-hud, metalfx).
   `BG3MFXGetOrCreateRasterizerState` call `GPUDevice`'s. Entry hooks on
   `DataLoader::CreateShader` and `GPUDevice::CreateDepthState` record
   programs' paths and depth-stencil states' settings; blend and rasterizer
-  settings are read from BG3's own copies. See
-  [DeferredBufferStage's hook points](baseline/deferred-buffer-stage.md#hook-points-for-the-merge).
-- `src/features/depth-prepass/DepthPrepass.*` implements Depth Prepass Optimization (`BG3MFX_FEATURE_DEPTH_PREPASS=1`, requires metal-hooks): vertex-only opaque prepass draws are skipped and
-  their G-buffer draws write depth. `DepthPrepassFeature.mm` registers its
-  rules (`BG3MFXClassifyPrepass`, `BG3MFXPrepassRole`,
-  `BG3MFXPreparePrepassDepth`, `BG3MFXPrepassDraw`) as metal-hooks' draw
-  filter (`BG3MFXMetalHooksFilterDraws`).
+  settings are read from BG3's own copies.
 - `src/features/render-thread-optimizations/` filters redundant binds (`BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1`, requires metal-hooks): fragment texture slots and pipelines
   already bound in the encoder are not forwarded to the driver. The rules
   are metal-hooks' (`src/features/metal-hooks/BindFilter.h`), inline in its
   bind hooks; the feature turns them on with
-  `BG3MFXMetalHooksFilterRedundantBinds`. The diagnostic
-  runtime counts BG3's redundant binds with `BG3MFX_TRACE_REDUNDANT=1`.
+  `BG3MFXMetalHooksFilterRedundantBinds`.
 - `src/features/duplicate-shadow-fix/DuplicateShadowFix.*`: Duplicate Shadow
   Fix (`BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=1`, requires
   custom-render-stages). It registers bg3mfx's own stage lists with
@@ -561,7 +560,6 @@ only for a feature that adds options to it (metal-hud, metalfx).
     `SetTextureSafe` binds BG3's transparent default texture, and the
     shader drops the normal offset for that frame.
 
-  See [validation](validation/README.md#improved-shadows-october-23-2026).
   The backed-out encoder merge's design is in
   [encoder-merge-plan.md](encoder-merge-plan.md).
 - `src/features/thread-idling/ThreadIdling.*`: CPU Thread Idling (`BG3MFX_FEATURE_THREAD_IDLING=1`). BG3's idle workers, job scheduler,
@@ -578,10 +576,16 @@ only for a feature that adds options to it (metal-hud, metalfx).
   metal-hooks' new-encoder hook point it binds a zero-filled,
   untracked stand-in at compute buffer indices 1 and 6 and fragment index 1 on
   each new encoder, so a clustered-lighting pass that BG3 dispatches without
-  `ClusterInfoBuffer` reads no lights instead of faulting the GPU. Diagnostic
-  builds record `clusterBufferGuard` when one of those passes reads the stand-in.
+  `ClusterInfoBuffer` reads no lights instead of faulting the GPU.
 - `src/features/lua-jump-fix/LuaJumpFix.*`: BG3's Lua error handling uses `_setjmp`/`_longjmp`,
   avoiding two system calls per protected call (`BG3MFX_FEATURE_LUA_JUMP_FIX=1`).
+- `src/features/animation-optimizations/AnimationOptimizations.*`,
+  `GrannyKernels.h`: bit-exact NEON replacements for hot functions of BG3's
+  unoptimized (-O0) Granny animation runtime: four Granny function pointers
+  (matrix products and world/composite transforms) are swapped, and composite
+  transforms, quaternion-to-matrix and normalization, spline sampling, knot
+  searches and three curve decoders are entry-patched
+  (`BG3MFX_FEATURE_ANIMATION_OPTIMIZATIONS=1`).
 - `src/features/ssao-blur-fix/SSAOBlurFix.*`: SSAO's horizontal blur pass
   blurs horizontally again (`BG3MFX_FEATURE_SSAO_BLUR_FIX=1`, set by the
   player launcher). Patches the unified-memory branch of
@@ -619,19 +623,15 @@ only for a feature that adds options to it (metal-hud, metalfx).
   spans the device's MetalFX Temporal input content scale range. The TAA
   capture accepts the reduced viewport, a dynamic-resolution scaler upscales
   just that region, and `MetalFXRenderer.mm`'s commit hook reports BG3's command-buffer
-  GPU intervals to the controller. Diagnostic runtime: `BG3MFX_DYNAMIC_RESOLUTION_AREA=<area>`
-  or `<min>,<max>,<seconds>` overrides the controller; logged to category
-  `resolution`. It also patches the volumetric fog history's previous
+  GPU intervals to the controller. It also patches the volumetric fog history's previous
   viewport loads, the auto-exposure scene UV load, the SSR history viewport, an SSR history discard after each area change, and loads of the full view rectangle for forward lighting clamps, bloom and DOF radii and the projection jitter divisor; `MetalFXRenderer.mm` gives the fog composite a viewport-mapped vertex
   shader (`viewportFogDescriptor`, whenever the feature is installed) and
   corrects surface grid draws (`SurfaceGridDraw`) and subsurface scattering
-  widths (`SubsurfaceDraw`) while reducing. See
-  [validation](validation/README.md#dynamic-resolution-probe-october-21-2026).
-- Header-padding islands: Temporal jitter `0x000`–`0x0c0`, Lua `0x700`, server
-  pacing probe `0x800`, thread idling `0x9c0`, uniform slices `0xa00`, custom pipeline bundles `0xad8` (offsets from
+  widths (`SubsurfaceDraw`) while reducing.
+- Header-padding islands: Temporal jitter `0x000`–`0x0c0`, Lua `0x700`, thread idling `0x9c0`, uniform
+  slices `0xa00`, viewport reduction `0xa40`, SSR history `0xa70`, SSR valid `0xaa0`, SSAO blur `0xac0`, custom pipeline bundles `0xad8` (offsets from
   `0x100004000`). Each install checks its range is still zero.
-- `src/features/metal-hooks/MetalHooks.mm`: Metal hooks and diagnostic
-  instrumentation; `src/features/metalfx/MetalFXRenderer.mm`: exact texture
+- `src/features/metal-hooks/MetalHooks.mm`: Metal hooks; `src/features/metalfx/renderer/MetalFXRenderer.mm`: exact texture
   association and pass replacement.
 - `src/features/metalfx/spatial-upscaling/SpatialUpscaler.*` and `src/features/metalfx/temporal-upscaling/TemporalUpscaler.*`: BG3-specific inputs,
   conversions, and destinations for each scaler.
@@ -642,4 +642,3 @@ only for a feature that adds options to it (metal-hud, metalfx).
 - `tests/features/`, `tests/common/`, and `tests/integration/`: synthetic Metal pixel and hook regressions.
 - `tools/launch/bg3mfx.py`: guarded, bundle-preserving development launch;
   `tools/launch/lab.py` drives lab mode.
-- `docs/dev/validation/`: current status and dated evidence.

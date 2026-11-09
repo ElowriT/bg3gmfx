@@ -8,14 +8,14 @@ CXXFLAGS = $(CPPFLAGS) -std=c++17 -fobjc-arc -O2 -Wall -Wextra -mmacosx-version-
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalFX -framework AppKit -framework QuartzCore -framework GameController
 
 .PHONY: hook-overhead all install test test-python clean clean-evidence
-# The quiet runtime is the build players use; bg3mfx is its launcher.
+# The runtime players use, and bg3mfx, its launcher.
 all: $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/bg3mfx
 
 $(BIN_DIR)/bg3mfx: src/launcher/main.m src/common/native/SupportedBuild.h | $(BIN_DIR)
 	xcrun clang $(CPPFLAGS) -fobjc-arc -O2 -Wall -Wextra -mmacosx-version-min=26.0 -DBG3MFX_VERSION=\"$(VERSION)\" $< \
 		-framework AppKit -framework UniformTypeIdentifiers -o $@
 
-# Player install (used by the Homebrew formula): launcher and quiet runtime only.
+# Player install (used by the Homebrew formula): launcher and runtime only.
 install: $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/bg3mfx
 	install -d "$(PREFIX)/bin" "$(PREFIX)/lib/bg3mfx"
 	install -m 755 $(BIN_DIR)/bg3mfx "$(PREFIX)/bin/bg3mfx"
@@ -35,9 +35,6 @@ $(BIN_DIR)/split-screen-upscale-smoke: tests/features/metalfx/split-screen/split
 
 $(BIN_DIR)/spatial-hook-smoke: tests/features/metalfx/spatial-upscaling/spatial_hook_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -framework AppKit -o $@
-
-$(BIN_DIR)/prepass-trim-smoke: tests/features/depth-prepass/prepass_trim_smoke.mm | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
 
 $(BIN_DIR)/new-character-crash-fix-smoke: tests/features/new-character-crash-fix/new_character_crash_fix_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
@@ -75,8 +72,6 @@ $(BIN_DIR):
 
 RUNTIME_SOURCES = \
 	src/features/new-character-crash-fix/NewCharacterCrashFix.mm \
-	src/features/depth-prepass/DepthPrepass.mm \
-	src/features/depth-prepass/DepthPrepassFeature.mm \
 	src/features/render-thread-optimizations/RenderThreadOptimizations.mm \
 	src/features/metalfx/spatial-upscaling/SpatialUpscaler.mm \
 	src/features/metalfx/temporal-upscaling/TemporalUpscaler.mm \
@@ -90,6 +85,7 @@ RUNTIME_SOURCES = \
 	src/features/metalfx/lab/LabInput.mm \
 	src/features/metalfx/sharpening/Sharpening.mm \
 	src/features/metalfx/split-screen/ViewRegions.mm \
+	src/features/animation-optimizations/AnimationOptimizations.mm \
 	src/features/ssao-blur-fix/SSAOBlurFix.mm \
 	src/features/metalfx/dynamic-resolution/DynamicResolution.mm \
 	src/features/improved-shadows/ImprovedShadows.mm \
@@ -97,23 +93,23 @@ RUNTIME_SOURCES = \
 	src/features/metalfx/MetalFX.mm \
 	src/features/metalfx/MetalFXOptions.mm \
 	src/features/metal-hud/MetalHUD.mm \
+	src/features/max-frame-rate/MaxFrameRate.mm \
 	src/features/custom-menu/CustomMenu.mm \
 	src/features/custom-menu/RenderViewFocus.mm \
+	src/features/custom-menu/RefreshRepair.mm \
+	src/features/custom-menu/FullscreenFit.mm \
 	src/common/gpu/GPUResources.mm \
 	src/common/gpu/MetalFXPipeline.mm \
 	src/common/native/CodePatch.mm \
 	src/common/Notice.mm \
+	src/common/ScreenTiming.mm \
 	src/features/custom-render-stages/CustomRenderStages.mm \
 	src/features/custom-pipeline-bundles/CustomPipelineBundles.mm \
-	src/features/metalfx/MetalFXRenderer.mm \
+	src/features/metalfx/renderer/MetalFXRenderer.mm \
 	src/features/metal-hooks/MetalHooks.mm \
 	src/features/root/Root.mm
 # Root.mm stays last: its constructor, which installs every feature, must run
 # after the other files' static initializers (dyld runs them in link order).
-
-DIAGNOSTIC_SOURCES = \
-	src/common/EventLog.mm \
-	src/features/metalfx/frame-generation/FrameLog.mm
 
 RUNTIME_HEADERS = \
 	src/features/window-rebind-click/RebindClick.h \
@@ -122,18 +118,18 @@ RUNTIME_HEADERS = \
 	src/features/metalfx/split-screen/ViewRegions.h \
 	src/common/native/SupportedBuild.h \
 	src/common/Feature.h \
-	src/common/EventLog.h \
 	src/common/Notice.h \
+	src/common/ScreenTiming.h \
 	src/features/new-character-crash-fix/NewCharacterCrashFix.h \
-	src/features/depth-prepass/DepthPrepass.h \
 	src/features/metal-hooks/BindFilter.h \
 	src/features/metalfx/spatial-upscaling/SpatialUpscaler.h \
 	src/features/metalfx/temporal-upscaling/TemporalUpscaler.h \
 	src/features/metalfx/frame-generation/FrameInterpolation.h \
-	src/features/metalfx/frame-generation/FrameLog.h \
 	src/features/thread-idling/ThreadIdling.h \
 	src/features/reduce-locking/UniformSlices.h \
 	src/features/lua-jump-fix/LuaJumpFix.h \
+	src/features/animation-optimizations/AnimationOptimizations.h \
+	src/features/animation-optimizations/GrannyKernels.h \
 	src/features/ssao-blur-fix/SSAOBlurFix.h \
 	src/features/metalfx/dynamic-resolution/DynamicResolution.h \
 	src/features/improved-shadows/ImprovedShadows.h \
@@ -147,26 +143,18 @@ RUNTIME_HEADERS = \
 	src/features/custom-render-stages/CustomRenderStages.h \
 	src/features/custom-pipeline-bundles/CustomPipelineBundles.h src/features/custom-pipeline-bundles/PipelineRecord.h \
 	src/features/custom-menu/RenderViewFocus.h \
+	src/features/custom-menu/RefreshRepair.h \
+	src/features/custom-menu/FullscreenFit.h \
 	src/features/metal-hooks/MetalHooks.h \
 	src/features/metal-hooks/MetalHooksInternal.h
 
-$(BIN_DIR)/libBG3MetalFXTrace.dylib: $(RUNTIME_SOURCES) $(DIAGNOSTIC_SOURCES) $(RUNTIME_HEADERS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -dynamiclib $(RUNTIME_SOURCES) $(DIAGNOSTIC_SOURCES) $(FRAMEWORKS) -o $@
-	codesign --force --sign - $@
-
 $(BIN_DIR)/libBG3MetalFX.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
+	$(CXX) $(CXXFLAGS) -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
 	codesign --force --sign - $@
 
-# Same quiet feature path, with standalone fixture exports unavailable to players.
-# Developer build: the quiet runtime plus dynamic resolution's controller log
-# (os_log category `controller`), for measuring without the diagnostic runtime.
-$(BIN_DIR)/libBG3MetalFXResolutionLog.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -DBG3MFX_RESOLUTION_LOG=1 -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
-	codesign --force --sign - $@
-
+# The same runtime, with standalone fixture exports unavailable to players.
 $(BIN_DIR)/libBG3MetalFXTest.dylib: $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) -DBG3MFX_NO_TRACE=1 -DBG3MFX_STANDALONE_TEST_HOOKS=1 -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
+	$(CXX) $(CXXFLAGS) -DBG3MFX_STANDALONE_TEST_HOOKS=1 -dynamiclib $(RUNTIME_SOURCES) $(FRAMEWORKS) -o $@
 	codesign --force --sign - $@
 
 # Synthetic BG3/Metal 4 bridge handshake scenarios (developer probe; several
@@ -180,7 +168,7 @@ $(BIN_DIR)/metalfx-probe: tools/probes/metalfx_probe.m | $(BIN_DIR)
 $(BIN_DIR)/uniform-lock-sim: tools/probes/uniform_lock_sim.cpp | $(BIN_DIR)
 	xcrun clang++ -std=c++17 -O2 -Wall -Wextra -mmacosx-version-min=26.0 $< -o $@
 
-test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/root-smoke $(BIN_DIR)/custom-render-stages-smoke $(BIN_DIR)/custom-pipeline-bundles-smoke $(BIN_DIR)/duplicate-shadow-fix-smoke $(BIN_DIR)/improved-shadows-smoke $(BIN_DIR)/native-shadows-smoke $(BIN_DIR)/ssr-history-island-smoke $(BIN_DIR)/ssao-blur-fix-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/new-character-crash-fix-smoke $(BIN_DIR)/lab-smoke $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTrace.dylib
+test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/root-smoke $(BIN_DIR)/custom-render-stages-smoke $(BIN_DIR)/custom-pipeline-bundles-smoke $(BIN_DIR)/duplicate-shadow-fix-smoke $(BIN_DIR)/improved-shadows-smoke $(BIN_DIR)/native-shadows-smoke $(BIN_DIR)/ssr-history-island-smoke $(BIN_DIR)/ssao-blur-fix-smoke $(BIN_DIR)/animation-optimizations-smoke $(BIN_DIR)/bind-filter-smoke $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/frame-interpolation-smoke $(BIN_DIR)/metal4-bridge-smoke $(BIN_DIR)/runtime-smoke $(BIN_DIR)/metalfx-smoke $(BIN_DIR)/temporal-quality-smoke $(BIN_DIR)/temporal-jitter-smoke $(BIN_DIR)/spatial-upscaler-smoke $(BIN_DIR)/temporal-upscaler-smoke $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/new-character-crash-fix-smoke $(BIN_DIR)/lab-smoke $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/supported-build-smoke
 	$(BIN_DIR)/root-smoke
 	$(BIN_DIR)/custom-render-stages-smoke
@@ -190,17 +178,13 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/root-smoke $(BIN_DIR)/custom-r
 	$(BIN_DIR)/native-shadows-smoke
 	$(BIN_DIR)/ssr-history-island-smoke
 	$(BIN_DIR)/ssao-blur-fix-smoke
+	$(BIN_DIR)/animation-optimizations-smoke
 	$(BIN_DIR)/bind-filter-smoke
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
-	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib hdr
-	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib hdr
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib scaled
-	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib scaled
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib overlays
-	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib overlays
 	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib startup-reset
-	$(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib startup-reset
 	$(BIN_DIR)/frame-interpolation-smoke
 	BG3MFX_TEST_DIRECT_INPUTS=1 $(BIN_DIR)/frame-interpolation-smoke
 	$(BIN_DIR)/metal4-bridge-smoke
@@ -212,49 +196,24 @@ test: $(BIN_DIR)/supported-build-smoke $(BIN_DIR)/root-smoke $(BIN_DIR)/custom-r
 	$(BIN_DIR)/spatial-upscaler-smoke
 	$(BIN_DIR)/temporal-upscaler-smoke
 	BG3MFX_TEST_DIRECT_OUTPUT=1 $(BIN_DIR)/temporal-upscaler-smoke
-	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFX.dylib
-	constants_trace=$$(mktemp "$(EVIDENCE_DIR)/constants-trace-XXXXXX"); \
-		BG3MFX_TRACE="$$PWD/$$constants_trace" BG3MFX_TRACE_CONSTANTS=1 $(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib && \
-		test "$$(grep -c '"event":"shaderConstants"' "$$constants_trace")" -eq 2 && rm "$$constants_trace" && \
-		echo "Constant snapshots recorded without call tracing (synthetic, offscreen)."
+	$(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	BG3MFX_ENABLE=1 BG3MFX_FEATURE_METAL_HOOKS=1 $(BIN_DIR)/runtime-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
-	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib no-taa
-	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib no-taa
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib resize
-	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib resize
 	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib tonemap
-	$(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib tonemap
-	BG3MFX_SKIP_FSR_TONEMAP=0 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib tonemap
 	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib bad-format
-	BG3MFX_TEST_ERRORS_STDERR=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib bad-format
 	$(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
-	$(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	BG3MFX_TRACE_RENDER_CALLS=1 BG3MFX_TRACE_CONSTANTS=1 $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	BG3MFX_TRACE_RENDER_CALLS=1 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	BG3MFX_TRACE_RENDER_CALLS=1 $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	BG3MFX_TRACE_RENDER_CALLS=1 BG3MFX_FEATURE_DEPTH_PREPASS=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib expect-trim
-	BG3MFX_FEATURE_DEPTH_PREPASS=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-trim
-	BG3MFX_FEATURE_DEPTH_PREPASS=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib expect-trim
-	BG3MFX_FEATURE_DEPTH_PREPASS=0 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-full
-	BG3MFX_FEATURE_DEPTH_PREPASS=1 BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFX.dylib expect-trim
-	BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 $(BIN_DIR)/prepass-trim-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib expect-full
 	$(BIN_DIR)/new-character-crash-fix-smoke $(BIN_DIR)/libBG3MetalFX.dylib
-	BG3MFX_TRACE_RENDER_CALLS=1 $(BIN_DIR)/new-character-crash-fix-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib expect-event
-	$(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFX.dylib
-	$(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	$(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFX.dylib
-	$(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
-	BG3MFX_SPLIT_SCREEN_FOG=0 $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFX.dylib
+	$(BIN_DIR)/lab-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	$(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
+	BG3MFX_SPLIT_SCREEN_FOG=0 $(BIN_DIR)/split-screen-fog-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/spatial-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/temporal-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/frame-generation-hook-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
-	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib
 	BG3MFX_METALFX_SHARPENING=0 $(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTest.dylib frame-generation
-	$(BIN_DIR)/split-screen-upscale-smoke $(BIN_DIR)/libBG3MetalFXTrace.dylib frame-generation
 
 # These exercise the development launch helper, not rendering acceptance.
 test-python: $(BIN_DIR)/bg3mfx
@@ -266,8 +225,8 @@ clean:
 clean-evidence:
 	python3 tools/build/cleanup.py evidence "$(BIN_DIR)" "$(EVIDENCE_DIR)"
 
-$(BIN_DIR)/frame-interpolation-smoke: tests/features/metalfx/frame-generation/frame_interpolation_smoke.mm src/features/metalfx/frame-generation/FrameInterpolation.mm src/features/metalfx/frame-generation/FrameInterpolation.h src/features/metalfx/frame-generation/FrameLog.mm src/features/metalfx/frame-generation/FrameLog.h src/common/gpu/GPUResources.mm src/common/gpu/GPUResources.h | $(BIN_DIR)
-	$(CXX) $(CXXFLAGS) $< src/features/metalfx/frame-generation/FrameInterpolation.mm src/features/metalfx/frame-generation/FrameLog.mm src/common/gpu/GPUResources.mm $(FRAMEWORKS) -Isrc -o $@
+$(BIN_DIR)/frame-interpolation-smoke: tests/features/metalfx/frame-generation/frame_interpolation_smoke.mm src/features/metalfx/frame-generation/FrameInterpolation.mm src/features/metalfx/frame-generation/FrameInterpolation.h src/common/gpu/GPUResources.mm src/common/gpu/GPUResources.h | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) $< src/features/metalfx/frame-generation/FrameInterpolation.mm src/common/gpu/GPUResources.mm $(FRAMEWORKS) -Isrc -o $@
 
 $(BIN_DIR)/frame-generation-hook-smoke: tests/features/metalfx/frame-generation/frame_generation_hook_smoke.mm | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< $(FRAMEWORKS) -o $@
@@ -284,9 +243,9 @@ $(BIN_DIR)/hook-overhead: tools/probes/hook_overhead.mm | $(BIN_DIR)
 
 hook-overhead: $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFX.dylib $(BIN_DIR)/libBG3MetalFXTest.dylib
 	$(BIN_DIR)/hook-overhead
-	$(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFX.dylib
-	BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 BG3MFX_FEATURE_DEPTH_PREPASS=1 BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=1 BG3MFX_FEATURE_IMPROVED_SHADOWS=1 BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=1 $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFX.dylib
-	BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 BG3MFX_FEATURE_DEPTH_PREPASS=1 BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=1 BG3MFX_FEATURE_IMPROVED_SHADOWS=1 BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=1 BG3MFX_FEATURE_METALFX=1 $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFXTest.dylib 3
+	BG3MFX_FEATURE_METAL_HOOKS=1 $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFX.dylib
+	BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=1 BG3MFX_FEATURE_IMPROVED_SHADOWS=1 BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=1 $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFX.dylib
+	BG3MFX_FEATURE_RENDER_THREAD_OPTIMIZATIONS=1 BG3MFX_FEATURE_DUPLICATE_SHADOW_FIX=1 BG3MFX_FEATURE_IMPROVED_SHADOWS=1 BG3MFX_FEATURE_NEW_CHARACTER_CRASH_FIX=1 BG3MFX_FEATURE_METALFX=1 $(BIN_DIR)/hook-overhead $(BIN_DIR)/libBG3MetalFXTest.dylib 3
 
 $(BIN_DIR)/bind-filter-smoke: tests/features/metal-hooks/bind_filter_smoke.mm src/features/metal-hooks/BindFilter.h | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) $< -framework Foundation -framework Metal -o $@
@@ -308,6 +267,9 @@ $(BIN_DIR)/supported-build-smoke: tests/common/supported_build_smoke.cpp src/com
 
 $(BIN_DIR)/ssr-history-island-smoke: tests/integration/ssr_history_island_smoke.cpp tests/integration/ssr_history_island_wrappers.S src/common/native/SupportedBuild.h | $(BIN_DIR)
 	$(CXX) $(CPPFLAGS) -std=c++17 -O2 -Wall -Wextra -arch arm64 tests/integration/ssr_history_island_smoke.cpp tests/integration/ssr_history_island_wrappers.S -o $@
+
+$(BIN_DIR)/animation-optimizations-smoke: tests/features/animation-optimizations/animation_optimizations_smoke.cpp src/features/animation-optimizations/GrannyKernels.h | $(BIN_DIR)
+	$(CXX) $(CPPFLAGS) -std=c++17 -O2 -Wall -Wextra -arch arm64 $< -o $@
 
 $(BIN_DIR)/ssao-blur-fix-smoke: tests/features/ssao-blur-fix/ssao_blur_fix_smoke.cpp tests/features/ssao-blur-fix/ssao_blur_island_wrappers.S src/common/native/SupportedBuild.h | $(BIN_DIR)
 	$(CXX) $(CPPFLAGS) -std=c++17 -O2 -Wall -Wextra -arch arm64 tests/features/ssao-blur-fix/ssao_blur_fix_smoke.cpp tests/features/ssao-blur-fix/ssao_blur_island_wrappers.S -o $@

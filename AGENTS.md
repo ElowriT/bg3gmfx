@@ -35,16 +35,21 @@
 - Never push commits upstream without first checkign with the user.
 - Never edit README.md without first checking with the user.
 - Use available skills and capabilities such as gpucapture and gputrace.
-- `make` builds the quiet runtime and the `bg3mfx` launcher. `make test` runs
-  Metal pixel and renderer-hook regressions on both quiet and diagnostic
-  libraries. `make test-python` checks the player launcher and the development
+- `make` builds the runtime and the `bg3mfx` launcher. `make test` runs
+  Metal pixel and renderer-hook regressions on the runtime's test build. `make test-python` checks the player launcher and the development
   launch helper. Keep synthetic, offscreen, and displayed results
   distinct in reports.
 - `make clean` removes only `build/bin/`; `make clean-evidence` removes only
   `build/evidence/`. Neither command migrates or removes older data elsewhere
   under `build/`.
-- The diagnostic runtime may record traces, shader reflection, and captures.
-  The quiet runtime compiles those diagnostics out and shall minimize diagnostic performance overhead.
+- The runtime has no diagnostics: no event logs, traces, counters or diagnostic build. Temporary diagnostics are allowed while developing a feature, but must be removed before the feature is committed. Do not add custom diagnostics for data that can be obtained from other tools like gpu capture, Metal logging, or cpu sampling.
+- Probes (opt-in checks, captures, forced failures and overrides) are development-time tools. Keep them temporary or under `build/`; do not add them to the runtime or commit them. The only exceptions are the standalone programs in `tools/probes/`, which are never part of the runtime.
+- Failures are not diagnostics: report them through `BG3MFXFail` (`src/common/Notice.h`).
+- BG3GMFX (this fork) keeps exceptions to the two rules above, by the user's choice: lab mode
+  (`BG3MFX_LAB`, [lab](docs/dev/lab.md)), off unless that variable names a directory, and the
+  switches that turn a fork fix off for comparisons (`BG3MFX_SPLIT_SCREEN_FOG=0`,
+  `BG3MFX_METALFX_SHARPENING=0`, `BG3MFX_METAL4_ORDER=0`). Keep them opt-in, and keep
+  features independent of lab mode.
 - Do not distribute BG3 executables, extracted game assets, or user
   credentials. Modified shaders are acceptable. Local captures and downloaded references stay in ignored
   `build/`.

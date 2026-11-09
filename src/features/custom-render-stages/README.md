@@ -4,8 +4,7 @@ Technical name: `custom-render-stages`.
 
 Lets other features replace the render stages BG3 creates for each kind of
 view, and override methods of particular stage classes. It has no player-visible effect itself: it is enabled by the features
-that require it (Duplicate Shadow Fix, Improved Shadows), or in the diagnostic runtime with
-`BG3MFX_TRACE_STAGE_LIST=1`, which records BG3's own stage calls.
+that require it (Duplicate Shadow Fix, Improved Shadows).
 
 ## Behavior
 
@@ -44,7 +43,7 @@ per method; only methods listed in `SupportedBuild.h`
 
 `CustomRenderStages.mm` replaces the Span overload's slot (0x2c8) in App's
 vtable, at this feature's activation: after every feature has installed, and
-only if a list was registered (or the trace asked for the shim). It checks
+only if a list was registered. It checks
 both vtable slots and every pack's bytes against `SupportedBuild.h` first.
 The vtable page is made writable, the pointer stored, and the page made
 read-only again (`BG3MFXPatchPointer`).
@@ -53,7 +52,7 @@ Method overrides are written at the same activation, before the stage-list
 shim. Every overridden entry is first checked against BG3's method from
 `SupportedBuild.h`; if one differs, nothing is written. `original` is set
 before the entry is replaced, and if a write fails the entries already written
-are put back. Activation reports `stageMethodsInstalled`.
+are put back.
 
 ## Improvement
 

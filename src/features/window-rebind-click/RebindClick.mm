@@ -43,7 +43,7 @@ static void bg3mfxPost(CGEventTapLocation tap, CGEventRef event) {
 __attribute__((used)) static struct { const void *replacement; const void *replacee; } interposeEventPost
     __attribute__((section("__DATA,__interpose"))) = { (const void *)&bg3mfxPost, (const void *)&CGEventPost };
 
-BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *), NSError **error) {
+BOOL BG3MFXInstallRebindClickFix(intptr_t slide, NSError **error) {
     gameSlide = slide;
     for (uintptr_t click : rebindClickSites) if (!callsStub(click, eventPostStub)) {
         if (error) *error = [NSError errorWithDomain:@"BG3MFX" code:1
@@ -51,13 +51,12 @@ BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *),
         return NO;
     }
     installed = true;
-    if (report) report(@{@"event":@"rebindClickFixInstalled"});
     return YES;
 }
 
 namespace {
 BOOL installRebindClick(const BG3MFXFeatureContext &context, NSError **error) {
-    return BG3MFXInstallRebindClickFix(context.slide, context.report, error);
+    return BG3MFXInstallRebindClickFix(context.slide, error);
 }
 }
-BG3MFX_FEATURE(windowRebindClick, {"window-rebind-click", nullptr, true, nullptr, installRebindClick, nullptr});
+BG3MFX_FEATURE(windowRebindClick, {"window-rebind-click", nullptr, true, installRebindClick, nullptr});

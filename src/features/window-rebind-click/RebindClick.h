@@ -11,4 +11,4 @@
 // render view focus repair, or here if it did not). The window-rebind-click
 // feature (BG3MFX_FEATURE_WINDOW_REBIND_CLICK=1) installs it on the supported
 // build; it stays off if the call sites differ.
-BOOL BG3MFXInstallRebindClickFix(intptr_t slide, void (*report)(NSDictionary *), NSError **error);
+BOOL BG3MFXInstallRebindClickFix(intptr_t slide, NSError **error);

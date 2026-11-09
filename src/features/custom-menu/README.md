@@ -3,14 +3,15 @@
 Technical name: `custom-menu`.
 
 There is no flag of its own: it is enabled by the features that require it
-(metal-hud and metalfx). It needs the supported ARM64 executable. It also
-keeps BG3's Video options responsive after a fullscreen change (below).
+(metal-hud, metalfx and max-frame-rate), and requires metal-hooks. It needs the
+supported ARM64 executable. It also repairs three BG3 Video settings bugs
+(below).
 
 ## Behavior
 
 Features add their options to Options → Video through custom-menu. Without a
 feature that requires it, the Video options are BG3's own. If BG3's option
-list is not what custom-menu expects, it reports `customMenuError` and shows
+list is not what custom-menu expects, it reports the problem and shows
 "bg3mfx options may be unavailable" once. BG3's own options keep working.
 
 ### Fullscreen focus repair
@@ -20,6 +21,29 @@ second click before a control responded. BG3's `BindSurface` removes its render
 view (`LSMTLView`) from the window and sets it back as the content view. That
 leaves the window as first responder, so the next click only gave the view its
 focus back.
+
+### Borderless fit repair
+
+BG3's Borderless mode is macOS full screen. On a MacBook with a notch, with
+the game's "Scale to fit below built-in camera" off, it started with the
+bottom of the picture off screen until a resolution change: BG3 sizes the
+window to the whole screen, notch strip included (1728×1117 pt on a 14-inch
+MacBook Pro), and macOS's full-screen transition keeps that height but puts
+the top under the notch, 33 pt down. custom-menu gives the window the frame
+below the notch (1728×1084 pt), as a resolution change does. With Scale to
+fit on, the window is not moved: macOS scales the whole full-screen space
+below the camera, with bars at the sides, and BG3's 16:10 picture is
+stretched to the window's height (not repaired).
+
+### Borderless refresh repair
+
+BG3 presents each frame no sooner than 1/(refresh rate + 1) after the last,
+using the refresh rate saved in its Video settings: the fullscreen mode's.
+It keeps that in a borderless window, where the screen runs at its own rate,
+so choosing 60 in fullscreen and returning to a 120 Hz borderless window held
+the game at 60. custom-menu replaces that duration with 1/(screen rate + 1),
+the game window's screen rate from `NSScreen`; in exclusive fullscreen the
+screen reports the mode's rate, so it matches BG3's.
 
 ## Implementation
 
@@ -36,16 +60,29 @@ focus back.
 ApplyCombo vtable slots at its activation. That runs after every install and
 before BG3 builds a menu. It checks both slots first. Init calls BG3's own,
 then validates the option list. It runs the callbacks only for the Video pass,
-which it recognizes by the Upscaling Type combo (type 3, id 99); other passes
-are recorded as `customMenuDeferred`.
+which it recognizes by the Upscaling Type combo (type 3, id 99).
 
 [`RenderViewFocus.mm`](RenderViewFocus.mm), installed with custom-menu, is the
 focus repair. It wraps `LSWindow`'s `setContentView:`. When the render view
 that had focus is removed and the same view is set back, it makes that view
 first responder again. It does this only for the active key window with no
 sheet or modal window open. If a different view is set, it stops tracking the
-old one without keeping it alive. The diagnostic runtime records
-`renderViewFocusRepair`.
+old one without keeping it alive.
+
+[`FullscreenFit.mm`](FullscreenFit.mm), installed with custom-menu, is the
+fit repair: after `NSWindowDidEnterFullScreenNotification` (and
+`NSWindowDidMoveNotification`), a full-screen `LSWindow` whose bottom is
+below its screen gets the screen's frame up to the bottom of
+`auxiliaryTopLeftArea` (the areas beside the camera housing). The safe area
+reports no notch with Scale to fit on, and the visible frame still excludes
+the menu bar when the transition ends, so neither is used.
+
+[`RefreshRepair.mm`](RefreshRepair.mm), installed with custom-menu, is the
+refresh repair: a metal-hooks present-duration filter that recognizes BG3's
+own duration (1/(settings refresh + 1), from `Temporal::Settings` +0x18/+0x1c)
+and passes other durations through. Screen timing comes from
+`src/common/ScreenTiming`. Filters run in install order, so max-frame-rate's
+Snap to Native FPS pacing, installed after custom-menu, sees the repaired duration.
 
 ## Improvement
 
@@ -53,3 +90,6 @@ The menu API is not a speedup; it only adds options. The focus repair is a fix:
 the Video menu stayed responsive after fullscreen settings changes
 (user-confirmed October 16, 2026, BG3 4.1.1.7631656). The API move has not been
 re-checked live.
+The refresh repair has not been checked live yet. The fit repair showed the
+whole picture at startup with Scale to fit off (user-confirmed November 7,
+2026, 14-inch MacBook Pro, BG3 4.1.1.7631656).

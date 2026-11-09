@@ -1,6 +1,6 @@
 # Dynamic Resolution
 
-Technical name: `dynamic-resolution`.
+Part of the [metalfx](../README.md) feature (`BG3MFX_FEATURE_METALFX`).
 
 Adds **Dynamic** (quality 4) to BG3's Upscaling Quality menu. It is offered only
 while MetalFX Temporal is the Upscaling Type, and changes the render resolution
@@ -32,9 +32,8 @@ and jitter to match. Dynamic's target counts rendered frames, as BG3's Max
 Frame Rate does; Frame Generation shows twice as many. Dynamic keeps
 native resolution for 60 frames after any change of size, Upscaling Type or
 quality.
-The dynamic-resolution feature, part of [metalfx](../README.md): root installs
-it whenever metalfx is enabled (`wanted`), without metalfx requiring it. If it
-cannot install, root reports it in `featureSkipped` and MetalFX does not offer
+metalfx's install puts it in after Temporal's jitter. It is optional: if it
+cannot install, metalfx reports it through `BG3MFXFail` and does not offer
 Dynamic.
 
 ## Implementation
@@ -53,9 +52,7 @@ Dynamic.
   - auto-exposure scene UVs;
   - the render-rectangle loads for forward lighting clamps, bloom and DOF radii,
     and the projection jitter divisor.
-
-  See [validation](../../../../docs/dev/validation/README.md#dynamic-resolution-probe-october-21-2026).
-- [`MetalFXRenderer.mm`](../MetalFXRenderer.mm) does the following:
+- [`MetalFXRenderer.mm`](../renderer/MetalFXRenderer.mm) does the following:
   - accepts the reduced TAA viewport as the Temporal content region;
   - creates Dynamic Temporal scalers with `inputContentPropertiesEnabled`;
   - gives the fog composite a viewport-mapped vertex shader;
@@ -128,23 +125,15 @@ Thermal Guard adds a ceiling on the area, from `NSProcessInfo`'s
   3456×2160, target 30) the Mac reached fair about 3 minutes into play and
   stayed there even at the floor (0.111), apart from 40 s at nominal, so with
   sustained load Thermal Guard usually runs near the floor.
-- Developer logs record each ceiling change (`thermal <state> ceiling <area>`).
 
-Live, 2026-10-22, quiet runtime, 60 Hz with VSync: a scene that ran 52–54 fps at
+Live, 2026-10-22, 60 Hz with VSync: a scene that ran 52–54 fps at
 native (GPU fully busy) held 60 fps at area 0.72 with the earlier
 busy-only rule (target 94%).
 
-## Diagnostics
-
-The diagnostic runtime logs area changes to the `com.bg3mfx` `resolution`
-category and records `dynamicResolutionStep` events.
-`BG3MFX_DYNAMIC_RESOLUTION_AREA` replaces the controller with a fixed area
-(`0.5`) or a triangle wave (`min,max,seconds`), with any Temporal quality.
-
 ## Improvement
 
-Displayed results so far are from the diagnostic probe at a fixed area 0.5 or
-an oscillating area (see validation). The controller and the quiet-runtime
+Displayed results so far are from a since-removed probe at a fixed area 0.5 or
+an oscillating area. The controller and the
 Dynamic presets are not yet measured live. The expected gain is GPU time roughly
 in proportion to the rendered area in render-resolution passes, at the cost of
 MetalFX reconstruction quality as the area falls.
